@@ -1,11 +1,14 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use bytes::Bytes;
+use diem_db::backup::backup_handler::BackupHandler;
 use diem_logger::prelude::*;
-use diem_metrics::{register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec};
-use diemdb::backup::backup_handler::BackupHandler;
+use diem_metrics_core::{
+    register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+};
+use bytes::Bytes;
 use hyper::Body;
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -120,7 +123,7 @@ pub(super) fn unwrap_or_500(result: Result<Box<dyn Reply>>) -> Box<dyn Reply> {
         Err(e) => {
             warn!("Request handler exception: {:#}", e);
             Box::new(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        },
     }
 }
 

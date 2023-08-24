@@ -1,33 +1,40 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
 mod mock_vm_test;
 
+use crate::{block_executor::TransactionBlockExecutor, components::chunk_output::ChunkOutput};
+use anyhow::Result;
 use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use diem_state_view::StateView;
+use diem_storage_interface::cached_state_view::CachedStateView;
 use diem_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{diem_root_address, validator_set_address, XUS_NAME},
+    account_config::CORE_CODE_ADDRESS,
+    block_executor::partitioner::{ExecutableTransactions, SubBlocksForShard},
     chain_id::ChainId,
     contract_event::ContractEvent,
     event::EventKey,
     on_chain_config::{
-        config_address, default_access_path_for_config, new_epoch_event_key, ConfigurationResource,
-        OnChainConfig, ValidatorSet,
+        access_path_for_config, new_epoch_event_key, ConfigurationResource, OnChainConfig,
+        ValidatorSet,
     },
+    state_store::state_key::StateKey,
     transaction::{
-        RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
-        TransactionOutput, TransactionPayload, TransactionStatus,
+        ChangeSet, ExecutionStatus, RawTransaction, Script, SignedTransaction, Transaction,
+        TransactionArgument, TransactionOutput, TransactionPayload, TransactionStatus,
+        WriteSetPayload,
     },
-    vm_status::{KeptVMStatus, StatusCode, VMStatus},
+    vm_status::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use diem_vm::VMExecutor;
+use diem_vm::{sharded_block_executor::ShardedBlockExecutor, VMExecutor};
 use move_core_types::{language_storage::TypeTag, move_resource::MoveResource};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug)]
 enum MockVMTransaction {
@@ -40,11 +47,10 @@ enum MockVMTransaction {
         recipient: AccountAddress,
         amount: u64,
     },
-    Reconfiguration,
 }
 
 pub static KEEP_STATUS: Lazy<TransactionStatus> =
-    Lazy::new(|| TransactionStatus::Keep(KeptVMStatus::Executed));
+    Lazy::new(|| TransactionStatus::Keep(ExecutionStatus::Success));
 
 // We use 10 as the assertion error code for insufficient balance within the Diem coin contract.
 pub static DISCARD_STATUS: Lazy<TransactionStatus> =
@@ -52,10 +58,25 @@ pub static DISCARD_STATUS: Lazy<TransactionStatus> =
 
 pub struct MockVM;
 
+impl TransactionBlockExecutor for MockVM {
+    fn execute_transaction_block(
+        transactions: ExecutableTransactions<Transaction>,
+        state_view: CachedStateView,
+        maybe_block_gas_limit: Option<u64>,
+    ) -> Result<ChunkOutput> {
+        ChunkOutput::by_transaction_execution::<MockVM>(
+            transactions,
+            state_view,
+            maybe_block_gas_limit,
+        )
+    }
+}
+
 impl VMExecutor for MockVM {
     fn execute_block(
         transactions: Vec<Transaction>,
         state_view: &impl StateView,
+        _maybe_block_gas_limit: Option<u64>,
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
         if state_view.is_genesis() {
             assert_eq!(
@@ -84,7 +105,43 @@ impl VMExecutor for MockVM {
         let mut outputs = vec![];
 
         for txn in transactions {
-            match decode_transaction(txn.as_signed_user_txn().unwrap()) {
+            if matches!(txn, Transaction::StateCheckpoint(_)) {
+                outputs.push(TransactionOutput::new(
+                    WriteSet::default(),
+                    vec![],
+                    0,
+                    KEEP_STATUS.clone(),
+                ));
+                continue;
+            }
+
+            if matches!(txn, Transaction::GenesisTransaction(_)) {
+                read_state_value_from_storage(
+                    state_view,
+                    &access_path_for_config(ValidatorSet::CONFIG_ID)
+                        .map_err(|_| VMStatus::error(StatusCode::TOO_MANY_TYPE_NODES, None))?,
+                );
+                read_state_value_from_storage(
+                    state_view,
+                    &AccessPath::new(CORE_CODE_ADDRESS, ConfigurationResource::resource_path()),
+                );
+                outputs.push(TransactionOutput::new(
+                    // WriteSet cannot be empty so use genesis writeset only for testing.
+                    gen_genesis_writeset(),
+                    // mock the validator set event
+                    vec![ContractEvent::new(
+                        new_epoch_event_key(),
+                        0,
+                        TypeTag::Bool,
+                        bcs::to_bytes(&0).unwrap(),
+                    )],
+                    0,
+                    KEEP_STATUS.clone(),
+                ));
+                continue;
+            }
+
+            match decode_transaction(txn.try_as_signed_user_txn().unwrap()) {
                 MockVMTransaction::Mint { sender, amount } => {
                     let old_balance = read_balance(&output_cache, state_view, sender);
                     let new_balance = old_balance + amount;
@@ -102,7 +159,7 @@ impl VMExecutor for MockVM {
                         0,
                         KEEP_STATUS.clone(),
                     ));
-                }
+                },
                 MockVMTransaction::Payment {
                     sender,
                     recipient,
@@ -141,30 +198,22 @@ impl VMExecutor for MockVM {
                         write_set,
                         events,
                         0,
-                        TransactionStatus::Keep(KeptVMStatus::Executed),
+                        TransactionStatus::Keep(ExecutionStatus::Success),
                     ));
-                }
-                MockVMTransaction::Reconfiguration => {
-                    read_balance_from_storage(state_view, &balance_ap(validator_set_address()));
-                    read_balance_from_storage(state_view, &balance_ap(diem_root_address()));
-                    outputs.push(TransactionOutput::new(
-                        // WriteSet cannot be empty so use genesis writeset only for testing.
-                        gen_genesis_writeset(),
-                        // mock the validator set event
-                        vec![ContractEvent::new(
-                            new_epoch_event_key(),
-                            0,
-                            TypeTag::Bool,
-                            bcs::to_bytes(&0).unwrap(),
-                        )],
-                        0,
-                        KEEP_STATUS.clone(),
-                    ));
-                }
+                },
             }
         }
 
         Ok(outputs)
+    }
+
+    fn execute_block_sharded<S: StateView + Sync + Send + 'static>(
+        _sharded_block_executor: &ShardedBlockExecutor<S>,
+        _block: Vec<SubBlocksForShard<Transaction>>,
+        _state_view: Arc<S>,
+        _maybe_block_gas_limit: Option<u64>,
+    ) -> std::result::Result<Vec<TransactionOutput>, VMStatus> {
+        todo!()
     }
 }
 
@@ -202,9 +251,18 @@ fn read_seqnum_from_storage(state_view: &impl StateView, seqnum_access_path: &Ac
 
 fn read_u64_from_storage(state_view: &impl StateView, access_path: &AccessPath) -> u64 {
     state_view
-        .get(access_path)
+        .get_state_value_bytes(&StateKey::access_path(access_path.clone()))
         .expect("Failed to query storage.")
         .map_or(0, |bytes| decode_bytes(&bytes))
+}
+
+fn read_state_value_from_storage(
+    state_view: &impl StateView,
+    access_path: &AccessPath,
+) -> Option<Vec<u8>> {
+    state_view
+        .get_state_value_bytes(&StateKey::access_path(access_path.clone()))
+        .expect("Failed to query storage.")
 }
 
 fn decode_bytes(bytes: &[u8]) -> u64 {
@@ -223,14 +281,18 @@ fn seqnum_ap(account: AccountAddress) -> AccessPath {
 
 fn gen_genesis_writeset() -> WriteSet {
     let mut write_set = WriteSetMut::default();
-    let validator_set_ap = default_access_path_for_config(ValidatorSet::CONFIG_ID);
-    write_set.push((
-        validator_set_ap,
-        WriteOp::Value(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
+    let validator_set_ap =
+        access_path_for_config(ValidatorSet::CONFIG_ID).expect("access path in test");
+    write_set.insert((
+        StateKey::access_path(validator_set_ap),
+        WriteOp::Modification(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
     ));
-    write_set.push((
-        AccessPath::new(config_address(), ConfigurationResource::resource_path()),
-        WriteOp::Value(bcs::to_bytes(&ConfigurationResource::default()).unwrap()),
+    write_set.insert((
+        StateKey::access_path(AccessPath::new(
+            CORE_CODE_ADDRESS,
+            ConfigurationResource::resource_path(),
+        )),
+        WriteOp::Modification(bcs::to_bytes(&ConfigurationResource::default()).unwrap()),
     ));
     write_set
         .freeze()
@@ -239,13 +301,13 @@ fn gen_genesis_writeset() -> WriteSet {
 
 fn gen_mint_writeset(sender: AccountAddress, balance: u64, seqnum: u64) -> WriteSet {
     let mut write_set = WriteSetMut::default();
-    write_set.push((
-        balance_ap(sender),
-        WriteOp::Value(balance.to_le_bytes().to_vec()),
+    write_set.insert((
+        StateKey::access_path(balance_ap(sender)),
+        WriteOp::Modification(balance.to_le_bytes().to_vec()),
     ));
-    write_set.push((
-        seqnum_ap(sender),
-        WriteOp::Value(seqnum.to_le_bytes().to_vec()),
+    write_set.insert((
+        StateKey::access_path(seqnum_ap(sender)),
+        WriteOp::Modification(seqnum.to_le_bytes().to_vec()),
     ));
     write_set.freeze().expect("mint writeset should be valid")
 }
@@ -258,17 +320,17 @@ fn gen_payment_writeset(
     recipient_balance: u64,
 ) -> WriteSet {
     let mut write_set = WriteSetMut::default();
-    write_set.push((
-        balance_ap(sender),
-        WriteOp::Value(sender_balance.to_le_bytes().to_vec()),
+    write_set.insert((
+        StateKey::access_path(balance_ap(sender)),
+        WriteOp::Modification(sender_balance.to_le_bytes().to_vec()),
     ));
-    write_set.push((
-        seqnum_ap(sender),
-        WriteOp::Value(sender_seqnum.to_le_bytes().to_vec()),
+    write_set.insert((
+        StateKey::access_path(seqnum_ap(sender)),
+        WriteOp::Modification(sender_seqnum.to_le_bytes().to_vec()),
     ));
-    write_set.push((
-        balance_ap(recipient),
-        WriteOp::Value(recipient_balance.to_le_bytes().to_vec()),
+    write_set.insert((
+        StateKey::access_path(balance_ap(recipient)),
+        WriteOp::Modification(recipient_balance.to_le_bytes().to_vec()),
     ));
     write_set
         .freeze()
@@ -277,7 +339,7 @@ fn gen_payment_writeset(
 
 fn gen_events(sender: AccountAddress) -> Vec<ContractEvent> {
     vec![ContractEvent::new(
-        EventKey::new_from_address(&sender, 0),
+        EventKey::new(111, sender),
         0,
         TypeTag::Vector(Box::new(TypeTag::U8)),
         b"event_data".to_vec(),
@@ -308,16 +370,7 @@ pub fn encode_transfer_transaction(
 }
 
 fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
-    let raw_transaction = RawTransaction::new_script(
-        sender,
-        0,
-        program,
-        0,
-        0,
-        XUS_NAME.to_owned(),
-        0,
-        ChainId::test(),
-    );
+    let raw_transaction = RawTransaction::new_script(sender, 0, program, 0, 0, 0, ChainId::test());
 
     let privkey = Ed25519PrivateKey::generate_for_testing();
     Transaction::UserTransaction(
@@ -328,17 +381,11 @@ fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
     )
 }
 
-pub fn encode_reconfiguration_transaction(sender: AccountAddress) -> Transaction {
-    let raw_transaction =
-        RawTransaction::new_write_set(sender, 0, WriteSet::default(), ChainId::test());
-
-    let privkey = Ed25519PrivateKey::generate_for_testing();
-    Transaction::UserTransaction(
-        raw_transaction
-            .sign(&privkey, privkey.public_key())
-            .expect("Failed to sign raw transaction.")
-            .into_inner(),
-    )
+pub fn encode_reconfiguration_transaction() -> Transaction {
+    Transaction::GenesisTransaction(WriteSetPayload::Direct(ChangeSet::new(
+        WriteSet::default(),
+        vec![],
+    )))
 }
 
 fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
@@ -360,7 +407,7 @@ fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
                             recipient: *recipient,
                             amount: *amount,
                         }
-                    }
+                    },
                     _ => unimplemented!(
                         "The first argument for payment transaction must be recipient address \
                          and the second argument must be amount."
@@ -368,17 +415,17 @@ fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
                 },
                 _ => unimplemented!("Transaction must have one or two arguments."),
             }
-        }
-        TransactionPayload::ScriptFunction(_) => {
-            // TODO: we need to migrate Script to ScriptFunction later
-            unimplemented!("MockVM does not support script function transaction payload.")
-        }
-        TransactionPayload::WriteSet(_) => {
-            // Use WriteSet for reconfig only for testing.
-            MockVMTransaction::Reconfiguration
-        }
+        },
+        TransactionPayload::EntryFunction(_) => {
+            // TODO: we need to migrate Script to EntryFunction later
+            unimplemented!("MockVM does not support entry function transaction payload.")
+        },
+        TransactionPayload::Multisig(_) => {
+            unimplemented!("MockVM does not support multisig transaction payload.")
+        },
+        // Deprecated. Will be removed in the future.
         TransactionPayload::ModuleBundle(_) => {
             unimplemented!("MockVM does not support Module transaction payload.")
-        }
+        },
     }
 }

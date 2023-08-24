@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{test_utils, SafetyRulesManager};
@@ -10,8 +11,7 @@ fn test_reconnect() {
     let storage = test_utils::test_storage(&signer);
     // test value for network timeout, in milliseconds.
     let network_timeout = 5_000;
-    let safety_rules_manager =
-        SafetyRulesManager::new_thread(storage, false, false, network_timeout);
+    let safety_rules_manager = SafetyRulesManager::new_thread(storage, network_timeout);
 
     // Verify that after a client has disconnected a new client will connect and resume operations
     let state0 = safety_rules_manager.client().consensus_state().unwrap();

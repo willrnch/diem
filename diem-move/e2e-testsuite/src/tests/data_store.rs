@@ -1,12 +1,12 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_types::{
-    transaction::{Module, SignedTransaction, Transaction, TransactionStatus},
-    vm_status::KeptVMStatus,
-};
-use language_e2e_tests::{
+use diem_language_e2e_tests::{
     account::AccountData, compile::compile_script, current_function_name, executor::FakeExecutor,
+};
+use diem_types::transaction::{
+    ExecutionStatus, Module, SignedTransaction, Transaction, TransactionStatus,
 };
 use move_binary_format::CompiledModule;
 use move_bytecode_verifier::verify_module;
@@ -14,7 +14,7 @@ use move_ir_compiler::Compiler;
 
 #[test]
 fn move_from_across_blocks() {
-    let mut executor = FakeExecutor::from_genesis_file();
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
     let sender = executor.create_raw_account_data(1_000_000, 10);
     executor.add_account_data(&sender);
@@ -29,7 +29,7 @@ fn move_from_across_blocks() {
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
 
@@ -51,7 +51,7 @@ fn move_from_across_blocks() {
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
 
@@ -61,7 +61,7 @@ fn move_from_across_blocks() {
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
 
@@ -79,12 +79,12 @@ fn move_from_across_blocks() {
         .expect("Must execute transactions");
     assert_eq!(
         output[0].status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
+        &TransactionStatus::Keep(ExecutionStatus::Success)
     );
     assert!(matches!(
         output[1].status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     for out in output {
         executor.apply_write_set(out.write_set());
@@ -93,7 +93,7 @@ fn move_from_across_blocks() {
 
 #[test]
 fn borrow_after_move() {
-    let mut executor = FakeExecutor::from_genesis_file();
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
     let sender = executor.create_raw_account_data(1_000_000, 10);
     executor.add_account_data(&sender);
@@ -102,24 +102,28 @@ fn borrow_after_move() {
     let (module, txn) = add_module_txn(&sender, 10);
     executor.execute_and_apply(txn);
 
+    println!("HERE!");
     // remove resource fails given no resource were published
     let rem_txn = remove_resource_txn(&sender, 11, vec![module.clone()]);
     let output = executor.execute_transaction(rem_txn);
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
+    println!("HERE!");
 
     // publish resource
     let add_txn = add_resource_txn(&sender, 12, vec![module.clone()]);
     executor.execute_and_apply(add_txn);
+    println!("HERE!");
 
     // borrow resource
     let borrow_txn = borrow_resource_txn(&sender, 13, vec![module.clone()]);
     executor.execute_and_apply(borrow_txn);
 
+    println!("HERE!");
     // create a remove and a borrow resource transaction over the same resource in one block
     let txns = vec![
         Transaction::UserTransaction(remove_resource_txn(&sender, 14, vec![module.clone()])),
@@ -130,13 +134,15 @@ fn borrow_after_move() {
         .expect("Must execute transactions");
     assert_eq!(
         output[0].status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
+        &TransactionStatus::Keep(ExecutionStatus::Success)
     );
+    println!("HERE!");
     assert!(matches!(
         output[1].status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
+    println!("HERE!");
     for out in output {
         executor.apply_write_set(out.write_set());
     }
@@ -144,7 +150,7 @@ fn borrow_after_move() {
 
 #[test]
 fn change_after_move() {
-    let mut executor = FakeExecutor::from_genesis_file();
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
     let sender = executor.create_raw_account_data(1_000_000, 10);
     executor.add_account_data(&sender);
@@ -159,7 +165,7 @@ fn change_after_move() {
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
 
@@ -181,12 +187,12 @@ fn change_after_move() {
         .expect("Must execute transactions");
     assert_eq!(
         output[0].status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
+        &TransactionStatus::Keep(ExecutionStatus::Success)
     );
     assert!(matches!(
         output[1].status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     for out in output {
         executor.apply_write_set(out.write_set());
@@ -198,7 +204,7 @@ fn change_after_move() {
     assert!(matches!(
         output.status().status(),
         // StatusCode::MISSING_DATA
-        Ok(KeptVMStatus::ExecutionFailure { .. })
+        Ok(ExecutionStatus::ExecutionFailure { .. })
     ));
     executor.apply_write_set(output.write_set());
 }
@@ -207,20 +213,20 @@ fn add_module_txn(sender: &AccountData, seq_num: u64) -> (CompiledModule, Signed
     let module_code = format!(
         "
         module 0x{}.M {{
-            import 0x1.Signer;
+            import 0x1.signer;
             struct T1 has key {{ v: u64 }}
 
             public borrow_t1(account: &signer) acquires T1 {{
                 let t1: &Self.T1;
             label b0:
-                t1 = borrow_global<T1>(Signer.address_of(move(account)));
+                t1 = borrow_global<T1>(signer.address_of(move(account)));
                 return;
             }}
 
             public change_t1(account: &signer, v: u64) acquires T1 {{
                 let t1: &mut Self.T1;
             label b0:
-                t1 = borrow_global_mut<T1>(Signer.address_of(move(account)));
+                t1 = borrow_global_mut<T1>(signer.address_of(move(account)));
                 *&mut move(t1).T1::v = move(v);
                 return;
             }}
@@ -228,7 +234,7 @@ fn add_module_txn(sender: &AccountData, seq_num: u64) -> (CompiledModule, Signed
             public remove_t1(account: &signer) acquires T1 {{
                 let v: u64;
             label b0:
-                T1 {{ v }} = move_from<T1>(Signer.address_of(move(account)));
+                T1 {{ v }} = move_from<T1>(signer.address_of(move(account)));
                 return;
             }}
 
@@ -242,8 +248,9 @@ fn add_module_txn(sender: &AccountData, seq_num: u64) -> (CompiledModule, Signed
         sender.address(),
     );
 
+    let framework_modules = diem_cached_packages::head_release_bundle().compiled_modules();
     let compiler = Compiler {
-        deps: diem_framework_releases::current_modules().iter().collect(),
+        deps: framework_modules.iter().collect(),
     };
     let module = compiler
         .into_compiled_module(module_code.as_str())

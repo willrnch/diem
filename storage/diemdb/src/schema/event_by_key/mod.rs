@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for an event index via which a ContractEvent (
@@ -12,13 +13,13 @@
 
 use crate::schema::{ensure_slice_len_eq, EVENT_BY_KEY_CF_NAME};
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use diem_types::{event::EventKey, transaction::Version};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
 };
-use std::{convert::TryFrom, mem::size_of};
+use diem_types::{event::EventKey, transaction::Version};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::mem::size_of;
 
 define_schema!(EventByKeySchema, Key, Value, EVENT_BY_KEY_CF_NAME);
 
@@ -32,7 +33,7 @@ impl KeyCodec<EventByKeySchema> for Key {
     fn encode_key(&self) -> Result<Vec<u8>> {
         let (ref event_key, seq_num) = *self;
 
-        let mut encoded = event_key.to_vec();
+        let mut encoded = event_key.to_bytes();
         encoded.write_u64::<BigEndian>(seq_num)?;
 
         Ok(encoded)
@@ -42,7 +43,7 @@ impl KeyCodec<EventByKeySchema> for Key {
         ensure_slice_len_eq(data, size_of::<Self>())?;
 
         const EVENT_KEY_LEN: usize = size_of::<EventKey>();
-        let event_key = EventKey::try_from(&data[..EVENT_KEY_LEN])?;
+        let event_key = bcs::from_bytes(&data[..EVENT_KEY_LEN])?;
         let seq_num = (&data[EVENT_KEY_LEN..]).read_u64::<BigEndian>()?;
 
         Ok((event_key, seq_num))

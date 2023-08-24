@@ -1,30 +1,32 @@
 [package]
-name = "executor-test-helpers"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-executor-test-helpers"
 description = "Diem executor test helpers"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-rand = "0.8.3"
-tempfile = "3.2.0"
-
-executor = { path = "../executor" }
-executor-types = { path = "../executor-types" }
-diemdb = { path = "../../storage/diemdb", features = ["fuzzing"] }
-diem-config = { path = "../../config" }
-diem-crypto = { path = "../../crates/diem-crypto" }
-diem-genesis-tool = {path = "../../config/management/genesis", features = ["testing"] }
-diem-temppath = { path = "../../crates/diem-temppath" }
-diem-types = { path = "../../types", features = ["fuzzing"] }
-diem-vm = { path = "../../diem-move/diem-vm" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-storage-interface = { path = "../../storage/storage-interface" }
-storage-service = { path = "../../storage/storage-service" }
-diem-transaction-builder = { path = "../../sdk/transaction-builder" }
-vm-genesis = { path = "../../diem-move/vm-genesis" }
+anyhow = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-config = { workspace = true }
+diem-consensus-types = { workspace = true }
+diem-crypto = { workspace = true }
+diem-db = { workspace = true, features = ["fuzzing"] }
+diem-executor = { workspace = true }
+diem-executor-types = { workspace = true }
+diem-genesis = { workspace = true }
+diem-sdk = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-temppath = { workspace = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true }
+diem-vm-genesis = { workspace = true }
+rand = { workspace = true }

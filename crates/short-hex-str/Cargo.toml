@@ -1,21 +1,23 @@
 [package]
-name = "short-hex-str"
+name = "diem-short-hex-str"
+description = "Short hex string encoding"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem implementation for retries of operations"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-mirai-annotations = "1.10.1"
-serde = { version = "1.0.124", default-features = false }
-static_assertions = "1.1.0"
-thiserror = "1.0.24"
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
+mirai-annotations = { workspace = true }
+serde = { workspace = true }
+static_assertions = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-hex = "0.4.3"
-proptest = "1.0.0"
+hex = { workspace = true }
+proptest = { workspace = true }

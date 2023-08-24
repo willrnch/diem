@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,33 +7,44 @@ use crate::{
     continuous_syncer::ContinuousSyncer,
     driver_client::{ClientNotificationListener, DriverNotification},
     error::Error,
+    logging::{LogEntry, LogSchema},
+    metadata_storage::MetadataStorageInterface,
+    metrics,
+    metrics::ExecutingComponent,
     notification_handlers::{
-        CommitNotification, CommitNotificationListener, ConsensusNotificationHandler,
-        ErrorNotification, ErrorNotificationListener, MempoolNotificationHandler,
+        CommitNotification, CommitNotificationListener, CommittedTransactions,
+        ConsensusNotificationHandler, ErrorNotification, ErrorNotificationListener,
+        MempoolNotificationHandler,
     },
     storage_synchronizer::StorageSynchronizerInterface,
     utils,
+    utils::{OutputFallbackHandler, PENDING_DATA_LOG_FREQ_SECS},
 };
-use consensus_notifications::{
+use diem_config::config::{RoleType, StateSyncDriverConfig};
+use diem_consensus_notifications::{
     ConsensusCommitNotification, ConsensusNotification, ConsensusSyncNotification,
 };
-use data_streaming_service::streaming_client::{NotificationFeedback, StreamingServiceClient};
-use diem_config::config::{RoleType, StateSyncDriverConfig};
-use diem_data_client::DiemDataClient;
+use diem_data_client::interface::DiemDataClientInterface;
+use diem_data_streaming_service::streaming_client::{
+    DataStreamingClient, NotificationAndFeedback, NotificationFeedback,
+};
+use diem_event_notifications::EventSubscriptionService;
 use diem_infallible::Mutex;
-use diem_logger::*;
+use diem_logger::prelude::*;
+use diem_mempool_notifications::MempoolNotificationSender;
+use diem_storage_interface::DbReader;
+use diem_time_service::{TimeService, TimeServiceTrait};
 use diem_types::waypoint::Waypoint;
-use event_notifications::EventSubscriptionService;
 use futures::StreamExt;
-use mempool_notifications::MempoolNotificationSender;
-use std::{sync::Arc, time::SystemTime};
-use storage_interface::DbReader;
-use tokio::time::{interval, Duration};
+use std::{sync::Arc, time::Instant};
+use tokio::{
+    task::yield_now,
+    time::{interval, Duration},
+};
 use tokio_stream::wrappers::IntervalStream;
 
-// TODO(joshlind): use structured logging!
-
-const MAX_CONNECTION_DEADLINE_SECS: u64 = 10;
+// Useful constants for the driver
+const DRIVER_ERROR_LOG_FREQ_SECS: u64 = 3;
 
 /// The configuration of the state sync driver
 #[derive(Clone)]
@@ -58,9 +70,15 @@ impl DriverConfiguration {
 }
 
 /// The state sync driver that drives synchronization progress
-pub struct StateSyncDriver<DataClient, MempoolNotifier, StorageSyncer> {
+pub struct StateSyncDriver<
+    DataClient,
+    MempoolNotifier,
+    MetadataStorage,
+    StorageSyncer,
+    StreamingClient,
+> {
     // The component that manages the initial bootstrapping of the node
-    bootstrapper: Bootstrapper<StorageSyncer>,
+    bootstrapper: Bootstrapper<MetadataStorage, StorageSyncer, StreamingClient>,
 
     // The listener for client notifications
     client_notification_listener: ClientNotificationListener,
@@ -72,7 +90,7 @@ pub struct StateSyncDriver<DataClient, MempoolNotifier, StorageSyncer> {
     consensus_notification_handler: ConsensusNotificationHandler,
 
     // The component that manages the continuous syncing of the node
-    continuous_syncer: ContinuousSyncer<StorageSyncer>,
+    continuous_syncer: ContinuousSyncer<StorageSyncer, StreamingClient>,
 
     // The client for checking the global data summary of our peers
     diem_data_client: DataClient,
@@ -90,17 +108,26 @@ pub struct StateSyncDriver<DataClient, MempoolNotifier, StorageSyncer> {
     mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
 
     // The timestamp at which the driver started executing
-    start_time: Option<SystemTime>,
+    start_time: Option<Instant>,
 
     // The interface to read from storage
     storage: Arc<dyn DbReader>,
+
+    // The storage synchronizer used to update local storage
+    storage_synchronizer: StorageSyncer,
+
+    // The time service
+    time_service: TimeService,
 }
 
 impl<
-        DataClient: DiemDataClient + Send + Clone + 'static,
+        DataClient: DiemDataClientInterface + Send + Clone + 'static,
         MempoolNotifier: MempoolNotificationSender,
+        MetadataStorage: MetadataStorageInterface + Clone,
         StorageSyncer: StorageSynchronizerInterface + Clone,
-    > StateSyncDriver<DataClient, MempoolNotifier, StorageSyncer>
+        StreamingClient: DataStreamingClient + Clone,
+    >
+    StateSyncDriver<DataClient, MempoolNotifier, MetadataStorage, StorageSyncer, StreamingClient>
 {
     pub fn new(
         client_notification_listener: ClientNotificationListener,
@@ -108,25 +135,31 @@ impl<
         consensus_notification_handler: ConsensusNotificationHandler,
         driver_configuration: DriverConfiguration,
         error_notification_listener: ErrorNotificationListener,
-        event_subscription_service: EventSubscriptionService,
+        event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
         mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
+        metadata_storage: MetadataStorage,
         storage_synchronizer: StorageSyncer,
         diem_data_client: DataClient,
-        streaming_service_client: StreamingServiceClient,
+        streaming_client: StreamingClient,
         storage: Arc<dyn DbReader>,
+        time_service: TimeService,
     ) -> Self {
-        let event_subscription_service = Arc::new(Mutex::new(event_subscription_service));
+        let output_fallback_handler =
+            OutputFallbackHandler::new(driver_configuration.clone(), time_service.clone());
         let bootstrapper = Bootstrapper::new(
             driver_configuration.clone(),
-            streaming_service_client.clone(),
+            metadata_storage,
+            output_fallback_handler.clone(),
+            streaming_client.clone(),
             storage.clone(),
             storage_synchronizer.clone(),
         );
         let continuous_syncer = ContinuousSyncer::new(
             driver_configuration.clone(),
-            streaming_service_client,
+            streaming_client,
+            output_fallback_handler,
             storage.clone(),
-            storage_synchronizer,
+            storage_synchronizer.clone(),
         );
 
         Self {
@@ -142,6 +175,8 @@ impl<
             mempool_notification_handler,
             start_time: None,
             storage,
+            storage_synchronizer,
+            time_service,
         }
     }
 
@@ -153,12 +188,12 @@ impl<
         .fuse();
 
         // Start the driver
-        info!("Started the state sync v2 driver!");
-        self.start_time = Some(SystemTime::now());
+        info!(LogSchema::new(LogEntry::Driver).message("Started the state sync v2 driver!"));
+        self.start_time = Some(self.time_service.now());
         loop {
             ::futures::select! {
                 notification = self.client_notification_listener.select_next_some() => {
-                    self.handle_client_notification(notification);
+                    self.handle_client_notification(notification).await;
                 },
                 notification = self.commit_notification_listener.select_next_some() => {
                     self.handle_commit_notification(notification).await;
@@ -202,18 +237,17 @@ impl<
                         .consensus_notification_handler
                         .respond_to_commit_notification(commit_notification, Err(error.clone()))
                         .await;
-                }
+                },
                 ConsensusNotification::SyncToTarget(sync_notification) => {
                     let _ = self
                         .consensus_notification_handler
                         .respond_to_sync_notification(sync_notification, Err(error.clone()))
                         .await;
-                }
+                },
             }
-            error!(
-                "Error encountered when handling the consensus notification: {:?}",
-                error
-            );
+            warn!(LogSchema::new(LogEntry::ConsensusNotification)
+                .error(&error)
+                .message("Error encountered when handling the consensus notification!"));
             return;
         }
 
@@ -222,19 +256,18 @@ impl<
             ConsensusNotification::NotifyCommit(commit_notification) => {
                 self.handle_consensus_commit_notification(commit_notification)
                     .await
-            }
+            },
             ConsensusNotification::SyncToTarget(sync_notification) => {
                 self.handle_consensus_sync_notification(sync_notification)
                     .await
-            }
+            },
         };
 
         // Log any errors from notification handling
         if let Err(error) = result {
-            error!(
-                "Error encountered when handling the consensus notification: {:?}",
-                error
-            );
+            warn!(LogSchema::new(LogEntry::ConsensusNotification)
+                .error(&error)
+                .message("Error encountered when handling the consensus notification!"));
         }
     }
 
@@ -243,31 +276,29 @@ impl<
         &mut self,
         consensus_commit_notification: ConsensusCommitNotification,
     ) -> Result<(), Error> {
-        debug!(
-            "Received a consensus commit notification! Transaction total: {:?}, event total: {:?}",
-            consensus_commit_notification.transactions.len(),
-            consensus_commit_notification.reconfiguration_events.len()
+        info!(
+            LogSchema::new(LogEntry::ConsensusNotification).message(&format!(
+                "Received a consensus commit notification! Total transactions: {:?}, events: {:?}",
+                consensus_commit_notification.transactions.len(),
+                consensus_commit_notification.reconfiguration_events.len()
+            ))
         );
+        self.update_consensus_commit_metrics(&consensus_commit_notification);
 
-        // Create a commit notification
         // TODO(joshlind): can we get consensus to forward the events?
-        let commit_notification = CommitNotification::new(
-            consensus_commit_notification.reconfiguration_events.clone(),
-            consensus_commit_notification.transactions.clone(),
-        );
 
         // Handle the commit notification
-        let latest_synced_version = utils::fetch_latest_synced_version(self.storage.clone())?;
-        let latest_synced_ledger_info =
-            utils::fetch_latest_synced_ledger_info(self.storage.clone())?;
-        commit_notification
-            .handle_commit_notification(
-                latest_synced_version,
-                latest_synced_ledger_info,
-                self.mempool_notification_handler.clone(),
-                self.event_subscription_service.clone(),
-            )
-            .await?;
+        let committed_transactions = CommittedTransactions {
+            events: consensus_commit_notification.reconfiguration_events.clone(),
+            transactions: consensus_commit_notification.transactions.clone(),
+        };
+        utils::handle_committed_transactions(
+            committed_transactions,
+            self.storage.clone(),
+            self.mempool_notification_handler.clone(),
+            self.event_subscription_service.clone(),
+        )
+        .await;
 
         // Respond to consensus successfully
         self.consensus_notification_handler
@@ -279,15 +310,55 @@ impl<
         self.check_sync_request_progress().await
     }
 
+    /// Updates the storage synchronizer metrics based on the consensus
+    /// commit notification.
+    fn update_consensus_commit_metrics(
+        &self,
+        consensus_commit_notification: &ConsensusCommitNotification,
+    ) {
+        // Update the driver metrics
+        metrics::increment_counter(
+            &metrics::DRIVER_COUNTERS,
+            metrics::DRIVER_CONSENSUS_COMMIT_NOTIFICATION,
+        );
+
+        // Update the synced versions
+        let operations = [
+            metrics::StorageSynchronizerOperations::ExecutedTransactions,
+            metrics::StorageSynchronizerOperations::Synced,
+        ];
+        for operation in operations {
+            metrics::increment_gauge(
+                &metrics::STORAGE_SYNCHRONIZER_OPERATIONS,
+                operation.get_label(),
+                consensus_commit_notification.transactions.len() as u64,
+            );
+        }
+
+        // Update the synced epoch
+        if !consensus_commit_notification
+            .reconfiguration_events
+            .is_empty()
+        {
+            utils::update_new_epoch_metrics();
+        }
+    }
+
     /// Handles a consensus notification to sync to a specified target
     async fn handle_consensus_sync_notification(
         &mut self,
         sync_notification: ConsensusSyncNotification,
     ) -> Result<(), Error> {
         let latest_synced_version = utils::fetch_latest_synced_version(self.storage.clone())?;
-        debug!(
+        info!(
+            LogSchema::new(LogEntry::ConsensusNotification).message(&format!(
             "Received a consensus sync notification! Target version: {:?}. Latest synced version: {:?}",
             sync_notification.target, latest_synced_version,
+            ))
+        );
+        metrics::increment_counter(
+            &metrics::DRIVER_COUNTERS,
+            metrics::DRIVER_CONSENSUS_SYNC_NOTIFICATION,
         );
 
         // Initialize a new sync request
@@ -299,8 +370,13 @@ impl<
     }
 
     /// Handles a client notification sent by the driver client
-    fn handle_client_notification(&mut self, notification: DriverNotification) {
-        debug!("Received a notify bootstrap notification from the client!");
+    async fn handle_client_notification(&mut self, notification: DriverNotification) {
+        debug!(LogSchema::new(LogEntry::ClientNotification)
+            .message("Received a notify bootstrap notification from the client!"));
+        metrics::increment_counter(
+            &metrics::DRIVER_COUNTERS,
+            metrics::DRIVER_CLIENT_NOTIFICATION,
+        );
 
         // TODO(joshlind): refactor this if the client only supports one notification type!
         // Extract the bootstrap notifier channel
@@ -310,72 +386,41 @@ impl<
         if let Err(error) = self
             .bootstrapper
             .subscribe_to_bootstrap_notifications(notifier_channel)
+            .await
         {
-            error!(
-                "Failed to subscribe to bootstrap notifications! Error: {:?}",
-                error
-            );
+            warn!(LogSchema::new(LogEntry::ClientNotification)
+                .error(&error)
+                .message("Failed to subscribe to bootstrap notifications!"));
         }
     }
 
-    /// Handles a commit notification sent by the storage synchronizer
+    /// Handles a commit notification sent by the storage synchronizer for a
+    /// new state snapshot.
     async fn handle_commit_notification(&mut self, commit_notification: CommitNotification) {
-        debug!("Received a commit notification from the storage synchronizer! Transaction total: {:?}, event total: {:?}",
-               commit_notification.transactions.len(),
-               commit_notification.events.len()
+        let CommitNotification::CommittedStateSnapshot(committed_snapshot) = commit_notification;
+        info!(
+            LogSchema::new(LogEntry::SynchronizerNotification).message(&format!(
+                "Received a state snapshot commit notification from the storage synchronizer. \
+                        Snapshot version: {:?}. Last committed index: {:?}.",
+                committed_snapshot.version, committed_snapshot.last_committed_state_index,
+            ))
         );
 
-        // Fetch the latest synced version and ledger info from storage
-        let (latest_synced_version, latest_synced_ledger_info) =
-            match utils::fetch_latest_synced_version(self.storage.clone()) {
-                Ok(latest_synced_version) => {
-                    match utils::fetch_latest_synced_ledger_info(self.storage.clone()) {
-                        Ok(latest_synced_ledger_info) => {
-                            (latest_synced_version, latest_synced_ledger_info)
-                        }
-                        Err(error) => {
-                            error!(
-                                "Failed to fetch latest synced ledger info! Error: {:?}",
-                                error
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(error) => {
-                    error!("Failed to fetch latest synced version! Error: {:?}", error);
-                    return;
-                }
-            };
-
-        // Handle the commit notification
-        if let Err(error) = commit_notification
-            .handle_commit_notification(
-                latest_synced_version,
-                latest_synced_ledger_info,
-                self.mempool_notification_handler.clone(),
-                self.event_subscription_service.clone(),
-            )
-            .await
-        {
-            error!("Failed to handle a commit notification! Error: {:?}", error);
-        }
-
-        // Update the last commit timestamp for the sync request
-        let consensus_sync_request = self
-            .consensus_notification_handler
-            .get_consensus_sync_request();
-        if let Some(sync_request) = consensus_sync_request.lock().as_mut() {
-            sync_request.update_last_commit_timestamp()
-        };
+        // Handle the committed transactions and events
+        utils::handle_committed_transactions(
+            committed_snapshot.committed_transaction,
+            self.storage.clone(),
+            self.mempool_notification_handler.clone(),
+            self.event_subscription_service.clone(),
+        )
+        .await;
     }
 
     /// Handles an error notification sent by the storage synchronizer
     async fn handle_error_notification(&mut self, error_notification: ErrorNotification) {
-        debug!(
-            "Received an error notification from the storage synchronizer! Error: {:?}",
-            error_notification.clone(),
-        );
+        warn!(LogSchema::new(LogEntry::SynchronizerNotification)
+            .error_notification(error_notification.clone())
+            .message("Received an error notification from the storage synchronizer!"));
 
         // Terminate the currently active streams
         let notification_id = error_notification.notification_id;
@@ -383,37 +428,89 @@ impl<
         if self.bootstrapper.is_bootstrapped() {
             if let Err(error) = self
                 .continuous_syncer
-                .terminate_active_stream(notification_id, notification_feedback)
+                .handle_storage_synchronizer_error(NotificationAndFeedback::new(
+                    notification_id,
+                    notification_feedback,
+                ))
                 .await
             {
-                panic!(
-                    "Failed to terminate the active stream for the continuous syncer! Error: {:?}",
-                    error
-                );
+                error!(LogSchema::new(LogEntry::SynchronizerNotification)
+                    .message(&format!(
+                        "Failed to terminate the active stream for the continuous syncer! Error: {:?}",
+                        error
+                    )));
             }
         } else if let Err(error) = self
             .bootstrapper
-            .terminate_active_stream(notification_id, notification_feedback)
+            .handle_storage_synchronizer_error(NotificationAndFeedback::new(
+                notification_id,
+                notification_feedback,
+            ))
             .await
         {
-            panic!(
-                "Failed to terminate the active stream for the bootstrapper! Error: {:?}",
-                error
+            error!(
+                LogSchema::new(LogEntry::SynchronizerNotification).message(&format!(
+                    "Failed to terminate the active stream for the bootstrapper! Error: {:?}",
+                    error
+                ))
             );
         };
     }
 
     /// Checks if the node has successfully reached the sync target
     async fn check_sync_request_progress(&mut self) -> Result<(), Error> {
-        if !self.consensus_notification_handler.active_sync_request() {
+        if !self.active_sync_request() {
+            return Ok(()); // There's no pending sync request
+        }
+
+        // There's a sync request. Fetch it and check if we're still behind the target.
+        let sync_request = self.consensus_notification_handler.get_sync_request();
+        let sync_target_version = sync_request
+            .lock()
+            .as_ref()
+            .ok_or_else(|| {
+                Error::UnexpectedError(
+                    "We've already verified there is an active sync request!".into(),
+                )
+            })?
+            .get_sync_target_version();
+        let latest_synced_ledger_info =
+            utils::fetch_latest_synced_ledger_info(self.storage.clone())?;
+        if latest_synced_ledger_info.ledger_info().version() < sync_target_version {
             return Ok(());
         }
 
+        // Wait for the storage synchronizer to drain (if it hasn't already).
+        // This prevents notifying consensus prematurely.
+        while self.storage_synchronizer.pending_storage_data() {
+            sample!(
+                SampleRate::Duration(Duration::from_secs(PENDING_DATA_LOG_FREQ_SECS)),
+                info!("Waiting for the storage synchronizer to handle pending data!")
+            );
+
+            // Yield to avoid starving the storage synchronizer threads.
+            yield_now().await;
+        }
+
+        // Refresh the latest synced ledger info and handle the sync request
         let latest_synced_ledger_info =
             utils::fetch_latest_synced_ledger_info(self.storage.clone())?;
         self.consensus_notification_handler
             .check_sync_request_progress(latest_synced_ledger_info)
-            .await
+            .await?;
+
+        // If the sync request was successfully handled, reset the continuous syncer
+        // so that in the event another sync request occurs, we have fresh state.
+        if !self.active_sync_request() {
+            self.continuous_syncer.reset_active_stream(None).await?;
+            self.storage_synchronizer.finish_chunk_executor(); // Consensus is now in control
+        }
+        Ok(())
+    }
+
+    /// Returns true iff there's an active sync request from consensus
+    fn active_sync_request(&self) -> bool {
+        self.consensus_notification_handler.active_sync_request()
     }
 
     /// Returns true iff this node is a validator
@@ -423,38 +520,38 @@ impl<
 
     /// Returns true iff consensus is currently executing
     fn check_if_consensus_executing(&self) -> bool {
-        self.is_validator()
-            && self.bootstrapper.is_bootstrapped()
-            && !self.consensus_notification_handler.active_sync_request()
+        self.is_validator() && self.bootstrapper.is_bootstrapped() && !self.active_sync_request()
     }
 
     /// Checks if the connection deadline has passed. If so, validators with
     /// genesis waypoints will be automatically marked as bootstrapped. This
     /// helps in the case of single node deployments, where there are no peers
     /// and state sync is trivial.
-    fn check_auto_bootstrapping(&mut self) {
+    async fn check_auto_bootstrapping(&mut self) {
         if !self.bootstrapper.is_bootstrapped()
             && self.is_validator()
+            && self.driver_configuration.config.enable_auto_bootstrapping
             && self.driver_configuration.waypoint.version() == 0
         {
             if let Some(start_time) = self.start_time {
-                if let Some(connection_deadline) =
-                    start_time.checked_add(Duration::from_secs(MAX_CONNECTION_DEADLINE_SECS))
-                {
-                    if SystemTime::now()
-                        .duration_since(connection_deadline)
-                        .is_ok()
-                    {
-                        info!("Passed the connection deadline! Auto-bootstrapping the validator!");
-                        if let Err(error) = self.bootstrapper.bootstrapping_complete() {
-                            error!(
-                                "Failed to mark bootstrapping as complete! Error: {:?}",
-                                error
-                            );
+                if let Some(connection_deadline) = start_time.checked_add(Duration::from_secs(
+                    self.driver_configuration
+                        .config
+                        .max_connection_deadline_secs,
+                )) {
+                    if self.time_service.now() >= connection_deadline {
+                        info!(LogSchema::new(LogEntry::AutoBootstrapping).message(
+                            "Passed the connection deadline! Auto-bootstrapping the validator!"
+                        ));
+                        if let Err(error) = self.bootstrapper.bootstrapping_complete().await {
+                            warn!(LogSchema::new(LogEntry::AutoBootstrapping)
+                                .error(&error)
+                                .message("Failed to mark bootstrapping as complete!"));
                         }
                     }
                 } else {
-                    error!("The connection deadline overflowed! Unable to auto-bootstrap!");
+                    warn!(LogSchema::new(LogEntry::AutoBootstrapping)
+                        .message("The connection deadline overflowed! Unable to auto-bootstrap!"));
                 }
             }
         }
@@ -465,44 +562,67 @@ impl<
         // Fetch the global data summary and verify we have active peers
         let global_data_summary = self.diem_data_client.get_global_data_summary();
         if global_data_summary.is_empty() {
-            trace!("The global data summary is empty! It's likely that we have no active peers.");
-            return self.check_auto_bootstrapping();
+            trace!(LogSchema::new(LogEntry::Driver).message(
+                "The global data summary is empty! It's likely that we have no active peers."
+            ));
+            return self.check_auto_bootstrapping().await;
         }
 
         // Check the progress of any sync requests
         if let Err(error) = self.check_sync_request_progress().await {
-            error!(
-                "Error found when checking the sync request progress: {:?}",
-                error
-            );
+            warn!(LogSchema::new(LogEntry::Driver)
+                .error(&error)
+                .message("Error found when checking the sync request progress!"));
         }
 
         // If consensus is executing, there's nothing to do
         if self.check_if_consensus_executing() {
-            trace!("Consensus is executing. There's nothing to do.");
+            trace!(LogSchema::new(LogEntry::Driver)
+                .message("Consensus is executing. There's nothing to do."));
+            metrics::increment_counter(
+                &metrics::EXECUTING_COMPONENT,
+                ExecutingComponent::Consensus.get_label(),
+            );
             return;
         }
 
         // Drive progress depending on if we're bootstrapping or continuously syncing
         if self.bootstrapper.is_bootstrapped() {
-            let consensus_sync_request = self
-                .consensus_notification_handler
-                .get_consensus_sync_request();
+            // Fetch any consensus sync requests
+            let consensus_sync_request = self.consensus_notification_handler.get_sync_request();
+
+            // Attempt to continuously sync
+            metrics::increment_counter(
+                &metrics::EXECUTING_COMPONENT,
+                ExecutingComponent::ContinuousSyncer.get_label(),
+            );
             if let Err(error) = self
                 .continuous_syncer
                 .drive_progress(consensus_sync_request)
                 .await
             {
-                error!(
-                    "Error found when driving progress of the continuous syncer: {:?}",
-                    error
+                sample!(
+                    SampleRate::Duration(Duration::from_secs(DRIVER_ERROR_LOG_FREQ_SECS)),
+                    warn!(LogSchema::new(LogEntry::Driver)
+                        .error(&error)
+                        .message("Error found when driving progress of the continuous syncer!"));
                 );
+                metrics::increment_counter(&metrics::CONTINUOUS_SYNCER_ERRORS, error.get_label());
             }
-        } else if let Err(error) = self.bootstrapper.drive_progress(&global_data_summary).await {
-            error!(
-                "Error found when checking the bootstrapper progress: {:?}",
-                error
+        } else {
+            metrics::increment_counter(
+                &metrics::EXECUTING_COMPONENT,
+                ExecutingComponent::Bootstrapper.get_label(),
             );
+            if let Err(error) = self.bootstrapper.drive_progress(&global_data_summary).await {
+                sample!(
+                        SampleRate::Duration(Duration::from_secs(DRIVER_ERROR_LOG_FREQ_SECS)),
+                        warn!(LogSchema::new(LogEntry::Driver)
+                            .error(&error)
+                            .message("Error found when checking the bootstrapper progress!"));
+                );
+                metrics::increment_counter(&metrics::BOOTSTRAPPER_ERRORS, error.get_label());
+            }
         };
     }
 }

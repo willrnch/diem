@@ -1,18 +1,19 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::{
     peer::DisconnectReason,
-    peer_manager::{conn_notifs_channel, ConnectionRequest},
+    peer_manager::{conn_notifs_channel, ConnectionNotification, ConnectionRequest},
     transport::ConnectionMetadata,
 };
-use channel::{diem_channel, message_queues::QueueStyle};
+use diem_channels::{diem_channel, message_queues::QueueStyle};
 use diem_config::config::{Peer, PeerRole, PeerSet, HANDSHAKE_VERSION};
 use diem_crypto::{test_utils::TEST_SEED, x25519, Uniform};
 use diem_logger::info;
 use diem_time_service::{MockTimeService, TimeService};
-use diem_types::network_address::NetworkAddress;
+use diem_types::{account_address::AccountAddress, network_address::NetworkAddress};
 use futures::{executor::block_on, future, SinkExt};
 use maplit::{hashmap, hashset};
 use rand::rngs::StdRng;
@@ -24,6 +25,8 @@ const CONNECTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECTION_DELAY: Duration = Duration::from_millis(100);
 const MAX_CONNECTION_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_BASE_ADDR: &str = "/ip4/127.0.0.1/tcp/9090";
+
+// TODO: the test code could use a lot of love.
 
 // TODO(philiphayes): just use `CONNECTION_DELAY + MAX_CONNNECTION_DELAY_JITTER`
 // when the const adds are stabilized, instead of this weird thing...
@@ -41,19 +44,14 @@ fn network_address_with_pubkey(
     network_address(addr_str).append_prod_protos(pubkey, HANDSHAKE_VERSION)
 }
 
-fn peer_id(index: usize) -> PeerId {
-    PeerId::new((index as u128).to_be_bytes())
-}
-
-fn test_peer(index: usize) -> (PeerId, Peer, x25519::PublicKey, NetworkAddress) {
+fn test_peer(index: AccountAddress) -> (PeerId, Peer, x25519::PublicKey, NetworkAddress) {
     test_peer_with_address(index, DEFAULT_BASE_ADDR)
 }
 
 fn test_peer_with_address(
-    index: usize,
+    peer_id: AccountAddress,
     addr_str: &'static str,
 ) -> (PeerId, Peer, x25519::PublicKey, NetworkAddress) {
-    let peer_id = peer_id(index);
     let pubkey = x25519::PrivateKey::generate_for_testing().public_key();
     let pubkeys = hashset! { pubkey };
     let addr = network_address_with_pubkey(addr_str, pubkey);
@@ -74,26 +72,28 @@ fn update_peer_with_address(mut peer: Peer, addr_str: &'static str) -> (Peer, Ne
 }
 
 struct TestHarness {
-    trusted_peers: Arc<RwLock<PeerSet>>,
+    network_context: NetworkContext,
+    peers_and_metadata: Arc<PeersAndMetadata>,
     mock_time: MockTimeService,
     connection_reqs_rx: diem_channel::Receiver<PeerId, ConnectionRequest>,
     connection_notifs_tx: conn_notifs_channel::Sender,
-    conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
+    conn_mgr_reqs_tx: diem_channels::Sender<ConnectivityRequest>,
 }
 
 impl TestHarness {
     fn new(seeds: PeerSet) -> (Self, ConnectivityManager<FixedInterval>) {
         let network_context = NetworkContext::mock();
         let time_service = TimeService::mock();
-        let (connection_reqs_tx, connection_reqs_rx) = diem_channel::new(QueueStyle::FIFO, 1, None);
+        let (connection_reqs_tx, connection_reqs_rx) =
+            diem_channel::new(QueueStyle::FIFO, 1, None);
         let (connection_notifs_tx, connection_notifs_rx) = conn_notifs_channel::new();
-        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(0);
-        let trusted_peers = Arc::new(RwLock::new(HashMap::new()));
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = diem_channels::new_test(0);
+        let peers_and_metadata = PeersAndMetadata::new(&[network_context.network_id()]);
 
         let conn_mgr = ConnectivityManager::new(
             network_context,
             time_service.clone(),
-            trusted_peers.clone(),
+            peers_and_metadata.clone(),
             seeds,
             ConnectionRequestSender::new(connection_reqs_tx),
             connection_notifs_rx,
@@ -105,7 +105,8 @@ impl TestHarness {
             true, /* mutual_authentication */
         );
         let mock = Self {
-            trusted_peers,
+            network_context,
+            peers_and_metadata,
             mock_time: time_service.into_mock(),
             connection_reqs_rx,
             connection_notifs_tx,
@@ -209,7 +210,7 @@ impl TestHarness {
             ConnectionRequest::DisconnectPeer(p, result_tx) => {
                 assert_eq!(peer_id, p);
                 result_tx.send(result).unwrap();
-            }
+            },
             request => panic!(
                 "Unexpected ConnectionRequest, expected DisconnectPeer: {:?}",
                 request
@@ -248,7 +249,7 @@ impl TestHarness {
             ConnectionRequest::DialPeer(peer_id, address, result_tx) => {
                 result_tx.send(result).unwrap();
                 (peer_id, address)
-            }
+            },
             request => panic!(
                 "Unexpected ConnectionRequest, expected DialPeer: {:?}",
                 request
@@ -312,8 +313,8 @@ impl TestHarness {
 
 #[test]
 fn connect_to_seeds_on_startup() {
-    let (seed_peer_id, seed_peer, _, seed_addr) = test_peer(1);
-    let seeds = hashmap! {seed_peer_id => seed_peer.clone()};
+    let (seed_peer_id, seed_peer, _, seed_addr) = test_peer(AccountAddress::ONE);
+    let seeds: PeerSet = hashmap! {seed_peer_id => seed_peer.clone()};
     let (mut mock, conn_mgr) = TestHarness::new(seeds.clone());
 
     let test = async move {
@@ -356,7 +357,7 @@ fn connect_to_seeds_on_startup() {
 
 #[test]
 fn addr_change() {
-    let (other_peer_id, other_peer, _, other_addr) = test_peer(0);
+    let (other_peer_id, other_peer, _, other_addr) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -403,7 +404,7 @@ fn addr_change() {
 
 #[test]
 fn lost_connection() {
-    let (other_peer_id, other_peer, _, other_addr) = test_peer(0);
+    let (other_peer_id, other_peer, _, other_addr) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -434,7 +435,7 @@ fn lost_connection() {
 
 #[test]
 fn disconnect() {
-    let (other_peer_id, other_peer, _, other_addr) = test_peer(0);
+    let (other_peer_id, other_peer, _, other_addr) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -469,7 +470,7 @@ fn disconnect() {
 // Tests that connectivity manager retries dials and disconnects on failure.
 #[test]
 fn retry_on_failure() {
-    let (other_peer_id, peer, _, other_addr) = test_peer(0);
+    let (other_peer_id, peer, _, other_addr) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -516,7 +517,7 @@ fn retry_on_failure() {
 // peer, connectivity manager does not send any additional dial or disconnect requests.
 #[test]
 fn no_op_requests() {
-    let (other_peer_id, peer, _, other_addr) = test_peer(0);
+    let (other_peer_id, peer, _, other_addr) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -562,14 +563,19 @@ fn no_op_requests() {
     };
     block_on(future::join(conn_mgr.start(), test));
 }
-
+fn generate_account_address(val: usize) -> AccountAddress {
+    let mut addr = [0u8; AccountAddress::LENGTH];
+    let array = val.to_be_bytes();
+    addr[AccountAddress::LENGTH - array.len()..].copy_from_slice(&array);
+    AccountAddress::new(addr)
+}
 #[test]
 fn backoff_on_failure() {
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
-        let (peer_id_a, peer_a, _, peer_a_addr) = test_peer(1);
-        let (peer_id_b, peer_b, _, peer_b_addr) = test_peer(2);
+        let (peer_id_a, peer_a, _, peer_a_addr) = test_peer(AccountAddress::ONE);
+        let (peer_id_b, peer_b, _, peer_b_addr) = test_peer(generate_account_address(2));
 
         // Sending pubkey set and addr of peers
         let peers = hashmap! {peer_id_a => peer_a, peer_id_b => peer_b};
@@ -601,7 +607,7 @@ fn backoff_on_failure() {
 // multiple listen addresses and some of them don't work.
 #[test]
 fn multiple_addrs_basic() {
-    let (other_peer_id, mut peer, pubkey, _) = test_peer(0);
+    let (other_peer_id, mut peer, pubkey, _) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -636,7 +642,7 @@ fn multiple_addrs_basic() {
 // retry more times than there are addresses.
 #[test]
 fn multiple_addrs_wrapping() {
-    let (other_peer_id, mut peer, pubkey, _) = test_peer(0);
+    let (other_peer_id, mut peer, pubkey, _) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -673,7 +679,7 @@ fn multiple_addrs_wrapping() {
 // multiple listen addrs and then that peer advertises a smaller number of addrs.
 #[test]
 fn multiple_addrs_shrinking() {
-    let (other_peer_id, mut peer, pubkey, _) = test_peer(0);
+    let (other_peer_id, mut peer, pubkey, _) = test_peer(AccountAddress::ZERO);
     let (mut mock, conn_mgr) = TestHarness::new(HashMap::new());
 
     let test = async move {
@@ -716,7 +722,7 @@ fn public_connection_limit() {
     let mut seeds = HashMap::new();
 
     for i in 0..=MAX_TEST_CONNECTIONS {
-        let (peer_id, peer, _, _) = test_peer(i);
+        let (peer_id, peer, _, _) = test_peer(generate_account_address(i));
         seeds.insert(peer_id, peer);
     }
 
@@ -742,11 +748,14 @@ fn public_connection_limit() {
 fn basic_update_discovered_peers() {
     let mut rng = StdRng::from_seed(TEST_SEED);
     let (mock, mut conn_mgr) = TestHarness::new(HashMap::new());
-    let trusted_peers = mock.trusted_peers;
+    let trusted_peers = mock
+        .peers_and_metadata
+        .get_trusted_peers(&mock.network_context.network_id())
+        .unwrap();
 
     // sample some example data
-    let peer_id_a = peer_id(0);
-    let peer_id_b = peer_id(1);
+    let peer_id_a = AccountAddress::ZERO;
+    let peer_id_b = AccountAddress::ONE;
     let addr_a = network_address("/ip4/127.0.0.1/tcp/9090");
     let addr_b = network_address("/ip4/127.0.0.1/tcp/9091");
     let pubkey_1 = x25519::PrivateKey::generate(&mut rng).public_key();
@@ -804,4 +813,96 @@ fn basic_update_discovered_peers() {
     // empty update again does nothing
     conn_mgr.handle_update_discovered_peers(DiscoverySource::Config, peers_empty.clone());
     assert_eq!(*trusted_peers.read(), peers_empty);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stale_peers_unknown_inbound() {
+    // Create a connectivity manager with mutual authentication disabled
+    let (mut mock, mut connectivity_manager) = TestHarness::new(HashMap::new());
+    connectivity_manager.mutual_authentication = false;
+
+    // Verify we have no trusted peers
+    let network_context = mock.network_context;
+    let trusted_peers = mock
+        .peers_and_metadata
+        .get_trusted_peers(&network_context.network_id())
+        .unwrap();
+    assert!(trusted_peers.read().is_empty());
+
+    // Create and connect peer 1 (an unknown outbound connection)
+    let peer_id_1 = PeerId::random();
+    let connection_metadata_1 = ConnectionMetadata::mock_with_role_and_origin(
+        peer_id_1,
+        PeerRole::Unknown,
+        ConnectionOrigin::Outbound,
+    );
+    let connection_notification =
+        ConnectionNotification::NewPeer(connection_metadata_1.clone(), network_context);
+    connectivity_manager.handle_control_notification(connection_notification);
+
+    // Create and connect peer 2 (an unknown inbound connection)
+    let peer_id_2 = PeerId::random();
+    let connection_metadata = ConnectionMetadata::mock_with_role_and_origin(
+        peer_id_2,
+        PeerRole::Unknown,
+        ConnectionOrigin::Inbound,
+    );
+    let connection_notification =
+        ConnectionNotification::NewPeer(connection_metadata, network_context);
+    connectivity_manager.handle_control_notification(connection_notification);
+
+    // Verify we have 2 peers
+    assert_eq!(connectivity_manager.get_connected_peers().len(), 2);
+
+    // Close the stale connections and verify that only peer 1 is disconnected
+    tokio::join!(
+        connectivity_manager.close_stale_connections(),
+        mock.expect_disconnect_fail(peer_id_1, connection_metadata_1.addr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stale_peers_vfn_inbound() {
+    // Create a connectivity manager with mutual authentication disabled
+    let (mut mock, mut connectivity_manager) = TestHarness::new(HashMap::new());
+    connectivity_manager.mutual_authentication = false;
+
+    // Verify we have no trusted peers
+    let network_context = mock.network_context;
+    let trusted_peers = mock
+        .peers_and_metadata
+        .get_trusted_peers(&network_context.network_id())
+        .unwrap();
+    assert!(trusted_peers.read().is_empty());
+
+    // Create and connect peer 1 (a vfn inbound connection)
+    let peer_id_1 = PeerId::random();
+    let connection_metadata = ConnectionMetadata::mock_with_role_and_origin(
+        peer_id_1,
+        PeerRole::ValidatorFullNode,
+        ConnectionOrigin::Inbound,
+    );
+    let connection_notification =
+        ConnectionNotification::NewPeer(connection_metadata, network_context);
+    connectivity_manager.handle_control_notification(connection_notification);
+
+    // Create and connect peer 2 (a validator outbound connection)
+    let peer_id_2 = PeerId::random();
+    let connection_metadata_2 = ConnectionMetadata::mock_with_role_and_origin(
+        peer_id_2,
+        PeerRole::Validator,
+        ConnectionOrigin::Outbound,
+    );
+    let connection_notification =
+        ConnectionNotification::NewPeer(connection_metadata_2.clone(), network_context);
+    connectivity_manager.handle_control_notification(connection_notification);
+
+    // Verify we have 2 peers
+    assert_eq!(connectivity_manager.get_connected_peers().len(), 2);
+
+    // Close the stale connections and verify that only peer 2 is disconnected
+    tokio::join!(
+        connectivity_manager.close_stale_connections(),
+        mock.expect_disconnect_fail(peer_id_2, connection_metadata_2.addr)
+    );
 }

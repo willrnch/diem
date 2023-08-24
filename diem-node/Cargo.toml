@@ -1,64 +1,87 @@
 [package]
 name = "diem-node"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
 description = "Diem node"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "1.6.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-bcs = "0.1.2"
-fail = "0.4.0"
-futures = "0.3.12"
-hex = "0.4.3"
-jemallocator = { version = "0.3.2", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-rand = "0.8.3"
-structopt = "0.3.21"
-tokio = { version = "1.8.1", features = ["full"] }
-tokio-stream = "0.1.4"
+anyhow = { workspace = true }
+diem-api = { workspace = true }
+diem-backup-service = { workspace = true }
+diem-build-info = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-consensus = { workspace = true }
+diem-consensus-notifications = { workspace = true }
+diem-crash-handler = { workspace = true }
+diem-crypto = { workspace = true }
+diem-data-client = { workspace = true }
+diem-data-streaming-service = { workspace = true }
+diem-db = { workspace = true }
+diem-event-notifications = { workspace = true }
+diem-executor = { workspace = true }
+diem-executor-types = { workspace = true }
+diem-framework = { workspace = true }
+diem-genesis = { workspace = true }
+diem-indexer = { workspace = true, optional = true }
+diem-indexer-grpc-fullnode = { workspace = true }
+diem-infallible = { workspace = true }
+diem-inspection-service = { workspace = true }
+diem-logger = { workspace = true }
+diem-mempool = { workspace = true }
+diem-mempool-notifications = { workspace = true }
+diem-network = { workspace = true }
+diem-network-builder = { workspace = true }
+diem-node-identity = { workspace = true }
+diem-peer-monitoring-service-client = { workspace = true }
+diem-peer-monitoring-service-server = { workspace = true }
+diem-peer-monitoring-service-types = { workspace = true }
+diem-runtimes = { workspace = true }
+diem-secure-storage = { workspace = true }
+diem-state-sync-driver = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-storage-service-client = { workspace = true }
+diem-storage-service-server = { workspace = true }
+diem-storage-service-types = { workspace = true }
+diem-telemetry = { workspace = true }
+diem-temppath = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true }
+bcs = { workspace = true }
+clap = { workspace = true }
+fail = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+maplit = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+url = { workspace = true }
 
-backup-service = { path = "../storage/backup/backup-service" }
-consensus = { path = "../consensus" }
-consensus-notifications = { path = "../state-sync/inter-component/consensus-notifications" }
-crash-handler = { path = "../crates/crash-handler" }
-data-streaming-service = { path = "../state-sync/state-sync-v2/data-streaming-service" }
-diem-infallible = { path = "../crates/diem-infallible" }
-debug-interface = { path = "../crates/debug-interface" }
-event-notifications = { path = "../state-sync/inter-component/event-notifications" }
-executor = { path = "../execution/executor" }
-executor-types = { path = "../execution/executor-types" }
-diem-api = { path = "../api" }
-diem-config = { path = "../config" }
-diem-crypto = { path = "../crates/diem-crypto" }
-diem-data-client = { path = "../state-sync/diem-data-client" }
-diem-framework-releases = { path = "../diem-move/diem-framework/DPN/releases" }
-diem-genesis-tool = {path = "../config/management/genesis", features = ["testing"] }
-diem-json-rpc = { path = "../json-rpc" }
-diem-logger = { path = "../crates/diem-logger" }
-diem-mempool = { path = "../mempool" }
-diem-metrics = { path = "../crates/diem-metrics" }
-diem-secure-storage = { path = "../secure/storage" }
-diem-temppath = { path = "../crates/diem-temppath" }
-diem-time-service = { path = "../crates/diem-time-service" }
-diem-types = { path = "../types" }
-diem-vm = { path = "../diem-move/diem-vm" }
-diem-workspace-hack = { version = "0.1", path = "../crates/diem-workspace-hack" }
-diemdb = { path = "../storage/diemdb" }
-mempool-notifications = { path = "../state-sync/inter-component/mempool-notifications" }
-network = { path = "../network" }
-network-builder = { path = "../network/builder" }
-state-sync-multiplexer = { path = "../state-sync/state-sync-v2/state-sync-multiplexer" }
-state-sync-v1 = { path = "../state-sync/state-sync-v1" }
-storage-client = { path = "../storage/storage-client" }
-storage-interface= { path = "../storage/storage-interface" }
-storage-service = { path = "../storage/storage-service" }
-storage-service-client = { path = "../state-sync/storage-service/client" }
-storage-service-server = { path = "../state-sync/storage-service/server" }
+[target.'cfg(unix)'.dependencies]
+jemallocator = { workspace = true }
 
 [features]
-default = []
 assert-private-keys-not-cloneable = ["diem-crypto/assert-private-keys-not-cloneable"]
-failpoints = ["fail/failpoints", "consensus/failpoints", "executor/failpoints", "diem-json-rpc/failpoints", "diem-mempool/failpoints", "diem-api/failpoints"]
+check-vm-features = []
+consensus-only-perf-test = ["diem-executor/consensus-only-perf-test", "diem-mempool/consensus-only-perf-test", "diem-db/consensus-only-perf-test"]
+default = []
+failpoints = ["fail/failpoints", "diem-consensus/failpoints", "diem-executor/failpoints", "diem-mempool/failpoints", "diem-api/failpoints"]
+indexer = ["diem-indexer"]
+network-perf-test = ["diem-peer-monitoring-service-client/network-perf-test", "diem-peer-monitoring-service-server/network-perf-test", "diem-peer-monitoring-service-types/network-perf-test"]
+tokio-console = ["diem-logger/tokio-console"]

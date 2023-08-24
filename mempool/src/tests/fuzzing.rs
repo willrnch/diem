@@ -1,22 +1,27 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     core_mempool::{CoreMempool, TimelineState},
+    network::MempoolSyncMsg,
     shared_mempool::{tasks, types::SharedMempool},
 };
 use diem_config::{config::NodeConfig, network_id::NetworkId};
 use diem_infallible::{Mutex, RwLock};
+use diem_network::{
+    application::{interface::NetworkClient, storage::PeersAndMetadata},
+    protocols::wire::handshake::v1::ProtocolId::MempoolDirectSend,
+};
+use diem_storage_interface::mock::MockDbReaderWriter;
 use diem_types::transaction::SignedTransaction;
-use network::application::storage::PeerMetadataStorage;
+use diem_vm_validator::mocks::mock_vm_validator::MockVMValidator;
 use proptest::{
     arbitrary::any,
     prelude::*,
     strategy::{Just, Strategy},
 };
 use std::{collections::HashMap, sync::Arc};
-use storage_interface::mock::MockDbReaderWriter;
-use vm_validator::mocks::mock_vm_validator::MockVMValidator;
 
 pub fn mempool_incoming_transactions_strategy(
 ) -> impl Strategy<Value = (Vec<SignedTransaction>, TimelineState)> {
@@ -36,18 +41,23 @@ pub fn test_mempool_process_incoming_transactions_impl(
     let config = NodeConfig::default();
     let mock_db = MockDbReaderWriter;
     let vm_validator = Arc::new(RwLock::new(MockVMValidator));
-    let smp = SharedMempool::new(
+    let network_client = NetworkClient::new(
+        vec![MempoolDirectSend],
+        vec![],
+        HashMap::new(),
+        PeersAndMetadata::new(&[NetworkId::Validator]),
+    );
+    let smp: SharedMempool<NetworkClient<MempoolSyncMsg>, MockVMValidator> = SharedMempool::new(
         Arc::new(Mutex::new(CoreMempool::new(&config))),
         config.mempool.clone(),
-        HashMap::new(),
+        network_client,
         Arc::new(mock_db),
         vm_validator,
         vec![],
         config.base.role,
-        PeerMetadataStorage::new(&[NetworkId::Validator]),
     );
 
-    let _ = tasks::process_incoming_transactions(&smp, txns, timeline_state);
+    let _ = tasks::process_incoming_transactions(&smp, txns, timeline_state, false);
 }
 
 proptest! {

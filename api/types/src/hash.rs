@@ -1,11 +1,17 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    fmt::{Formatter, LowerHex},
+    str::FromStr,
+};
 
-#[derive(Clone, Debug, PartialEq, Copy)]
-pub struct HashValue(diem_crypto::hash::HashValue);
+/// A hex encoded 32-byte hash value
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct HashValue(pub diem_crypto::hash::HashValue);
 
 impl From<diem_crypto::hash::HashValue> for HashValue {
     fn from(val: diem_crypto::hash::HashValue) -> Self {
@@ -53,10 +59,21 @@ impl fmt::Display for HashValue {
     }
 }
 
+impl LowerHex for HashValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
+
+impl HashValue {
+    pub fn zero() -> Self {
+        Self(diem_crypto::hash::HashValue::zero())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hash::HashValue;
-
     use serde_json::{json, Value};
 
     #[test]

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{access_path::AccessPath, on_chain_config::ConfigID, transaction::Version};
@@ -6,9 +7,6 @@ use anyhow::Result;
 
 // TODO combine with ConfigStorage
 pub trait MoveStorage {
-    /// Returns a Move resources as a serialized byte array.
-    fn fetch_resource(&self, access_path: AccessPath) -> Result<Vec<u8>>;
-
     /// Returns a Move resources as serialized byte array from a
     /// specified version of the database.
     fn fetch_resource_by_version(
@@ -23,4 +21,7 @@ pub trait MoveStorage {
 
     /// Get the version on the latest transaction info.
     fn fetch_synced_version(&self) -> Result<Version>;
+
+    /// Get the version of the latest state checkpoint
+    fn fetch_latest_state_checkpoint_version(&self) -> Result<Version>;
 }

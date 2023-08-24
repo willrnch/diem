@@ -1,11 +1,19 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{balance_ap, encode_mint_transaction, encode_transfer_transaction, seqnum_ap, MockVM};
 use anyhow::Result;
-use diem_state_view::StateView;
-use diem_types::{access_path::AccessPath, account_address::AccountAddress, write_set::WriteOp};
+use diem_state_view::TStateView;
+use diem_types::{
+    account_address::AccountAddress,
+    state_store::{
+        state_key::StateKey, state_storage_usage::StateStorageUsage, state_value::StateValue,
+    },
+    write_set::WriteOp,
+};
 use diem_vm::VMExecutor;
+use std::collections::BTreeMap;
 
 fn gen_address(index: u8) -> AccountAddress {
     AccountAddress::new([index; AccountAddress::LENGTH])
@@ -13,13 +21,19 @@ fn gen_address(index: u8) -> AccountAddress {
 
 struct MockStateView;
 
-impl StateView for MockStateView {
-    fn get(&self, _access_path: &AccessPath) -> Result<Option<Vec<u8>>> {
+impl TStateView for MockStateView {
+    type Key = StateKey;
+
+    fn get_state_value(&self, _state_key: &StateKey) -> Result<Option<StateValue>> {
         Ok(None)
     }
 
     fn is_genesis(&self) -> bool {
         false
+    }
+
+    fn get_usage(&self) -> Result<StateStorageUsage> {
+        Ok(StateStorageUsage::new_untracked())
     }
 }
 
@@ -31,23 +45,29 @@ fn test_mock_vm_different_senders() {
         txns.push(encode_mint_transaction(gen_address(i), amount));
     }
 
-    let outputs = MockVM::execute_block(txns.clone(), &MockStateView)
+    let outputs = MockVM::execute_block(txns.clone(), &MockStateView, None)
         .expect("MockVM should not fail to start");
 
     for (output, txn) in itertools::zip_eq(outputs.iter(), txns.iter()) {
-        let sender = txn.as_signed_user_txn().unwrap().sender();
+        let sender = txn.try_as_signed_user_txn().unwrap().sender();
         assert_eq!(
-            output.write_set().iter().cloned().collect::<Vec<_>>(),
-            vec![
+            output
+                .write_set()
+                .iter()
+                .map(|(key, op)| (key.clone(), op.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            [
                 (
-                    balance_ap(sender),
-                    WriteOp::Value(amount.to_le_bytes().to_vec())
+                    StateKey::access_path(balance_ap(sender)),
+                    WriteOp::Modification(amount.to_le_bytes().to_vec())
                 ),
                 (
-                    seqnum_ap(sender),
-                    WriteOp::Value(1u64.to_le_bytes().to_vec())
+                    StateKey::access_path(seqnum_ap(sender)),
+                    WriteOp::Modification(1u64.to_le_bytes().to_vec())
                 ),
             ]
+            .into_iter()
+            .collect()
         );
     }
 }
@@ -62,21 +82,27 @@ fn test_mock_vm_same_sender() {
     }
 
     let outputs =
-        MockVM::execute_block(txns, &MockStateView).expect("MockVM should not fail to start");
+        MockVM::execute_block(txns, &MockStateView, None).expect("MockVM should not fail to start");
 
     for (i, output) in outputs.iter().enumerate() {
         assert_eq!(
-            output.write_set().iter().cloned().collect::<Vec<_>>(),
-            vec![
+            output
+                .write_set()
+                .iter()
+                .map(|(key, op)| (key.clone(), op.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            [
                 (
-                    balance_ap(sender),
-                    WriteOp::Value((amount * (i as u64 + 1)).to_le_bytes().to_vec())
+                    StateKey::access_path(balance_ap(sender)),
+                    WriteOp::Modification((amount * (i as u64 + 1)).to_le_bytes().to_vec())
                 ),
                 (
-                    seqnum_ap(sender),
-                    WriteOp::Value((i as u64 + 1).to_le_bytes().to_vec())
+                    StateKey::access_path(seqnum_ap(sender)),
+                    WriteOp::Modification((i as u64 + 1).to_le_bytes().to_vec())
                 ),
             ]
+            .into_iter()
+            .collect()
         );
     }
 }
@@ -90,7 +116,7 @@ fn test_mock_vm_payment() {
     ];
 
     let output =
-        MockVM::execute_block(txns, &MockStateView).expect("MockVM should not fail to start");
+        MockVM::execute_block(txns, &MockStateView, None).expect("MockVM should not fail to start");
 
     let mut output_iter = output.iter();
     output_iter.next();
@@ -101,21 +127,23 @@ fn test_mock_vm_payment() {
             .unwrap()
             .write_set()
             .iter()
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![
+            .map(|(key, op)| (key.clone(), op.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        [
             (
-                balance_ap(gen_address(0)),
-                WriteOp::Value(50u64.to_le_bytes().to_vec())
+                StateKey::access_path(balance_ap(gen_address(0))),
+                WriteOp::Modification(50u64.to_le_bytes().to_vec())
             ),
             (
-                seqnum_ap(gen_address(0)),
-                WriteOp::Value(2u64.to_le_bytes().to_vec())
+                StateKey::access_path(seqnum_ap(gen_address(0))),
+                WriteOp::Modification(2u64.to_le_bytes().to_vec())
             ),
             (
-                balance_ap(gen_address(1)),
-                WriteOp::Value(150u64.to_le_bytes().to_vec())
+                StateKey::access_path(balance_ap(gen_address(1))),
+                WriteOp::Modification(150u64.to_le_bytes().to_vec())
             ),
         ]
+        .into_iter()
+        .collect()
     );
 }

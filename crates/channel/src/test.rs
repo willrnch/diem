@@ -1,8 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate as channel;
-use diem_metrics::IntGauge;
+use diem_metrics_core::IntGauge;
 use futures::{
     executor::block_on,
     task::{noop_waker, Context, Poll},

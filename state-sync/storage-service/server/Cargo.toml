@@ -1,39 +1,48 @@
 [package]
-name = "storage-service-server"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-storage-service-server"
 description = "The Diem storage service (server-side)"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-bcs = "0.1.2"
-bytes = "1.0.1"
-futures = "0.3.12"
-once_cell = "1.7.2"
-serde = { version = "1.0.124", default-features = false }
-thiserror = "1.0.24"
-tokio = { version = "1.8.1", features = ["rt", "macros"], default-features = false }
-
-bounded-executor = { path = "../../../crates/bounded-executor" }
-channel = { path = "../../../crates/channel" }
-diem-config = { path = "../../../config" }
-diem-logger = { path = "../../../crates/diem-logger" }
-diem-metrics = { path = "../../../crates/diem-metrics" }
-diem-types = { path = "../../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../../crates/diem-workspace-hack" }
-network = { path = "../../../network" }
-storage-interface = { path = "../../../storage/storage-interface" }
-storage-service-types = { path = "../types" }
+diem-bounded-executor = { workspace = true }
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-network = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-storage-service-types = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+lru = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-anyhow = "1.0.52"
-claim = "0.5.0"
-
-diem-crypto = { path = "../../../crates/diem-crypto" }
-diem-types = { path = "../../../types" }
-move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-storage-interface = { path = "../../../storage/storage-interface" }
+anyhow = { workspace = true }
+diem-bitvec = { workspace = true }
+diem-config = { workspace = true, features = ["fuzzing"] }
+diem-crypto = { workspace = true }
+diem-netcore = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-time-service = { workspace = true, features = ["async", "testing"] }
+diem-types = { workspace = true }
+claims = { workspace = true }
+maplit = { workspace = true }
+mockall = { workspace = true }
+rand = { workspace = true }

@@ -1,19 +1,19 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::vote_data::VoteData;
 use anyhow::{ensure, Context};
+use diem_bitvec::BitVec;
 use diem_crypto::{hash::CryptoHash, HashValue};
 use diem_types::{
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     validator_verifier::ValidatorVerifier,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fmt::{Display, Formatter},
-};
+use std::fmt::{Display, Formatter};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct QuorumCert {
@@ -87,12 +87,22 @@ impl QuorumCert {
             ledger_info.timestamp_usecs(),
             None,
         );
+
         let vote_data = VoteData::new(ancestor.clone(), ancestor.clone());
         let li = LedgerInfo::new(ancestor, vote_data.hash());
 
+        let validator_set_size = ledger_info
+            .next_epoch_state()
+            .expect("Next epoch state not found in ledger info")
+            .verifier
+            .len();
+
         QuorumCert::new(
             vote_data,
-            LedgerInfoWithSignatures::new(li, BTreeMap::new()),
+            LedgerInfoWithSignatures::new(
+                li,
+                AggregateSignature::new(BitVec::with_num_bits(validator_set_size as u16), None),
+            ),
         )
     }
 
@@ -115,7 +125,7 @@ impl QuorumCert {
                 "Genesis QC has inconsistent commit block with certified block"
             );
             ensure!(
-                self.ledger_info().signatures().is_empty(),
+                self.ledger_info().get_num_voters() == 0,
                 "Genesis QC should not carry signatures"
             );
             return Ok(());
@@ -125,5 +135,20 @@ impl QuorumCert {
             .context("Fail to verify QuorumCert")?;
         self.vote_data.verify()?;
         Ok(())
+    }
+
+    pub fn create_merged_with_executed_state(
+        &self,
+        executed_ledger_info: LedgerInfoWithSignatures,
+    ) -> anyhow::Result<QuorumCert> {
+        let self_commit_info = self.commit_info();
+        let executed_commit_info = executed_ledger_info.ledger_info().commit_info();
+        ensure!(
+            self_commit_info.match_ordered_only(executed_commit_info),
+            "Block info from QC and executed LI need to match, {:?} and {:?}",
+            self_commit_info,
+            executed_commit_info
+        );
+        Ok(Self::new(self.vote_data.clone(), executed_ledger_info))
     }
 }

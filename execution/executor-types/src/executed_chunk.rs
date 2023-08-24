@@ -1,19 +1,20 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use crate::{ExecutedTrees, StateComputeResult, TransactionData};
-use anyhow::{ensure, Result};
-use diem_crypto::hash::{CryptoHash, TransactionAccumulatorHasher};
+use crate::TransactionData;
+use anyhow::{bail, ensure, Result};
+use diem_crypto::hash::CryptoHash;
+use diem_storage_interface::ExecutedTrees;
 use diem_types::{
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    proof::accumulator::InMemoryAccumulator,
+    state_store::create_empty_sharded_state_updates,
     transaction::{Transaction, TransactionInfo, TransactionStatus, TransactionToCommit},
 };
-use std::sync::Arc;
 
 #[derive(Default)]
 pub struct ExecutedChunk {
@@ -46,13 +47,17 @@ impl ExecutedChunk {
         self.to_commit
             .iter()
             .map(|(txn, txn_data)| {
+                let mut sharded_state_updates = create_empty_sharded_state_updates();
+                txn_data.state_updates().iter().for_each(|(k, v)| {
+                    sharded_state_updates[k.get_shard_id() as usize].insert(k.clone(), v.clone());
+                });
                 Ok(TransactionToCommit::new(
                     txn.clone(),
                     txn_data.txn_info.clone(),
-                    txn_data.account_blobs().clone(),
-                    Some(txn_data.jf_node_hashes().clone()),
+                    sharded_state_updates,
                     txn_data.write_set().clone(),
                     txn_data.events().to_vec(),
+                    txn_data.is_reconfig(),
                 ))
             })
             .collect()
@@ -65,8 +70,7 @@ impl ExecutedChunk {
     pub fn events_to_commit(&self) -> Vec<ContractEvent> {
         self.to_commit
             .iter()
-            .map(|(_, txn_data)| txn_data.events())
-            .flatten()
+            .flat_map(|(_, txn_data)| txn_data.events())
             .cloned()
             .collect()
     }
@@ -94,11 +98,25 @@ impl ExecutedChunk {
             .iter()
             .map(CryptoHash::hash)
             .collect::<Vec<_>>();
-        ensure!(
-            txn_info_hashes == expected_txn_info_hashes,
-            "Transaction infos don't match",
-        );
-        Ok(())
+
+        if txn_info_hashes != expected_txn_info_hashes {
+            for (idx, ((_, txn_data), expected_txn_info)) in
+                itertools::zip_eq(self.to_commit.iter(), transaction_infos.iter()).enumerate()
+            {
+                if &txn_data.txn_info != expected_txn_info {
+                    bail!(
+                        "Transaction infos don't match. version: {}, txn_info:{}, expected_txn_info:{}",
+                        self.result_view.txn_accumulator().version() + 1 + idx as u64
+                            - self.to_commit.len() as u64,
+                        &txn_data.txn_info,
+                        expected_txn_info,
+                    )
+                }
+            }
+            unreachable!()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn maybe_select_chunk_ending_ledger_info(
@@ -149,45 +167,11 @@ impl ExecutedChunk {
         }
     }
 
-    pub fn combine(self, rhs: Self) -> Result<Self> {
-        let mut to_commit = self.to_commit;
-        to_commit.extend(rhs.to_commit.into_iter());
-        let mut status = self.status;
-        status.extend(rhs.status.into_iter());
-
-        Ok(Self {
-            status,
-            to_commit,
-            result_view: rhs.result_view,
-            next_epoch_state: rhs.next_epoch_state,
-            ledger_info: rhs.ledger_info,
-        })
-    }
-
-    pub fn as_state_compute_result(
-        &self,
-        parent_accumulator: &Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
-    ) -> StateComputeResult {
-        let txn_accu = self.result_view.txn_accumulator();
-
-        let mut transaction_info_hashes = Vec::new();
-        let mut reconfig_events = Vec::new();
-
-        for (_, txn_data) in &self.to_commit {
-            transaction_info_hashes.push(txn_data.txn_info_hash());
-            reconfig_events.extend(txn_data.reconfig_events.iter().cloned())
-        }
-
-        StateComputeResult::new(
-            txn_accu.root_hash(),
-            txn_accu.frozen_subtree_roots().clone(),
-            txn_accu.num_leaves(),
-            parent_accumulator.frozen_subtree_roots().clone(),
-            parent_accumulator.num_leaves(),
-            self.next_epoch_state.clone(),
-            self.status.clone(),
-            transaction_info_hashes,
-            reconfig_events,
-        )
+    pub fn combine(&mut self, rhs: Self) {
+        self.to_commit.extend(rhs.to_commit.into_iter());
+        self.status.extend(rhs.status.into_iter());
+        self.result_view = rhs.result_view;
+        self.next_epoch_state = rhs.next_epoch_state;
+        self.ledger_info = rhs.ledger_info;
     }
 }

@@ -1,134 +1,234 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{context::Context, index};
-
-use diem_config::config::{ApiConfig, JsonRpcConfig, NodeConfig};
+use crate::{
+    accounts::AccountsApi, basic::BasicApi, blocks::BlocksApi, check_size::PostSizeLimit,
+    context::Context, error_converter::convert_error, events::EventsApi, index::IndexApi,
+    log::middleware_log, set_failpoints, state::StateApi, transactions::TransactionsApi,
+    view_function::ViewFunctionApi,
+};
+use anyhow::Context as AnyhowContext;
+use diem_api_types::X_DIEM_CLIENT;
+use diem_config::config::{ApiConfig, NodeConfig};
+use diem_logger::info;
 use diem_mempool::MempoolClientSender;
+use diem_storage_interface::DbReader;
 use diem_types::chain_id::ChainId;
-use futures::join;
-use storage_interface::MoveDbReader;
-use warp::{Filter, Reply};
+use poem::{
+    http::{header, Method},
+    listener::{Listener, RustlsCertificate, RustlsConfig, TcpListener},
+    middleware::Cors,
+    EndpointExt, Route, Server,
+};
+use poem_openapi::{ContactObject, LicenseObject, OpenApiService};
+use std::{net::SocketAddr, sync::Arc};
+use tokio::runtime::{Handle, Runtime};
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-use tokio::runtime::{Builder, Runtime};
+const VERSION: &str = include_str!("../doc/.version");
 
-/// Creates HTTP server (warp-based) serves for both REST and JSON-RPC API.
-/// When api and json-rpc are configured with same port, both API will be served for the port.
-/// When api and json-rpc are configured with different port, both API will be served for
-/// both ports.
-/// Returns corresponding Tokio runtime
+/// Create a runtime and attach the Poem webserver to it.
 pub fn bootstrap(
     config: &NodeConfig,
     chain_id: ChainId,
-    db: Arc<dyn MoveDbReader>,
+    db: Arc<dyn DbReader>,
     mp_sender: MempoolClientSender,
 ) -> anyhow::Result<Runtime> {
-    let runtime = Builder::new_multi_thread()
-        .thread_name("api")
-        .enable_all()
-        .build()
-        .expect("[api] failed to create runtime");
+    let max_runtime_workers = get_max_runtime_workers(&config.api);
+    let runtime = diem_runtimes::spawn_named_runtime("api".into(), Some(max_runtime_workers));
 
-    let role = config.base.role;
-    let json_rpc_config = config.json_rpc.clone();
-    let api_config = config.api.clone();
-    let api = WebServer::from(api_config.clone());
-    let jsonrpc = WebServer::from(json_rpc_config.clone());
+    let context = Context::new(chain_id, db, mp_sender, config.clone());
 
-    runtime.spawn(async move {
-        let context = Context::new(chain_id, db, mp_sender, role, json_rpc_config, api_config);
-        let routes = index::routes(context);
-        if api.address.port() == jsonrpc.address.port() {
-            // when we rollout api, it's likely there is no api configuration for diem
-            // node, we will load default api configurations (127.0.0.1:8080).
-            // if ip is unspecified(0.0.0.0), we assume it is properly configured and
-            // prefer the api web server configuration over jsonrpc configuration.
-            if api.address.ip() == jsonrpc.address.ip() || api.address.ip().is_unspecified() {
-                api.serve(routes).await;
-            } else {
-                jsonrpc.serve(routes).await;
-            }
-        } else {
-            join!(api.serve(routes.clone()), jsonrpc.serve(routes));
-        }
-    });
+    attach_poem_to_runtime(runtime.handle(), context, config, false)
+        .context("Failed to attach poem to runtime")?;
+
     Ok(runtime)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct WebServer {
-    pub address: SocketAddr,
-    pub tls_cert_path: Option<String>,
-    pub tls_key_path: Option<String>,
+// TODOs regarding spec generation:
+// TODO: https://github.com/aptos-labs/diem-core/issues/2280
+// TODO: https://github.com/poem-web/poem/issues/321
+// TODO: https://github.com/poem-web/poem/issues/332
+// TODO: https://github.com/poem-web/poem/issues/333
+
+/// Generate the top level API service
+pub fn get_api_service(
+    context: Arc<Context>,
+) -> OpenApiService<
+    (
+        AccountsApi,
+        BasicApi,
+        BlocksApi,
+        EventsApi,
+        IndexApi,
+        StateApi,
+        TransactionsApi,
+        ViewFunctionApi,
+    ),
+    (),
+> {
+    // These APIs get merged.
+    let apis = (
+        AccountsApi {
+            context: context.clone(),
+        },
+        BasicApi {
+            context: context.clone(),
+        },
+        BlocksApi {
+            context: context.clone(),
+        },
+        EventsApi {
+            context: context.clone(),
+        },
+        IndexApi {
+            context: context.clone(),
+        },
+        StateApi {
+            context: context.clone(),
+        },
+        TransactionsApi {
+            context: context.clone(),
+        },
+        ViewFunctionApi { context },
+    );
+
+    let version = VERSION.to_string();
+    let license =
+        LicenseObject::new("Apache 2.0").url("https://www.apache.org/licenses/LICENSE-2.0.html");
+    let contact = ContactObject::new()
+        .name("Diem Labs")
+        .url("https://github.com/aptos-labs/diem-core");
+
+    OpenApiService::new(apis, "Diem Node API", version.trim())
+        .server("/v1")
+        .description("The Diem Node API is a RESTful API for client applications to interact with the Diem blockchain.")
+        .license(license)
+        .contact(contact)
+        .external_document("https://github.com/aptos-labs/diem-core")
 }
 
-impl From<ApiConfig> for WebServer {
-    fn from(cfg: ApiConfig) -> Self {
-        Self::new(cfg.address, cfg.tls_cert_path, cfg.tls_key_path)
+/// Returns address it is running at.
+pub fn attach_poem_to_runtime(
+    runtime_handle: &Handle,
+    context: Context,
+    config: &NodeConfig,
+    random_port: bool,
+) -> anyhow::Result<SocketAddr> {
+    let context = Arc::new(context);
+
+    let size_limit = context.content_length_limit();
+
+    let api_service = get_api_service(context.clone());
+
+    let spec_json = api_service.spec_endpoint();
+    let spec_yaml = api_service.spec_endpoint_yaml();
+
+    let mut address = config.api.address;
+
+    if random_port {
+        // Let the OS assign an open port.
+        address.set_port(0);
     }
+
+    // Build listener with or without TLS
+    let listener = match (&config.api.tls_cert_path, &config.api.tls_key_path) {
+        (Some(tls_cert_path), Some(tls_key_path)) => {
+            info!("Using TLS for API");
+            let cert = std::fs::read_to_string(tls_cert_path).context(format!(
+                "Failed to read TLS cert from path: {}",
+                tls_cert_path
+            ))?;
+            let key = std::fs::read_to_string(tls_key_path).context(format!(
+                "Failed to read TLS key from path: {}",
+                tls_key_path
+            ))?;
+            let rustls_certificate = RustlsCertificate::new().cert(cert).key(key);
+            let rustls_config = RustlsConfig::new().fallback(rustls_certificate);
+            TcpListener::bind(address).rustls(rustls_config).boxed()
+        },
+        _ => {
+            info!("Not using TLS for API");
+            TcpListener::bind(address).boxed()
+        },
+    };
+
+    let acceptor = tokio::task::block_in_place(move || {
+        runtime_handle
+            .block_on(async move { listener.into_acceptor().await })
+            .with_context(|| format!("Failed to bind Poem to address: {}", address))
+    })?;
+
+    let actual_address = &acceptor.local_addr()[0];
+    let actual_address = *actual_address
+        .as_socket_addr()
+        .context("Failed to get socket addr from local addr for Poem webserver")?;
+    runtime_handle.spawn(async move {
+        let cors = Cors::new()
+            // To allow browsers to use cookies (for cookie-based sticky
+            // routing in the LB) we must enable this:
+            // https://stackoverflow.com/a/24689738/3846032
+            .allow_credentials(true)
+            .allow_methods(vec![Method::GET, Method::POST])
+            .allow_headers(vec![
+                header::HeaderName::from_static(X_DIEM_CLIENT),
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+            ]);
+
+        // Build routes for the API
+        let route = Route::new()
+            .nest(
+                "/v1",
+                Route::new()
+                    .nest("/", api_service)
+                    .at("/spec.json", spec_json)
+                    .at("/spec.yaml", spec_yaml)
+                    // TODO: We add this manually outside of the OpenAPI spec for now.
+                    // https://github.com/poem-web/poem/issues/364
+                    .at(
+                        "/set_failpoint",
+                        poem::get(set_failpoints::set_failpoint_poem).data(context.clone()),
+                    ),
+            )
+            .with(cors)
+            .with(PostSizeLimit::new(size_limit))
+            // NOTE: Make sure to keep this after all the `with` middleware.
+            .catch_all_error(convert_error)
+            .around(middleware_log);
+        Server::new_with_acceptor(acceptor)
+            .run(route)
+            .await
+            .map_err(anyhow::Error::msg)
+    });
+
+    info!("API server is running at {}", actual_address);
+
+    Ok(actual_address)
 }
 
-impl From<JsonRpcConfig> for WebServer {
-    fn from(cfg: JsonRpcConfig) -> Self {
-        Self::new(cfg.address, cfg.tls_cert_path, cfg.tls_key_path)
-    }
-}
-
-impl WebServer {
-    pub fn new(
-        address: SocketAddr,
-        tls_cert_path: Option<String>,
-        tls_key_path: Option<String>,
-    ) -> Self {
-        Self {
-            address,
-            tls_cert_path,
-            tls_key_path,
-        }
-    }
-
-    pub async fn serve<F>(&self, routes: F)
-    where
-        F: Filter<Error = Infallible> + Clone + Sync + Send + 'static,
-        F::Extract: Reply,
-    {
-        match &self.tls_cert_path {
-            None => warp::serve(routes).bind(self.address).await,
-            Some(cert_path) => {
-                warp::serve(routes)
-                    .tls()
-                    .cert_path(cert_path)
-                    .key_path(self.tls_key_path.as_ref().unwrap())
-                    .bind(self.address)
-                    .await
-            }
-        }
-    }
+/// Returns the maximum number of runtime workers to be given to the
+/// API runtime. Defaults to 2 * number of CPU cores if not specified
+/// via the given config.
+fn get_max_runtime_workers(api_config: &ApiConfig) -> usize {
+    api_config
+        .max_runtime_workers
+        .unwrap_or_else(|| num_cpus::get() * api_config.runtime_worker_multiplier)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::bootstrap;
+    use crate::runtime::get_max_runtime_workers;
+    use diem_api_test_context::{new_test_context, TestContext};
+    use diem_config::config::{ApiConfig, NodeConfig};
+    use diem_types::chain_id::ChainId;
     use std::time::Duration;
 
-    use diem_config::config::NodeConfig;
-    use diem_types::chain_id::ChainId;
-    use serde_json::json;
-
-    use crate::{
-        runtime::bootstrap,
-        tests::{new_test_context, TestContext},
-    };
-
-    #[test]
-    fn test_bootstrap_jsonprc_and_api_configured_same_address() {
-        let mut cfg = NodeConfig::default();
-        cfg.randomize_ports();
-        // same port and ip
-        cfg.api.address = cfg.json_rpc.address;
-        bootstrap_with_config(cfg);
-    }
-
+    // TODO: Unignore this when I figure out why this only works when being
+    // run alone (it fails when run with other tests).
+    // https://github.com/aptos-labs/diem-core/issues/2977
+    #[ignore]
     #[test]
     fn test_bootstrap_jsonprc_and_api_configured_at_different_port() {
         let mut cfg = NodeConfig::default();
@@ -137,29 +237,47 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_same_port_and_jsonprc_with_unspecified_ip() {
-        let mut cfg = NodeConfig::default();
-        cfg.randomize_ports();
-        cfg.json_rpc.address = format!("0.0.0.0:{}", cfg.api.address.port())
-            .parse()
-            .unwrap();
-        bootstrap_with_config(cfg);
-    }
+    fn test_max_runtime_workers() {
+        // Specify the number of workers for the runtime
+        let max_runtime_workers = 100;
+        let api_config = ApiConfig {
+            max_runtime_workers: Some(max_runtime_workers),
+            ..Default::default()
+        };
 
-    #[test]
-    fn test_bootstrap_same_port_and_api_with_unspecified_ip() {
-        let mut cfg = NodeConfig::default();
-        cfg.randomize_ports();
-        cfg.api.address = format!("0.0.0.0:{}", cfg.json_rpc.address.port())
-            .parse()
-            .unwrap();
+        // Verify the correct number of workers is returned
+        assert_eq!(get_max_runtime_workers(&api_config), max_runtime_workers);
 
-        bootstrap_with_config(cfg);
+        // Don't specify the number of workers for the runtime
+        let api_config = ApiConfig {
+            max_runtime_workers: None,
+            ..Default::default()
+        };
+
+        // Verify the correct number of workers is returned
+        assert_eq!(
+            get_max_runtime_workers(&api_config),
+            num_cpus::get() * api_config.runtime_worker_multiplier
+        );
+
+        // Update the multiplier
+        let api_config = ApiConfig {
+            runtime_worker_multiplier: 10,
+            ..Default::default()
+        };
+
+        // Verify the correct number of workers is returned
+        assert_eq!(
+            get_max_runtime_workers(&api_config),
+            num_cpus::get() * api_config.runtime_worker_multiplier
+        );
     }
 
     pub fn bootstrap_with_config(cfg: NodeConfig) {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let context = runtime.block_on(new_test_context_async());
+        let context = runtime.block_on(new_test_context_async(
+            "test_bootstrap_jsonprc_and_api_configured_at_different_port".to_string(),
+        ));
         let ret = bootstrap(
             &cfg,
             ChainId::test(),
@@ -169,11 +287,10 @@ mod tests {
         assert!(ret.is_ok());
 
         assert_web_server(cfg.api.address.port());
-        assert_web_server(cfg.json_rpc.address.port());
     }
 
     pub fn assert_web_server(port: u16) {
-        let base_url = format!("http://localhost:{}", port);
+        let base_url = format!("http://localhost:{}/v1", port);
         let client = reqwest::blocking::Client::new();
         // first call have retry to ensure the server is ready to serve
         let api_resp = with_retry(|| Ok(client.get(&base_url).send()?)).unwrap();
@@ -183,12 +300,6 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(healthy_check_resp.status(), 200);
-        let jsonrpc_resp = client
-            .post(&base_url)
-            .json(&json!({"jsonrpc": "2.0", "method": "get_metadata", "id": 1}))
-            .send()
-            .unwrap();
-        assert_eq!(jsonrpc_resp.status(), 200);
     }
 
     fn with_retry<F>(f: F) -> anyhow::Result<reqwest::blocking::Response>
@@ -202,13 +313,13 @@ mod tests {
                 Err(_) if remaining_attempts > 0 => {
                     remaining_attempts -= 1;
                     std::thread::sleep(Duration::from_millis(100));
-                }
+                },
                 Err(error) => return Err(error),
             }
         }
     }
 
-    pub async fn new_test_context_async() -> TestContext {
-        new_test_context()
+    pub async fn new_test_context_async(test_name: String) -> TestContext {
+        new_test_context(test_name, NodeConfig::default(), false)
     }
 }

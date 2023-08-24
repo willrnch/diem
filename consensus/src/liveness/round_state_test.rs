@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,18 +8,21 @@ use crate::{
     },
     util::mock_time_service::SimulatedTimeService,
 };
-
-use consensus_types::{
-    common::Round, quorum_cert::QuorumCert, sync_info::SyncInfo, timeout::Timeout,
-    timeout_certificate::TimeoutCertificate, vote_data::VoteData,
+use diem_consensus_types::{
+    common::Round,
+    quorum_cert::QuorumCert,
+    sync_info::SyncInfo,
+    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
+    vote_data::VoteData,
 };
 use diem_crypto::HashValue;
 use diem_types::{
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
 };
 use futures::StreamExt;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 #[test]
 fn test_round_time_interval() {
@@ -78,10 +82,10 @@ fn test_round_event_generation() {
     );
 }
 
-fn make_round_state() -> (RoundState, channel::Receiver<Round>) {
+fn make_round_state() -> (RoundState, diem_channels::Receiver<Round>) {
     let time_interval = Box::new(ExponentialTimeInterval::fixed(Duration::from_millis(2)));
     let simulated_time = SimulatedTimeService::auto_advance_until(Duration::from_millis(4));
-    let (timeout_tx, timeout_rx) = channel::new_test(1_024);
+    let (timeout_tx, timeout_rx) = diem_channels::new_test(1_024);
     (
         RoundState::new(time_interval, Arc::new(simulated_time), timeout_tx),
         timeout_rx,
@@ -119,7 +123,7 @@ fn generate_sync_info(
     );
     let ledger_info = LedgerInfoWithSignatures::new(
         LedgerInfo::new(commit_block, HashValue::zero()),
-        BTreeMap::new(),
+        AggregateSignature::empty(),
     );
     let quorum_cert = QuorumCert::new(
         VoteData::new(
@@ -137,6 +141,10 @@ fn generate_sync_info(
         ledger_info,
     );
     let commit_cert = quorum_cert.clone();
-    let timeout_cert = TimeoutCertificate::new(Timeout::new(1, timeout_round));
-    SyncInfo::new(quorum_cert, commit_cert, Some(timeout_cert), None)
+    let tc = TwoChainTimeoutCertificate::new(TwoChainTimeout::new(
+        1,
+        timeout_round,
+        quorum_cert.clone(),
+    ));
+    SyncInfo::new(quorum_cert, commit_cert, Some(tc))
 }

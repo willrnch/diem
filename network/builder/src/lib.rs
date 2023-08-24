@@ -1,7 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-pub use network::protocols::rpc::error::RpcError;
+pub use diem_network::protocols::rpc::error::RpcError;
 pub mod builder;
 
 // TODO:  This module should be test-only, e.g., #[cfg(any(feature = "testing", test))]

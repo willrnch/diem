@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -48,9 +49,9 @@ const VAULT_TESTS: &[fn()] = &[
     test_vault_tokens,
 ];
 
-/// A test for verifying VaultStorage properly implements the DiemSecureStorage API and enforces
+/// A test for verifying VaultStorage properly implements the SecureStorage API and enforces
 /// strict separation between unique namespaces. This test depends on running Vault, which can be
-/// done by using the provided docker run script in `docker/vault/run.sh`
+/// done by using the provided docker run script in `docker/testutils/start_vault_container.sh`
 #[test]
 fn execute_storage_tests_vault() {
     if dev::test_host_safe().is_none() {
@@ -118,20 +119,20 @@ fn test_vault_key_value_policies() {
     let root = Policy::new(vec![]);
     let partial = Policy::new(vec![
         Permission::new(Identity::User(READER.into()), vec![Capability::Read]),
-        Permission::new(
-            Identity::User(WRITER.into()),
-            vec![Capability::Read, Capability::Write],
-        ),
+        Permission::new(Identity::User(WRITER.into()), vec![
+            Capability::Read,
+            Capability::Write,
+        ]),
     ]);
     let full = Policy::new(vec![
-        Permission::new(
-            Identity::User(READER.into()),
-            vec![Capability::Read, Capability::Write],
-        ),
-        Permission::new(
-            Identity::User(WRITER.into()),
-            vec![Capability::Read, Capability::Write],
-        ),
+        Permission::new(Identity::User(READER.into()), vec![
+            Capability::Read,
+            Capability::Write,
+        ]),
+        Permission::new(Identity::User(WRITER.into()), vec![
+            Capability::Read,
+            Capability::Write,
+        ]),
     ]);
 
     // Provide a TTL to verify that lease renews work
@@ -234,10 +235,10 @@ fn test_vault_crypto_policies() {
     let policy = Policy::new(vec![
         Permission::new(Identity::User(EXPORTER.into()), vec![Capability::Export]),
         Permission::new(Identity::User(READER.into()), vec![Capability::Read]),
-        Permission::new(
-            Identity::User(ROTATER.into()),
-            vec![Capability::Read, Capability::Rotate],
-        ),
+        Permission::new(Identity::User(ROTATER.into()), vec![
+            Capability::Read,
+            Capability::Rotate,
+        ]),
         Permission::new(Identity::User(SIGNER.into()), vec![Capability::Sign]),
     ]);
 
@@ -339,10 +340,10 @@ fn test_vault_crypto_policies() {
 fn test_vault_tokens() {
     let mut storage = create_vault_policy_with_namespace(Some(VAULT_NAMESPACE_1.into()));
 
-    let partial = Policy::new(vec![Permission::new(
-        Identity::User(WRITER.into()),
-        vec![Capability::Read, Capability::Write],
-    )]);
+    let partial = Policy::new(vec![Permission::new(Identity::User(WRITER.into()), vec![
+        Capability::Read,
+        Capability::Write,
+    ])]);
 
     // Initialize data and policies
     storage.set(PARTIAL, 3).unwrap();

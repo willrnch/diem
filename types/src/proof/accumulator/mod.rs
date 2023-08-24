@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module implements an in-memory Merkle Accumulator that is similar to what we use in
@@ -20,9 +21,7 @@ use super::MerkleTreeInternalNode;
 use crate::proof::definition::{LeafCount, MAX_ACCUMULATOR_LEAVES};
 use anyhow::{ensure, format_err, Result};
 use diem_crypto::{
-    hash::{
-        CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH,
-    },
+    hash::{CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH},
     HashValue,
 };
 use serde::{Deserialize, Serialize};
@@ -46,13 +45,13 @@ pub struct InMemoryAccumulator<H> {
     ///      / \     / \     / \
     ///     a   b   c   d   e   placeholder
     /// ```
-    frozen_subtree_roots: Vec<HashValue>,
+    pub frozen_subtree_roots: Vec<HashValue>,
 
     /// The total number of leaves in this accumulator.
-    num_leaves: LeafCount,
+    pub num_leaves: LeafCount,
 
     /// The root hash of this accumulator.
-    root_hash: HashValue,
+    pub root_hash: HashValue,
 
     phantom: PhantomData<H>,
 }
@@ -86,7 +85,7 @@ where
         Self {
             frozen_subtree_roots: Vec::new(),
             num_leaves: 0,
-            root_hash: *SPARSE_MERKLE_PLACEHOLDER_HASH,
+            root_hash: *ACCUMULATOR_PLACEHOLDER_HASH,
             phantom: PhantomData,
         }
     }
@@ -147,7 +146,7 @@ where
     }
 
     /// Appends a list of new subtrees to the existing accumulator. This is similar to
-    /// [`append`](Accumulator::append) except that the new leaves themselves are not known and
+    /// [`append`](InMemoryAccumulator::append) except that the new leaves themselves are not known and
     /// they are represented by `subtrees`. As an example, given the following accumulator that
     /// currently has 10 leaves, the frozen subtree roots and the new subtrees are annotated below.
     /// Note that in this case `subtrees[0]` represents two new leaves `A` and `B`, `subtrees[1]`

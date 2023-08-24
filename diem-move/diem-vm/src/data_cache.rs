@@ -1,178 +1,237 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //! Scratchpad for on chain values during the execution.
 
-use crate::{counters::CRITICAL_ERRORS, create_access_path, logging::AdapterLogSchema};
+use crate::{
+    diem_vm_impl::gas_config,
+    move_vm_ext::{get_max_binary_format_version, MoveResolverExt},
+};
 #[allow(unused_imports)]
-use anyhow::format_err;
-use diem_logger::prelude::*;
-use diem_state_view::{StateView, StateViewId};
+use anyhow::Error;
+use diem_framework::natives::state_storage::StateStorageUsageResolver;
+use diem_state_view::StateView;
 use diem_types::{
     access_path::AccessPath,
-    on_chain_config::ConfigStorage,
-    vm_status::StatusCode,
-    write_set::{WriteOp, WriteSet},
+    on_chain_config::{ConfigStorage, Features, OnChainConfig},
+    state_store::{state_key::StateKey, state_storage_usage::StateStorageUsage},
 };
-use fail::fail_point;
-use move_binary_format::errors::*;
+use move_binary_format::{errors::*, CompiledModule};
 use move_core_types::{
     account_address::AccountAddress,
     language_storage::{ModuleId, StructTag},
-    resolver::{ModuleResolver, ResourceResolver},
+    metadata::Metadata,
+    resolver::{resource_size, ModuleResolver, ResourceResolver},
+    vm_status::StatusCode,
 };
-use std::collections::btree_map::BTreeMap;
+use move_table_extension::{TableHandle, TableResolver};
+use std::{cell::RefCell, collections::BTreeMap, ops::Deref};
 
-/// A local cache for a given a `StateView`. The cache is private to the Diem layer
-/// but can be used as a one shot cache for systems that need a simple `RemoteCache`
-/// implementation (e.g. tests or benchmarks).
-///
-/// The cache is responsible to track all changes to the `StateView` that are the result
-/// of transaction execution. Those side effects are published at the end of a transaction
-/// execution via `StateViewCache::push_write_set`.
-///
-/// `StateViewCache` is responsible to give an up to date view over the data store,
-/// so that changes executed but not yet committed are visible to subsequent transactions.
-///
-/// If a system wishes to execute a block of transaction on a given view, a cache that keeps
-/// track of incremental changes is vital to the consistency of the data store and the system.
-pub struct StateViewCache<'a, S> {
-    data_view: &'a S,
-    data_map: BTreeMap<AccessPath, Option<Vec<u8>>>,
+pub(crate) fn get_resource_group_from_metadata(
+    struct_tag: &StructTag,
+    metadata: &[Metadata],
+) -> Option<StructTag> {
+    let metadata = diem_framework::get_metadata(metadata)?;
+    metadata
+        .struct_attributes
+        .get(struct_tag.name.as_ident_str().as_str())?
+        .iter()
+        .find_map(|attr| attr.get_resource_group_member())
 }
 
-impl<'a, S: StateView> StateViewCache<'a, S> {
-    /// Create a `StateViewCache` give a `StateView`. Hold updates to the data store and
-    /// forward data request to the `StateView` if not in the local cache.
-    pub fn new(data_view: &'a S) -> Self {
-        StateViewCache {
-            data_view,
-            data_map: BTreeMap::new(),
+/// Adapter to convert a `StateView` into a `MoveResolverExt`.
+pub struct StorageAdapter<'a, S> {
+    state_store: &'a S,
+    accurate_byte_count: bool,
+    max_binary_format_version: u32,
+    resource_group_cache:
+        RefCell<BTreeMap<AccountAddress, BTreeMap<StructTag, BTreeMap<StructTag, Vec<u8>>>>>,
+}
+
+impl<'a, S: StateView> StorageAdapter<'a, S> {
+    pub fn new_with_cached_config(
+        state_store: &'a S,
+        gas_feature_version: u64,
+        features: &Features,
+    ) -> Self {
+        let mut s = Self {
+            state_store,
+            accurate_byte_count: false,
+            max_binary_format_version: 0,
+            resource_group_cache: RefCell::new(BTreeMap::new()),
+        };
+        if gas_feature_version >= 9 {
+            s.accurate_byte_count = true;
         }
+        s.max_binary_format_version = get_max_binary_format_version(features, gas_feature_version);
+        s
     }
 
-    // Publishes a `WriteSet` computed at the end of a transaction.
-    // The effect is to build a layer in front of the `StateView` which keeps
-    // track of the data as if the changes were applied immediately.
-    pub(crate) fn push_write_set(&mut self, write_set: &WriteSet) {
-        for (ref ap, ref write_op) in write_set.iter() {
-            match write_op {
-                WriteOp::Value(blob) => {
-                    self.data_map.insert(ap.clone(), Some(blob.clone()));
-                }
-                WriteOp::Deletion => {
-                    self.data_map.remove(ap);
-                    self.data_map.insert(ap.clone(), None);
-                }
-            }
-        }
-    }
-}
-
-impl<'block, S: StateView> StateView for StateViewCache<'block, S> {
-    // Get some data either through the cache or the `StateView` on a cache miss.
-    fn get(&self, access_path: &AccessPath) -> anyhow::Result<Option<Vec<u8>>> {
-        fail_point!("move_adapter::data_cache::get", |_| Err(format_err!(
-            "Injected failure in data_cache::get"
-        )));
-
-        match self.data_map.get(access_path) {
-            Some(opt_data) => Ok(opt_data.clone()),
-            None => match self.data_view.get(access_path) {
-                Ok(remote_data) => Ok(remote_data),
-                // TODO: should we forward some error info?
-                Err(e) => {
-                    // create an AdapterLogSchema from the `data_view` in scope. This log_context
-                    // does not carry proper information about the specific transaction and
-                    // context, but this error is related to the given `StateView` rather
-                    // than the transaction.
-                    // Also this API does not make it easy to plug in a context
-                    let log_context = AdapterLogSchema::new(self.data_view.id(), 0);
-                    CRITICAL_ERRORS.inc();
-                    error!(
-                        log_context,
-                        "[VM, StateView] Error getting data from storage for {:?}", access_path
-                    );
-                    Err(e)
-                }
-            },
-        }
-    }
-
-    fn is_genesis(&self) -> bool {
-        self.data_view.is_genesis()
-    }
-
-    fn id(&self) -> StateViewId {
-        self.data_view.id()
-    }
-}
-
-impl<'block, S: StateView> ModuleResolver for StateViewCache<'block, S> {
-    type Error = VMError;
-
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        RemoteStorage::new(self).get_module(module_id)
-    }
-}
-
-impl<'block, S: StateView> ResourceResolver for StateViewCache<'block, S> {
-    type Error = VMError;
-
-    fn get_resource(
-        &self,
-        address: &AccountAddress,
-        tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        RemoteStorage::new(self).get_resource(address, tag)
-    }
-}
-
-impl<'block, S: StateView> ConfigStorage for StateViewCache<'block, S> {
-    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
-        self.get(&access_path).ok()?
-    }
-}
-
-// Adapter to convert a `StateView` into a `RemoteCache`.
-pub struct RemoteStorage<'a, S>(&'a S);
-
-impl<'a, S: StateView> RemoteStorage<'a, S> {
     pub fn new(state_store: &'a S) -> Self {
-        Self(state_store)
+        let mut s = Self {
+            state_store,
+            accurate_byte_count: false,
+            max_binary_format_version: 0,
+            resource_group_cache: RefCell::new(BTreeMap::new()),
+        };
+        let (_, gas_feature_version) = gas_config(&s);
+        let features = Features::fetch_config(&s).unwrap_or_default();
+        if gas_feature_version >= 9 {
+            s.accurate_byte_count = true;
+        }
+        s.max_binary_format_version = get_max_binary_format_version(&features, gas_feature_version);
+        s
     }
 
-    pub fn get(&self, access_path: &AccessPath) -> PartialVMResult<Option<Vec<u8>>> {
-        self.0
-            .get(access_path)
+    pub fn get(&self, access_path: AccessPath) -> PartialVMResult<Option<Vec<u8>>> {
+        self.state_store
+            .get_state_value_bytes(&StateKey::access_path(access_path))
             .map_err(|_| PartialVMError::new(StatusCode::STORAGE_ERROR))
     }
-}
 
-impl<'a, S: StateView> ModuleResolver for RemoteStorage<'a, S> {
-    type Error = VMError;
-
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        // REVIEW: cache this?
-        let ap = AccessPath::from(module_id);
-        self.get(&ap).map_err(|e| e.finish(Location::Undefined))
-    }
-}
-
-impl<'a, S: StateView> ResourceResolver for RemoteStorage<'a, S> {
-    type Error = VMError;
-
-    fn get_resource(
+    fn get_any_resource(
         &self,
         address: &AccountAddress,
         struct_tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        let ap = create_access_path(*address, struct_tag.clone());
-        self.get(&ap).map_err(|e| e.finish(Location::Undefined))
+        metadata: &[Metadata],
+    ) -> Result<(Option<Vec<u8>>, usize), VMError> {
+        let resource_group = get_resource_group_from_metadata(struct_tag, metadata);
+        if let Some(resource_group) = resource_group {
+            let mut cache = self.resource_group_cache.borrow_mut();
+            let cache = cache.entry(*address).or_insert_with(BTreeMap::new);
+            if let Some(group_data) = cache.get_mut(&resource_group) {
+                // This resource group is already cached for this address. So just return the
+                // cached value.
+                let buf = group_data.get(struct_tag).cloned();
+                let buf_size = resource_size(&buf);
+                return Ok((buf, buf_size));
+            }
+            let group_data = self.get_resource_group_data(address, &resource_group)?;
+            if let Some(group_data) = group_data {
+                let len = if self.accurate_byte_count {
+                    group_data.len()
+                } else {
+                    0
+                };
+                let group_data: BTreeMap<StructTag, Vec<u8>> = bcs::from_bytes(&group_data)
+                    .map_err(|_| {
+                        PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                            .finish(Location::Undefined)
+                    })?;
+                let res = group_data.get(struct_tag).cloned();
+                let res_size = resource_size(&res);
+                cache.insert(resource_group, group_data);
+                Ok((res, res_size + len))
+            } else {
+                cache.insert(resource_group, BTreeMap::new());
+                Ok((None, 0))
+            }
+        } else {
+            let buf = self.get_standard_resource(address, struct_tag)?;
+            let buf_size = resource_size(&buf);
+            Ok((buf, buf_size))
+        }
     }
 }
 
-impl<'a, S: StateView> ConfigStorage for RemoteStorage<'a, S> {
+impl<'a, S: StateView> MoveResolverExt for StorageAdapter<'a, S> {
+    fn get_resource_group_data(
+        &self,
+        address: &AccountAddress,
+        resource_group: &StructTag,
+    ) -> Result<Option<Vec<u8>>, VMError> {
+        let ap = AccessPath::resource_group_access_path(*address, resource_group.clone());
+        self.get(ap).map_err(|e| e.finish(Location::Undefined))
+    }
+
+    fn get_standard_resource(
+        &self,
+        address: &AccountAddress,
+        struct_tag: &StructTag,
+    ) -> Result<Option<Vec<u8>>, VMError> {
+        let ap = AccessPath::resource_access_path(*address, struct_tag.clone()).map_err(|_| {
+            PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES).finish(Location::Undefined)
+        })?;
+        self.get(ap).map_err(|e| e.finish(Location::Undefined))
+    }
+
+    fn release_resource_group_cache(
+        &self,
+    ) -> BTreeMap<AccountAddress, BTreeMap<StructTag, BTreeMap<StructTag, Vec<u8>>>> {
+        self.resource_group_cache.take()
+    }
+}
+
+impl<'a, S: StateView> ResourceResolver for StorageAdapter<'a, S> {
+    fn get_resource_with_metadata(
+        &self,
+        address: &AccountAddress,
+        struct_tag: &StructTag,
+        metadata: &[Metadata],
+    ) -> anyhow::Result<(Option<Vec<u8>>, usize)> {
+        Ok(self.get_any_resource(address, struct_tag, metadata)?)
+    }
+}
+
+impl<'a, S: StateView> ModuleResolver for StorageAdapter<'a, S> {
+    fn get_module_metadata(&self, module_id: &ModuleId) -> Vec<Metadata> {
+        let module_bytes = match self.get_module(module_id) {
+            Ok(Some(bytes)) => bytes,
+            _ => return vec![],
+        };
+        let module = match CompiledModule::deserialize_with_max_version(
+            &module_bytes,
+            self.max_binary_format_version,
+        ) {
+            Ok(module) => module,
+            _ => return vec![],
+        };
+        module.metadata
+    }
+
+    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Error> {
+        // REVIEW: cache this?
+        let ap = AccessPath::from(module_id);
+        Ok(self.get(ap).map_err(|e| e.finish(Location::Undefined))?)
+    }
+}
+
+impl<'a, S: StateView> TableResolver for StorageAdapter<'a, S> {
+    fn resolve_table_entry(
+        &self,
+        handle: &TableHandle,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.get_state_value_bytes(&StateKey::table_item((*handle).into(), key.to_vec()))
+    }
+}
+
+impl<'a, S: StateView> ConfigStorage for StorageAdapter<'a, S> {
     fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
-        self.get(&access_path).ok()?
+        self.get(access_path).ok()?
+    }
+}
+
+impl<'a, S: StateView> StateStorageUsageResolver for StorageAdapter<'a, S> {
+    fn get_state_storage_usage(&self) -> Result<StateStorageUsage, Error> {
+        self.get_usage()
+    }
+}
+
+impl<'a, S> Deref for StorageAdapter<'a, S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        self.state_store
+    }
+}
+
+pub trait AsMoveResolver<S> {
+    fn as_move_resolver(&self) -> StorageAdapter<S>;
+}
+
+impl<S: StateView> AsMoveResolver<S> for S {
+    fn as_move_resolver(&self) -> StorageAdapter<S> {
+        StorageAdapter::new(self)
     }
 }

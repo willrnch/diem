@@ -1,29 +1,35 @@
 [package]
 name = "diem-api-types"
-version = "0.0.1"
-authors = ["Diem Association <opensource@diem.com>"]
 description = "Diem API Types"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.0.1"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-bcs = "0.1.2"
-hex = "0.4.3"
-serde = { version = "1.0.124", default-features = false }
-serde_json = "1.0.64"
-warp = { version = "0.3.0", features = ["default"] }
-
-diem-crypto = { path = "../../crates/diem-crypto" }
-diem-transaction-builder = { path = "../../sdk/transaction-builder" }
-diem-types = { path = "../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-move-binary-format = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-move-resource-viewer = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-
-[dev-dependencies]
-move-binary-format = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
+anyhow = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-framework = { workspace = true }
+diem-logger = { workspace = true }
+diem-openapi = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+hex = { workspace = true }
+indoc = { workspace = true }
+move-binary-format = { workspace = true }
+move-core-types = { workspace = true }
+move-resource-viewer = { workspace = true }
+poem = { workspace = true }
+poem-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

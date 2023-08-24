@@ -1,8 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Mutex as StdMutex;
-
 pub use std::sync::MutexGuard;
 
 /// A simple wrapper around the lock() function of a std::sync::Mutex
@@ -20,7 +20,20 @@ impl<T> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         self.0
             .lock()
-            .expect("diem cannot currently handle a poisoned lock")
+            .expect("Cannot currently handle a poisoned lock")
+    }
+
+    // consume the mutex
+    pub fn into_inner(self) -> T {
+        self.0
+            .into_inner()
+            .expect("Cannot currently handle a poisoned lock")
+    }
+}
+
+impl<T> Default for Mutex<Option<T>> {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
@@ -31,7 +44,7 @@ mod tests {
     use std::{sync::Arc, thread};
 
     #[test]
-    fn test_diem_mutex() {
+    fn test_mutex() {
         let a = 7u8;
         let mutex = Arc::new(Mutex::new(a));
         let mutex2 = mutex.clone();

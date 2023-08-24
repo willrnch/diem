@@ -1,6 +1,6 @@
 script {
-    use DiemFramework::ParallelExecutionConfig;
+    use diem_framework::parallel_execution_config;
     fun main(diem_root: signer, _execute_as: signer) {
-        ParallelExecutionConfig::disable_parallel_execution(&diem_root);
+        parallel_execution_config::disable_parallel_execution(&diem_root);
     }
 }

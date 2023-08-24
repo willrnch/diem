@@ -1,27 +1,32 @@
 [package]
-name = "executor-types"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-executor-types"
 description = "Diem executor interface types"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-serde = { version = "1.0.124", default-features = false }
-thiserror = "1.0.24"
-
-bcs = "0.1.2"
-diem-crypto = { path = "../../crates/diem-crypto" }
-diem-secure-net = { path = "../../secure/net" }
-diem-state-view = { path = "../../storage/state-view" }
-diem-types = { path = "../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-scratchpad = { path = "../../storage/scratchpad" }
-storage-interface = { path = "../../storage/storage-interface" }
+anyhow = { workspace = true }
+diem-block-partitioner = { workspace = true }
+diem-crypto = { workspace = true }
+diem-scratchpad = { workspace = true }
+diem-secure-net = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+dashmap = { workspace = true }
+itertools = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 default = []

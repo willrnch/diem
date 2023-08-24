@@ -1,50 +1,54 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use chrono::Local;
-use diem_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
-    PrivateKey, SigningKey, Uniform,
-};
-use diem_logger::info;
-use diem_transaction_builder::stdlib::{
-    encode_create_parent_vasp_account_script, encode_peer_to_peer_with_metadata_script,
-};
+use crate::account_generator::{AccountCache, AccountGenerator};
+use diem_crypto::{ed25519::Ed25519PrivateKey, HashValue};
+use diem_sdk::{transaction_builder::TransactionFactory, types::LocalAccount};
+use diem_state_view::account_with_state_view::AsAccountWithStateView;
+use diem_storage_interface::{state_view::LatestDbStateCheckpointView, DbReader, DbReaderWriter};
+use diem_transaction_generator_lib::TransactionGeneratorCreator;
 use diem_types::{
     account_address::AccountAddress,
-    account_config::{
-        testnet_dd_account_address, treasury_compliance_account_address, xus_tag, AccountResource,
-        XUS_NAME,
-    },
+    account_config::diem_test_root_address,
+    account_view::AccountView,
     chain_id::ChainId,
-    transaction::{
-        authenticator::AuthenticationKey, RawTransaction, Script, SignedTransaction, Transaction,
-        Version,
-    },
+    transaction::{Transaction, Version},
 };
+use chrono::Local;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::{rngs::StdRng, SeedableRng};
+use itertools::Itertools;
+use rand::thread_rng;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
-    convert::TryFrom,
     fs::File,
     io::{Read, Write},
+    iter::once,
     path::Path,
-    sync::mpsc,
-    time::Instant,
+    sync::{mpsc, Arc},
 };
-use storage_interface::DbReader;
 
 const META_FILENAME: &str = "metadata.toml";
-const MAX_ACCOUNTS_INVOLVED_IN_P2P: usize = 1_000_000;
+pub const MAX_ACCOUNTS_INVOLVED_IN_P2P: usize = 1_000_000;
 
 fn get_progress_bar(num_accounts: usize) -> ProgressBar {
     let bar = ProgressBar::new(num_accounts as u64);
-    bar.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:100.cyan/blue} {percent}% ETA {eta_precise}"),
-    );
+    bar.set_style(ProgressStyle::default_bar().template(
+        "[{elapsed_precise} {per_sec}] {bar:100.cyan/blue} {percent}% ETA {eta_precise}",
+    ));
     bar
+}
+
+fn get_sequence_number(address: AccountAddress, reader: Arc<dyn DbReader>) -> u64 {
+    let db_state_view = reader.latest_state_checkpoint_view().unwrap();
+
+    let account_state_view = db_state_view.as_account_with_state_view(&address);
+
+    match account_state_view.get_account_resource().unwrap() {
+        Some(account_resource) => account_resource.sequence_number(),
+        None => 0,
+    }
 }
 
 macro_rules! now_fmt {
@@ -64,139 +68,149 @@ struct P2pTestCase {
     num_accounts: usize,
 }
 
-#[derive(Deserialize, Serialize)]
-struct AccountData {
-    private_key: Ed25519PrivateKey,
-    public_key: Ed25519PublicKey,
-    address: AccountAddress,
-    sequence_number: u64,
-}
-
-impl AccountData {
-    pub fn auth_key_prefix(&self) -> Vec<u8> {
-        AuthenticationKey::ed25519(&self.public_key)
-            .prefix()
-            .to_vec()
-    }
-}
-
 pub struct TransactionGenerator {
     /// The current state of the accounts. The main purpose is to keep track of the sequence number
     /// so generated transactions are guaranteed to be successfully executed.
-    accounts_cache: Vec<AccountData>,
+    main_signer_accounts: Option<AccountCache>,
 
-    /// Total number of accounts in the DB
-    num_accounts: usize,
+    /// The current state of seed accounts. The purpose of the seed accounts to parallelize the
+    /// account creation and minting process so that they are not blocked on sequence number of
+    /// a single root account.
+    seed_accounts_cache: Option<AccountCache>,
 
-    /// Used to mint accounts.
-    genesis_key: Ed25519PrivateKey,
+    /// Total # of existing (non-seed) accounts in the DB at the time of TransactionGenerator
+    /// creation.
+    num_existing_accounts: usize,
 
     /// Record the number of txns generated.
     version: Version,
 
-    /// For deterministic transaction generation.
-    rng: StdRng,
-
     /// Each generated block of transactions are sent to this channel. Using `SyncSender` to make
     /// sure if execution is slow to consume the transactions, we do not run out of memory.
     block_sender: Option<mpsc::SyncSender<Vec<Transaction>>>,
+
+    /// Transaction Factory
+    transaction_factory: TransactionFactory,
+
+    /// root account is used across creating and minting.
+    root_account: LocalAccount,
 }
 
 impl TransactionGenerator {
-    pub fn new(genesis_key: Ed25519PrivateKey, num_accounts: usize) -> Self {
-        Self::new_impl(genesis_key, num_accounts, None)
-    }
-
-    pub fn new_with_sender(
-        genesis_key: Ed25519PrivateKey,
+    fn gen_account_cache(
+        generator: AccountGenerator,
         num_accounts: usize,
-        block_sender: mpsc::SyncSender<Vec<Transaction>>,
-    ) -> Self {
-        Self::new_impl(genesis_key, num_accounts, Some(block_sender))
-    }
-
-    fn new_impl(
-        genesis_key: Ed25519PrivateKey,
-        num_accounts: usize,
-        block_sender: Option<mpsc::SyncSender<Vec<Transaction>>>,
-    ) -> Self {
-        let seed = [1u8; 32];
-        let rng = StdRng::from_seed(seed);
-        Self {
-            accounts_cache: Self::gen_account_cache(num_accounts),
+        name: &str,
+    ) -> AccountCache {
+        println!(
+            "[{}] Generating cache of {} {} accounts.",
+            now_fmt!(),
             num_accounts,
-            genesis_key,
-            version: 0,
-            rng,
-            block_sender,
-        }
-    }
-
-    fn gen_account_cache(num_accounts: usize) -> Vec<AccountData> {
-        let start = Instant::now();
-        let seed = [1u8; 32];
-        let mut rng = StdRng::from_seed(seed);
-
-        let mut accounts = Vec::with_capacity(num_accounts);
-        println!("[{}] Generating {} accounts.", now_fmt!(), num_accounts);
+            name,
+        );
+        let mut accounts = AccountCache::new(generator);
         let bar = get_progress_bar(num_accounts);
-        for _i in 0..num_accounts {
-            let private_key = Ed25519PrivateKey::generate(&mut rng);
-            let public_key = private_key.public_key();
-            let address = diem_types::account_address::from_public_key(&public_key);
-            let account = AccountData {
-                private_key,
-                public_key,
-                address,
-                sequence_number: 0,
-            };
-            accounts.push(account);
+        for _ in 0..num_accounts {
+            accounts.grow(1);
             bar.inc(1);
         }
         bar.finish();
-        println!("[{}] done.", now_fmt!());
-
-        info!(
-            num_accounts_generated = num_accounts,
-            time_ms = %start.elapsed().as_millis(),
-            "Account cache generation finished.",
-        );
         accounts
     }
 
-    pub fn new_with_metafile<P: AsRef<Path>>(
+    pub fn resync_sequence_numbers(
+        reader: Arc<dyn DbReader>,
+        mut accounts: AccountCache,
+        name: &str,
+    ) -> AccountCache {
+        let mut updated = 0;
+        for account in &mut accounts.accounts {
+            let seq_num = get_sequence_number(account.address(), reader.clone());
+            if seq_num > 0 {
+                updated += 1;
+                *account.sequence_number_mut() = seq_num;
+            }
+        }
+        if updated > 0 {
+            println!(
+                "Updated {} seq numbers out of {} {} accounts",
+                updated,
+                accounts.accounts.len(),
+                name
+            );
+        }
+        accounts
+    }
+
+    pub fn gen_user_account_cache(
+        reader: Arc<dyn DbReader>,
+        num_accounts: usize,
+        num_to_skip: usize,
+    ) -> AccountCache {
+        Self::resync_sequence_numbers(
+            reader,
+            Self::gen_account_cache(
+                AccountGenerator::new_for_user_accounts(num_to_skip as u64),
+                num_accounts,
+                "user",
+            ),
+            "user",
+        )
+    }
+
+    fn gen_seed_account_cache(reader: Arc<dyn DbReader>, num_accounts: usize) -> AccountCache {
+        Self::resync_sequence_numbers(
+            reader,
+            Self::gen_account_cache(
+                AccountGenerator::new_for_seed_accounts(),
+                num_accounts,
+                "seed",
+            ),
+            "seed",
+        )
+    }
+
+    pub fn new_with_existing_db<P: AsRef<Path>>(
+        db: DbReaderWriter,
         genesis_key: Ed25519PrivateKey,
         block_sender: mpsc::SyncSender<Vec<Transaction>>,
         db_dir: P,
+        version: Version,
+        num_main_signer_accounts: Option<usize>,
     ) -> Self {
-        let path = db_dir.as_ref().join(META_FILENAME);
-        let mut file = File::open(&path).unwrap();
-        let mut contents = vec![];
-        file.read_to_end(&mut contents).unwrap();
-        let test_case: TestCase = toml::from_slice(&contents).expect("Must exist.");
-        let num_accounts = match test_case {
-            TestCase::P2p(P2pTestCase { num_accounts }) => num_accounts,
-        };
+        let num_existing_accounts = TransactionGenerator::read_meta(&db_dir);
 
-        let seed = [1u8; 32];
-        let rng = StdRng::from_seed(seed);
         Self {
-            accounts_cache: Self::gen_account_cache(std::cmp::min(
-                num_accounts,
-                MAX_ACCOUNTS_INVOLVED_IN_P2P,
-            )),
-            num_accounts,
-            genesis_key,
-            version: 2 * num_accounts as Version,
-            rng,
+            seed_accounts_cache: None,
+            root_account: LocalAccount::new(
+                diem_test_root_address(),
+                genesis_key,
+                get_sequence_number(diem_test_root_address(), db.reader.clone()),
+            ),
+            main_signer_accounts: num_main_signer_accounts.map(|num_main_signer_accounts| {
+                let num_cached_accounts =
+                    std::cmp::min(num_existing_accounts, num_main_signer_accounts);
+                Self::gen_user_account_cache(db.reader.clone(), num_cached_accounts, 0)
+            }),
+            num_existing_accounts,
+            version,
             block_sender: Some(block_sender),
+            transaction_factory: Self::create_transaction_factory(),
         }
     }
 
+    pub fn create_transaction_factory() -> TransactionFactory {
+        TransactionFactory::new(ChainId::test())
+            .with_transaction_expiration_time(300)
+            .with_gas_unit_price(100)
+            // TODO(Gas): double check if this is correct
+            .with_max_gas_amount(100_000)
+    }
+
     // Write metadata
-    pub fn write_meta<P: AsRef<Path>>(self, path: &P) {
+    pub fn write_meta<P: AsRef<Path>>(self, path: &P, num_new_accounts: usize) {
         let metadata = TestCase::P2p(P2pTestCase {
-            num_accounts: self.num_accounts,
+            num_accounts: self.num_existing_accounts + num_new_accounts,
         });
         let serialized = toml::to_vec(&metadata).unwrap();
         let meta_file = path.as_ref().join(META_FILENAME);
@@ -204,108 +218,188 @@ impl TransactionGenerator {
         file.write_all(&serialized).unwrap();
     }
 
+    pub fn read_meta<P: AsRef<Path>>(path: &P) -> usize {
+        let filename = path.as_ref().join(META_FILENAME);
+        File::open(filename).map_or(0, |mut file| {
+            let mut contents = vec![];
+            file.read_to_end(&mut contents).unwrap();
+            let test_case: TestCase = toml::from_slice(&contents).expect("Must exist.");
+            let TestCase::P2p(P2pTestCase { num_accounts }) = test_case;
+            num_accounts
+        })
+    }
+
+    pub fn num_existing_accounts(&self) -> usize {
+        self.num_existing_accounts
+    }
+
     pub fn version(&self) -> Version {
         self.version
     }
 
-    pub fn run_mint(&mut self, init_account_balance: u64, block_size: usize) {
+    pub fn run_mint(
+        &mut self,
+        reader: Arc<dyn DbReader>,
+        num_existing_accounts: usize,
+        num_new_accounts: usize,
+        init_account_balance: u64,
+        block_size: usize,
+    ) {
         assert!(self.block_sender.is_some());
-        self.gen_account_creations(block_size);
-        self.gen_mint_transactions(init_account_balance, block_size);
+        // Ensure that seed accounts have enough balance to transfer money to at least 10000 account with
+        // balance init_account_balance.
+        self.create_seed_accounts(
+            reader,
+            num_new_accounts,
+            block_size,
+            init_account_balance * 10_000,
+        );
+        self.create_and_fund_accounts(
+            num_existing_accounts,
+            num_new_accounts,
+            init_account_balance,
+            block_size,
+        );
     }
 
-    pub fn run_transfer(&mut self, block_size: usize, num_transfer_blocks: usize) {
+    pub fn run_transfer(
+        &mut self,
+        block_size: usize,
+        num_transfer_blocks: usize,
+        transactions_per_sender: usize,
+    ) {
         assert!(self.block_sender.is_some());
-        self.gen_transfer_transactions(block_size, num_transfer_blocks);
+        self.gen_transfer_transactions(block_size, num_transfer_blocks, transactions_per_sender);
     }
 
-    pub fn gen_account_creations(&mut self, block_size: usize) -> Vec<Vec<Transaction>> {
-        let tc_account = treasury_compliance_account_address();
-        let mut txn_block = vec![];
+    pub fn run_workload(
+        &mut self,
+        block_size: usize,
+        num_blocks: usize,
+        mut transaction_generator_creator: Box<dyn TransactionGeneratorCreator>,
+        transactions_per_sender: usize,
+    ) {
+        assert!(self.block_sender.is_some());
+        let num_senders_per_block =
+            (block_size + transactions_per_sender - 1) / transactions_per_sender;
+        let account_pool_size = self.main_signer_accounts.as_ref().unwrap().accounts.len();
+        let mut transaction_generator =
+            transaction_generator_creator.create_transaction_generator();
+        for _ in 0..num_blocks {
+            let transactions: Vec<_> = rand::seq::index::sample(
+                &mut thread_rng(),
+                account_pool_size,
+                num_senders_per_block,
+            )
+            .into_iter()
+            .flat_map(|idx| {
+                let sender = &mut self.main_signer_accounts.as_mut().unwrap().accounts[idx];
+                transaction_generator.generate_transactions(sender, transactions_per_sender)
+            })
+            .map(Transaction::UserTransaction)
+            .chain(once(Transaction::StateCheckpoint(HashValue::random())))
+            .collect();
+            self.version += transactions.len() as Version;
 
+            if let Some(sender) = &self.block_sender {
+                sender.send(transactions).unwrap();
+            }
+        }
+    }
+
+    pub fn create_seed_accounts(
+        &mut self,
+        reader: Arc<dyn DbReader>,
+        num_new_accounts: usize,
+        block_size: usize,
+        seed_account_balance: u64,
+    ) {
+        // We don't store the # of existing seed accounts now. Thus here we just blindly re-create
+        // and re-mint seed accounts here.
+        let num_seed_accounts = (num_new_accounts / 1000).clamp(1, 100000);
+        let seed_accounts_cache = Self::gen_seed_account_cache(reader, num_seed_accounts);
+
+        println!(
+            "[{}] Generating {} seed account creation txns, with {} coins.",
+            now_fmt!(),
+            num_seed_accounts,
+            seed_account_balance,
+        );
+        let bar = get_progress_bar(num_seed_accounts);
+
+        for chunk in seed_accounts_cache
+            .accounts
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(block_size)
+        {
+            let transactions: Vec<_> = chunk
+                .iter()
+                .map(|new_account| {
+                    let txn = self.root_account.sign_with_transaction_builder(
+                        self.transaction_factory
+                            .implicitly_create_user_account_and_transfer(
+                                new_account.public_key(),
+                                seed_account_balance,
+                            ),
+                    );
+                    Transaction::UserTransaction(txn)
+                })
+                .chain(once(Transaction::StateCheckpoint(HashValue::random())))
+                .collect();
+            self.version += transactions.len() as Version;
+            bar.inc(transactions.len() as u64 - 1);
+            if let Some(sender) = &self.block_sender {
+                sender.send(transactions).unwrap();
+            }
+        }
+        bar.finish();
+        println!("[{}] done.", now_fmt!());
+        self.seed_accounts_cache = Some(seed_accounts_cache);
+    }
+
+    /// Generates transactions that creates a set of accounts and fund them from the seed accounts.
+    pub fn create_and_fund_accounts(
+        &mut self,
+        num_existing_accounts: usize,
+        num_new_accounts: usize,
+        init_account_balance: u64,
+        block_size: usize,
+    ) {
         println!(
             "[{}] Generating {} account creation txns.",
             now_fmt!(),
-            self.accounts_cache.len(),
+            num_new_accounts
         );
-        let bar = get_progress_bar(self.accounts_cache.len());
-        for (i, block) in self.accounts_cache.chunks(block_size).enumerate() {
-            let mut transactions = Vec::with_capacity(block_size);
-            for (j, account) in block.iter().enumerate() {
-                let txn = create_transaction(
-                    tc_account,
-                    (i * block_size + j) as u64,
-                    &self.genesis_key,
-                    self.genesis_key.public_key(),
-                    encode_create_parent_vasp_account_script(
-                        xus_tag(),
-                        0,
-                        account.address,
-                        account.auth_key_prefix(),
-                        vec![],
-                        false, /* add all currencies */
-                    ),
-                );
-                transactions.push(txn);
-            }
+        let mut generator = AccountGenerator::new_for_user_accounts(num_existing_accounts as u64);
+        println!("Skipped first {} existing accounts.", num_existing_accounts);
+
+        let bar = get_progress_bar(num_new_accounts);
+
+        for chunk in &(0..num_new_accounts).chunks(block_size) {
+            let transactions: Vec<_> = chunk
+                .map(|_| {
+                    let sender = self.seed_accounts_cache.as_mut().unwrap().get_random();
+                    let new_account = generator.generate();
+                    let txn = sender.sign_with_transaction_builder(
+                        self.transaction_factory
+                            .implicitly_create_user_account_and_transfer(
+                                new_account.public_key(),
+                                init_account_balance,
+                            ),
+                    );
+                    Transaction::UserTransaction(txn)
+                })
+                .chain(once(Transaction::StateCheckpoint(HashValue::random())))
+                .collect();
             self.version += transactions.len() as Version;
             if let Some(sender) = &self.block_sender {
                 sender.send(transactions).unwrap();
-            } else {
-                txn_block.push(transactions);
             }
             bar.inc(block_size as u64);
         }
         bar.finish();
         println!("[{}] done.", now_fmt!());
-        txn_block
-    }
-
-    /// Generates transactions that allocate `init_account_balance` to every account.
-    pub fn gen_mint_transactions(
-        &mut self,
-        init_account_balance: u64,
-        block_size: usize,
-    ) -> Vec<Vec<Transaction>> {
-        let testnet_dd_account = testnet_dd_account_address();
-        let mut txn_block = vec![];
-
-        println!(
-            "[{}] Generating {} mint txns.",
-            now_fmt!(),
-            self.accounts_cache.len(),
-        );
-        let bar = get_progress_bar(self.accounts_cache.len());
-        for (i, block) in self.accounts_cache.chunks(block_size).enumerate() {
-            let mut transactions = Vec::with_capacity(block_size);
-            for (j, account) in block.iter().enumerate() {
-                let txn = create_transaction(
-                    testnet_dd_account,
-                    (i * block_size + j) as u64,
-                    &self.genesis_key,
-                    self.genesis_key.public_key(),
-                    encode_peer_to_peer_with_metadata_script(
-                        xus_tag(),
-                        account.address,
-                        init_account_balance,
-                        vec![],
-                        vec![],
-                    ),
-                );
-                transactions.push(txn);
-            }
-            self.version += transactions.len() as Version;
-
-            if let Some(sender) = &self.block_sender {
-                sender.send(transactions).unwrap();
-            } else {
-                txn_block.push(transactions);
-            }
-            bar.inc(block.len() as u64)
-        }
-        bar.finish();
-        println!("[{}] done.", now_fmt!());
-        txn_block
     }
 
     /// Generates transactions for random pairs of accounts.
@@ -313,63 +407,71 @@ impl TransactionGenerator {
         &mut self,
         block_size: usize,
         num_blocks: usize,
-    ) -> Vec<Vec<Transaction>> {
-        let mut txn_block = vec![];
-
-        for _i in 0..num_blocks {
-            let mut transactions = Vec::with_capacity(block_size);
-            for _j in 0..block_size {
-                let indices = rand::seq::index::sample(&mut self.rng, self.accounts_cache.len(), 2);
-                let sender_idx = indices.index(0);
-                let receiver_idx = indices.index(1);
-
-                let sender = &self.accounts_cache[sender_idx];
-                let receiver = &self.accounts_cache[receiver_idx];
-                let txn = create_transaction(
-                    sender.address,
-                    sender.sequence_number,
-                    &sender.private_key,
-                    sender.public_key.clone(),
-                    encode_peer_to_peer_with_metadata_script(
-                        xus_tag(),
-                        receiver.address,
-                        1, /* amount */
-                        vec![],
-                        vec![],
-                    ),
-                );
-                transactions.push(txn);
-                self.accounts_cache[sender_idx].sequence_number += 1;
-            }
+        transactions_per_sender: usize,
+    ) {
+        for _ in 0..num_blocks {
+            // TODO: handle when block_size isn't divisible by transactions_per_sender
+            let transactions: Vec<_> = (0..(block_size / transactions_per_sender))
+                .flat_map(|_| {
+                    let (sender, receivers) = self
+                        .main_signer_accounts
+                        .as_mut()
+                        .unwrap()
+                        .get_random_transfer_batch(transactions_per_sender);
+                    receivers
+                        .into_iter()
+                        .map(|receiver| {
+                            let amount = 1;
+                            let txn = sender.sign_with_transaction_builder(
+                                self.transaction_factory.transfer(receiver, amount),
+                            );
+                            Transaction::UserTransaction(txn)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .chain(once(Transaction::StateCheckpoint(HashValue::random())))
+                .collect();
             self.version += transactions.len() as Version;
 
             if let Some(sender) = &self.block_sender {
                 sender.send(transactions).unwrap();
-            } else {
-                txn_block.push(transactions);
             }
         }
-        txn_block
     }
 
     /// Verifies the sequence numbers in storage match what we have locally.
-    pub fn verify_sequence_number(&self, db: &dyn DbReader) {
+    pub fn verify_sequence_numbers(&self, db: Arc<dyn DbReader>) {
+        if self.main_signer_accounts.is_none() {
+            println!("Cannot verify account sequence numbers.");
+            return;
+        }
+
+        let num_accounts_in_cache = self.main_signer_accounts.as_ref().unwrap().len();
         println!(
             "[{}] verify {} account sequence numbers.",
             now_fmt!(),
-            self.accounts_cache.len(),
+            num_accounts_in_cache,
         );
-        let bar = get_progress_bar(self.accounts_cache.len());
-        for account in &self.accounts_cache {
-            let address = account.address;
-            let blob = db
-                .get_latest_account_state(address)
-                .expect("Failed to query storage.")
-                .expect("Account must exist.");
-            let account_resource = AccountResource::try_from(&blob).unwrap();
-            assert_eq!(account_resource.sequence_number(), account.sequence_number);
-            bar.inc(1);
-        }
+        let bar = get_progress_bar(num_accounts_in_cache);
+        self.main_signer_accounts
+            .as_ref()
+            .unwrap()
+            .accounts()
+            .par_iter()
+            .for_each(|account| {
+                let address = account.address();
+                let db_state_view = db.latest_state_checkpoint_view().unwrap();
+                let address_account_view = db_state_view.as_account_with_state_view(&address);
+                assert_eq!(
+                    address_account_view
+                        .get_account_resource()
+                        .unwrap()
+                        .unwrap()
+                        .sequence_number(),
+                    account.sequence_number()
+                );
+                bar.inc(1);
+            });
         bar.finish();
         println!("[{}] done.", now_fmt!());
     }
@@ -378,30 +480,4 @@ impl TransactionGenerator {
     pub fn drop_sender(&mut self) {
         self.block_sender.take().unwrap();
     }
-}
-
-fn create_transaction(
-    sender: AccountAddress,
-    sequence_number: u64,
-    private_key: &Ed25519PrivateKey,
-    public_key: Ed25519PublicKey,
-    program: Script,
-) -> Transaction {
-    let now = diem_infallible::duration_since_epoch();
-    let expiration_time = now.as_secs() + 3600;
-
-    let raw_txn = RawTransaction::new_script(
-        sender,
-        sequence_number,
-        program,
-        1_000_000,           /* max_gas_amount */
-        0,                   /* gas_unit_price */
-        XUS_NAME.to_owned(), /* gas_currency_code */
-        expiration_time,
-        ChainId::test(),
-    );
-
-    let signature = private_key.sign(&raw_txn);
-    let signed_txn = SignedTransaction::new(raw_txn, public_key, signature);
-    Transaction::UserTransaction(signed_txn)
 }

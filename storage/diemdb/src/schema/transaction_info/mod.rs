@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for TransactionInfo structure.
@@ -14,12 +15,12 @@
 
 use crate::schema::{ensure_slice_len_eq, TRANSACTION_INFO_CF_NAME};
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt};
-use diem_types::transaction::{TransactionInfo, Version};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
 };
+use diem_types::transaction::{TransactionInfo, Version};
+use byteorder::{BigEndian, ReadBytesExt};
 use std::mem::size_of;
 
 define_schema!(

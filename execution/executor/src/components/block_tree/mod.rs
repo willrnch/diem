@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -7,25 +8,28 @@
 mod test;
 
 use crate::{
-    components::apply_chunk_output::IntoLedgerView,
     logging::{LogEntry, LogSchema},
+    metrics::DIEM_EXECUTOR_OTHER_TIMERS_SECONDS,
 };
 use anyhow::{anyhow, ensure, Result};
-use consensus_types::block::Block as ConsensusBlock;
+use diem_consensus_types::block::Block as ConsensusBlock;
 use diem_crypto::HashValue;
+use diem_executor_types::{Error, ExecutedBlock};
 use diem_infallible::Mutex;
 use diem_logger::{debug, info};
+use diem_storage_interface::DbReader;
 use diem_types::{ledger_info::LedgerInfo, proof::definition::LeafCount};
-use executor_types::{Error, ExecutedChunk};
 use std::{
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, Weak},
+    sync::{
+        mpsc::{channel, Receiver},
+        Arc, Weak,
+    },
 };
-use storage_interface::DbReader;
 
 pub struct Block {
     pub id: HashValue,
-    pub output: ExecutedChunk,
+    pub output: ExecutedBlock,
     children: Mutex<Vec<Arc<Block>>>,
     block_lookup: Arc<BlockLookup>,
 }
@@ -49,7 +53,7 @@ impl Block {
         self.output.result_view.txn_accumulator().num_leaves()
     }
 
-    fn ensure_has_child(&self, child_id: HashValue) -> Result<()> {
+    pub fn ensure_has_child(&self, child_id: HashValue) -> Result<()> {
         ensure!(
             self.children.lock().iter().any(|c| c.id == child_id),
             "{:x} doesn't have child {:x}",
@@ -90,7 +94,7 @@ impl BlockLookupInner {
     fn fetch_or_add_block(
         &mut self,
         id: HashValue,
-        output: ExecutedChunk,
+        output: ExecutedBlock,
         parent_id: Option<HashValue>,
         block_lookup: &Arc<BlockLookup>,
     ) -> Result<(Arc<Block>, bool, Option<Arc<Block>>)> {
@@ -116,7 +120,7 @@ impl BlockLookupInner {
                     id,
                 );
                 Ok((existing, true, parent_block))
-            }
+            },
             Entry::Vacant(entry) => {
                 let block = Arc::new(Block {
                     id,
@@ -126,7 +130,7 @@ impl BlockLookupInner {
                 });
                 entry.insert(Arc::downgrade(&block));
                 Ok((block, false, parent_block))
-            }
+            },
         }
     }
 }
@@ -149,7 +153,7 @@ impl BlockLookup {
     fn fetch_or_add_block(
         self: &Arc<Self>,
         id: HashValue,
-        output: ExecutedChunk,
+        output: ExecutedBlock,
         parent_id: Option<HashValue>,
     ) -> Result<Arc<Block>> {
         let (block, existing, parent_block) = self
@@ -208,10 +212,16 @@ impl BlockTree {
     }
 
     fn root_from_db(block_lookup: &Arc<BlockLookup>, db: &Arc<dyn DbReader>) -> Result<Arc<Block>> {
-        let startup_info = db
-            .get_startup_info()?
-            .ok_or_else(|| anyhow!("DB not bootstrapped."))?;
-        let ledger_info = startup_info.latest_ledger_info.ledger_info();
+        let ledger_info_with_sigs = db.get_latest_ledger_info()?;
+        let ledger_info = ledger_info_with_sigs.ledger_info();
+        let ledger_view = db.get_latest_executed_trees()?;
+
+        ensure!(
+            ledger_view.version() == Some(ledger_info.version()),
+            "Missing ledger info at the end of the ledger. latest version {:?}, LI version {}",
+            ledger_view.version(),
+            ledger_info.version(),
+        );
 
         let id = if ledger_info.ends_epoch() {
             epoch_genesis_block_id(ledger_info)
@@ -219,14 +229,15 @@ impl BlockTree {
             ledger_info.consensus_block_id()
         };
 
-        let result_view = startup_info
-            .committed_tree_state
-            .clone()
-            .into_ledger_view(db)?;
-        block_lookup.fetch_or_add_block(id, ExecutedChunk::new_empty(result_view), None)
+        block_lookup.fetch_or_add_block(id, ExecutedBlock::new_empty(ledger_view), None)
     }
 
-    pub fn prune(&self, ledger_info: &LedgerInfo) -> Result<()> {
+    // Set the root to be at `ledger_info`, drop blocks that are no longer descendants of the
+    // new root.
+    //
+    // Dropping happens asynchronously in another thread. A receiver is returned to the caller
+    // to wait for the dropping to fully complete (useful for tests).
+    pub fn prune(&self, ledger_info: &LedgerInfo) -> Result<Receiver<()>> {
         let committed_block_id = ledger_info.consensus_block_id();
         let last_committed_block = self.get_block(committed_block_id)?;
 
@@ -240,7 +251,7 @@ impl BlockTree {
             );
             self.block_lookup.fetch_or_add_block(
                 epoch_genesis_id,
-                ExecutedChunk::new_empty(last_committed_block.output.result_view.clone()),
+                ExecutedBlock::new_empty(last_committed_block.output.result_view.clone()),
                 None,
             )?
         } else {
@@ -250,16 +261,33 @@ impl BlockTree {
             );
             last_committed_block
         };
-
-        *self.root.lock() = root;
-        Ok(())
+        let old_root = {
+            let mut root_locked = self.root.lock();
+            // send old root to async task to drop it
+            let old_root = root_locked.clone();
+            *root_locked = root;
+            old_root
+        };
+        // This should be the last reference to old root, spawning a drop to a different thread
+        // guarantees that the drop will not happen in the current thread
+        let (tx, rx) = channel::<()>();
+        rayon::spawn(move || {
+            let _timeer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+                .with_label_values(&["drop_old_root"])
+                .start_timer();
+            drop(old_root);
+            // Error is ignored, since the caller might not care about dropping completion and
+            // has discarded the receiver already.
+            tx.send(()).ok();
+        });
+        Ok(rx)
     }
 
     pub fn add_block(
         &self,
         parent_block_id: HashValue,
         id: HashValue,
-        output: ExecutedChunk,
+        output: ExecutedBlock,
     ) -> Result<Arc<Block>> {
         self.block_lookup
             .fetch_or_add_block(id, output, Some(parent_block_id))

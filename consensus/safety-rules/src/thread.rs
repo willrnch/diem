@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This provides a execution separation between SafetyRules and Consensus without requiring the
@@ -26,25 +27,12 @@ pub struct ThreadService {
 }
 
 impl ThreadService {
-    pub fn new(
-        storage: PersistentSafetyStorage,
-        verify_vote_proposal_signature: bool,
-        export_consensus_key: bool,
-        timeout: u64,
-    ) -> Self {
+    pub fn new(storage: PersistentSafetyStorage, timeout: u64) -> Self {
         let listen_port = utils::get_available_port();
         let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
         let server_addr = listen_addr;
 
-        let child = thread::spawn(move || {
-            remote_service::execute(
-                storage,
-                listen_addr,
-                verify_vote_proposal_signature,
-                export_consensus_key,
-                timeout,
-            )
-        });
+        let child = thread::spawn(move || remote_service::execute(storage, listen_addr, timeout));
 
         Self {
             _child: child,
@@ -58,6 +46,7 @@ impl RemoteService for ThreadService {
     fn server_address(&self) -> SocketAddr {
         self.server_addr
     }
+
     fn network_timeout_ms(&self) -> u64 {
         self.network_timeout
     }

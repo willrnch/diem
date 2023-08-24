@@ -1,18 +1,20 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::serializer::SafetyRulesInput;
 #[cfg(any(test, feature = "fuzzing"))]
-use consensus_types::block::Block;
-use consensus_types::{
+use diem_consensus_types::block::Block;
+use diem_consensus_types::{
     block_data::{BlockData, BlockType},
+    common::Payload,
     quorum_cert::QuorumCert,
-    timeout::Timeout,
+    timeout_2chain::TwoChainTimeout,
     vote_data::VoteData,
-    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
+    vote_proposal::VoteProposal,
 };
 use diem_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
+    bls12381,
     hash::{HashValue, TransactionAccumulatorHasher},
     test_utils::TEST_SEED,
     traits::{SigningKey, Uniform},
@@ -64,8 +66,8 @@ prop_compose! {
     ) -> Block {
         let signature = if include_signature {
             let mut rng = StdRng::from_seed(TEST_SEED);
-            let private_key = Ed25519PrivateKey::generate(&mut rng);
-            let signature = private_key.sign(&block_data);
+            let private_key = bls12381::PrivateKey::generate(&mut rng);
+            let signature = private_key.sign(&block_data).unwrap();
             Some(signature)
         } else {
             None
@@ -93,38 +95,38 @@ prop_compose! {
     pub fn arb_block_type_proposal(
     )(
         author in any::<AccountAddress>(),
-        payload in prop::collection::vec(any::<SignedTransaction>(), 0..MAX_PROPOSAL_TRANSACTIONS),
+        txns in prop::collection::vec(any::<SignedTransaction>(), 0..MAX_PROPOSAL_TRANSACTIONS),
     ) -> BlockType {
         BlockType::Proposal{
-            payload,
-            author
+            payload: Payload::DirectMempool(txns),
+            author,
+            failed_authors: Vec::new(),
         }
     }
 }
 
-// This generates an arbitrary MaybeSignedVoteProposal.
+// This generates an arbitrary BlockType::Proposal enum instance.
 prop_compose! {
-    pub fn arb_maybe_signed_vote_proposal(
+    pub fn arb_nil_block(
+    )(
+        author in any::<AccountAddress>(),
+        round in any::<u64>(),
+    ) -> BlockType {
+        BlockType::NilBlock{
+            failed_authors: vec![(round, author)],
+        }
+    }
+}
+
+// This generates an arbitrary VoteProposal.
+prop_compose! {
+    pub fn arb_vote_proposal(
     )(
         accumulator_extension_proof in arb_accumulator_extension_proof(),
         block in arb_block(),
         next_epoch_state in arb_epoch_state(),
-        include_signature in any::<bool>(),
-    ) -> MaybeSignedVoteProposal {
-        let vote_proposal = VoteProposal::new(accumulator_extension_proof, block, next_epoch_state, false);
-        let signature = if include_signature {
-            let mut rng = StdRng::from_seed(TEST_SEED);
-            let private_key = Ed25519PrivateKey::generate(&mut rng);
-            let signature = private_key.sign(&vote_proposal);
-            Some(signature)
-        } else {
-            None
-        };
-
-        MaybeSignedVoteProposal {
-            vote_proposal,
-            signature
-        }
+    ) -> VoteProposal {
+        VoteProposal::new(accumulator_extension_proof, block, next_epoch_state, false)
     }
 }
 
@@ -151,8 +153,9 @@ prop_compose! {
     )(
         epoch in any::<u64>(),
         round in any::<u64>(),
-    ) -> Timeout {
-        Timeout::new(epoch, round)
+        qc in arb_quorum_cert(),
+    ) -> TwoChainTimeout {
+        TwoChainTimeout::new(epoch, round, qc)
     }
 }
 
@@ -162,18 +165,13 @@ prop_compose! {
     )(
         include_epoch_state in any::<bool>(),
         epoch in any::<u64>(),
-        address_to_validator_info in prop::collection::btree_map(
-            any::<AccountAddress>(),
-            arb_validator_consensus_info(),
+        validator_infos in prop::collection::vec(
+            any::<ValidatorConsensusInfo>(),
             0..MAX_NUM_ADDR_TO_VALIDATOR_INFO
         ),
-        quorum_voting_power in any::<u64>(),
-        total_voting_power in any::<u64>(),
     ) -> Option<EpochState> {
-        let verifier = ValidatorVerifier::new_for_testing(
-            address_to_validator_info,
-            quorum_voting_power,
-            total_voting_power
+        let verifier = ValidatorVerifier::new(
+            validator_infos,
         );
         if include_epoch_state {
             Some(EpochState {
@@ -212,22 +210,11 @@ prop_compose! {
     }
 }
 
-// This generates an arbitrary ValidatorConsensusInfo.
-prop_compose! {
-    pub fn arb_validator_consensus_info(
-    )(
-        public_key in any::<Ed25519PublicKey>(),
-        voting_power in any::<u64>(),
-    ) -> ValidatorConsensusInfo {
-        ValidatorConsensusInfo::new(public_key, voting_power)
-    }
-}
-
 // This generates an arbitrary BlockType enum.
 fn arb_block_type() -> impl Strategy<Value = BlockType> {
     prop_oneof![
         arb_block_type_proposal(),
-        Just(BlockType::NilBlock),
+        arb_nil_block(),
         Just(BlockType::Genesis),
     ]
 }
@@ -237,20 +224,24 @@ pub fn arb_safety_rules_input() -> impl Strategy<Value = SafetyRulesInput> {
     prop_oneof![
         Just(SafetyRulesInput::ConsensusState),
         arb_epoch_change_proof().prop_map(|input| SafetyRulesInput::Initialize(Box::new(input))),
-        arb_maybe_signed_vote_proposal()
-            .prop_map(|input| { SafetyRulesInput::ConstructAndSignVote(Box::new(input)) }),
+        arb_vote_proposal().prop_map(|input| {
+            SafetyRulesInput::ConstructAndSignVoteTwoChain(Box::new(input), Box::new(None))
+        }),
         arb_block_data().prop_map(|input| { SafetyRulesInput::SignProposal(Box::new(input)) }),
-        arb_timeout().prop_map(|input| { SafetyRulesInput::SignTimeout(Box::new(input)) }),
+        arb_timeout().prop_map(|input| {
+            SafetyRulesInput::SignTimeoutWithQC(Box::new(input), Box::new(None))
+        }),
     ]
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod fuzzing {
     use crate::{error::Error, serializer::SafetyRulesInput, test_utils, TSafetyRules};
-    use consensus_types::{
-        block_data::BlockData, timeout::Timeout, vote::Vote, vote_proposal::MaybeSignedVoteProposal,
+    use diem_consensus_types::{
+        block_data::BlockData, timeout_2chain::TwoChainTimeout, vote::Vote,
+        vote_proposal::VoteProposal,
     };
-    use diem_crypto::ed25519::Ed25519Signature;
+    use diem_crypto::bls12381;
     use diem_types::epoch_change::EpochChangeProof;
 
     pub fn fuzz_initialize(proof: EpochChangeProof) -> Result<(), Error> {
@@ -258,11 +249,11 @@ pub mod fuzzing {
         safety_rules.initialize(&proof)
     }
 
-    pub fn fuzz_construct_and_sign_vote(
-        maybe_signed_vote_proposal: MaybeSignedVoteProposal,
+    pub fn fuzz_construct_and_sign_vote_two_chain(
+        vote_proposal: VoteProposal,
     ) -> Result<Vote, Error> {
         let mut safety_rules = test_utils::test_safety_rules();
-        safety_rules.construct_and_sign_vote(&maybe_signed_vote_proposal)
+        safety_rules.construct_and_sign_vote_two_chain(&vote_proposal, None)
     }
 
     pub fn fuzz_handle_message(safety_rules_input: SafetyRulesInput) -> Result<Vec<u8>, Error> {
@@ -279,14 +270,16 @@ pub mod fuzzing {
         }
     }
 
-    pub fn fuzz_sign_proposal(block_data: &BlockData) -> Result<Ed25519Signature, Error> {
+    pub fn fuzz_sign_proposal(block_data: &BlockData) -> Result<bls12381::Signature, Error> {
         let mut safety_rules = test_utils::test_safety_rules();
         safety_rules.sign_proposal(block_data)
     }
 
-    pub fn fuzz_sign_timeout(timeout: Timeout) -> Result<Ed25519Signature, Error> {
+    pub fn fuzz_sign_timeout_with_qc(
+        timeout: TwoChainTimeout,
+    ) -> Result<bls12381::Signature, Error> {
         let mut safety_rules = test_utils::test_safety_rules();
-        safety_rules.sign_timeout(&timeout)
+        safety_rules.sign_timeout_with_qc(&timeout, None)
     }
 }
 
@@ -296,12 +289,12 @@ pub mod fuzzing {
 mod tests {
     use crate::{
         fuzzing::{
-            fuzz_construct_and_sign_vote, fuzz_handle_message, fuzz_initialize, fuzz_sign_proposal,
-            fuzz_sign_timeout,
+            fuzz_construct_and_sign_vote_two_chain, fuzz_handle_message, fuzz_initialize,
+            fuzz_sign_proposal, fuzz_sign_timeout_with_qc,
         },
         fuzzing_utils::{
-            arb_block_data, arb_epoch_change_proof, arb_maybe_signed_vote_proposal,
-            arb_safety_rules_input, arb_timeout,
+            arb_block_data, arb_epoch_change_proof, arb_safety_rules_input, arb_timeout,
+            arb_vote_proposal,
         },
     };
     use proptest::prelude::*;
@@ -320,8 +313,8 @@ mod tests {
         }
 
         #[test]
-        fn construct_and_sign_vote_proptest(input in arb_maybe_signed_vote_proposal()) {
-            let _ = fuzz_construct_and_sign_vote(input);
+        fn construct_and_sign_vote_two_chain_proptest(input in arb_vote_proposal()) {
+            let _ = fuzz_construct_and_sign_vote_two_chain(input);
         }
 
         #[test]
@@ -331,7 +324,7 @@ mod tests {
 
         #[test]
         fn sign_timeout_proptest(input in arb_timeout()) {
-            let _ = fuzz_sign_timeout(input);
+            let _ = fuzz_sign_timeout_with_qc(input);
         }
     }
 }

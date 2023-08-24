@@ -1,29 +1,30 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::tests::new_test_context;
-
+use super::new_test_context;
+use diem_api_test_context::current_function_name;
 use diem_api_types::Address;
 use diem_crypto::ed25519::Ed25519PrivateKey;
 use diem_sdk::types::LocalAccount;
 use serde_json::json;
-
 use std::convert::TryInto;
 
 #[tokio::test]
+#[ignore] // TODO(issue 81): re-enable this test when having correct script code
 async fn test_renders_move_acsii_string_into_utf8_string() {
-    let context = new_test_context();
+    let mut context = new_test_context(current_function_name!());
     let mut account = init_test_account();
-    let txn = context.create_parent_vasp(&account);
+    let txn = context.create_user_account(&account).await;
     context.commit_block(&vec![txn]).await;
 
     // module 0x87342d91af60c3a883a2812c9294c2f8::Message {
-    //     use Std::ASCII;
+    //     use Std::ascii;
     //     struct MessageHolder has key {
-    //         message: ASCII::String,
+    //         message: string::String,
     //     }
     //     public(script) fun set_message(account: signer, msg: vector<u8>) {
-    //         let message = ASCII::string(msg);
+    //         let message = string::utf8(msg);
     //         move_to(&account, MessageHolder {
     //             message,
     //         });
@@ -35,9 +36,9 @@ async fn test_renders_move_acsii_string_into_utf8_string() {
         .await;
 
     context
-        .api_execute_script_function(
+        .api_execute_entry_function(
             &mut account,
-            "Message::set_message",
+            "set_message",
             json!([]),
             json!([hex::encode(b"hello world")]),
         )
@@ -45,11 +46,10 @@ async fn test_renders_move_acsii_string_into_utf8_string() {
 
     let message = context
         .api_get_account_resource(
-            &account,
-            format!(
-                "{}::Message::MessageHolder",
-                account.address().to_hex_literal()
-            ),
+            account.address(),
+            &account.address().to_hex_literal(),
+            "Message",
+            "MessageHolder",
         )
         .await;
     assert_eq!("hello world", message["data"]["message"]);
@@ -59,6 +59,6 @@ fn init_test_account() -> LocalAccount {
     let key_bytes =
         hex::decode("a38ba78b1a0fbfc55e2c5dfdedf48d1172283d0f7c59fd64c02d811130a2f4b2").unwrap();
     let private_key: Ed25519PrivateKey = (&key_bytes[..]).try_into().unwrap();
-    let address: Address = "87342d91af60c3a883a2812c9294c2f8".parse().unwrap();
+    let address: Address = "0x87342d91af60c3a883a2812c9294c2f8".parse().unwrap();
     LocalAccount::new(address.into(), private_key, 0)
 }

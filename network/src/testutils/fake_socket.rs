@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //!
@@ -7,12 +8,12 @@
 //! - ReadWriteTestSocket: a similar wrapper but around MemorySocket to retrieve handshake messages being sent as well.
 //!
 
+use diem_memsocket::MemorySocket;
 use futures::{
     io::{AsyncRead, AsyncWrite},
     ready,
     task::{Context, Poll},
 };
-use memsocket::MemorySocket;
 use std::{io, pin::Pin};
 
 //

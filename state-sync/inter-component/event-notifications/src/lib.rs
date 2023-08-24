@@ -1,32 +1,34 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use channel::{diem_channel, message_queues::QueueStyle};
+use diem_channels::{diem_channel, message_queues::QueueStyle};
 use diem_id_generator::{IdGenerator, U64IdGenerator};
 use diem_infallible::RwLock;
+use diem_state_view::account_with_state_view::AsAccountWithStateView;
+use diem_storage_interface::{state_view::DbStateViewAtVersion, DbReaderWriter};
 use diem_types::{
-    account_state::AccountState,
+    account_config::CORE_CODE_ADDRESS,
+    account_view::AccountView,
     contract_event::ContractEvent,
     event::EventKey,
     move_resource::MoveStorage,
     on_chain_config,
-    on_chain_config::{config_address, ConfigID, OnChainConfigPayload},
+    on_chain_config::{ConfigID, OnChainConfigPayload},
     transaction::Version,
 };
 use futures::{channel::mpsc::SendError, stream::FusedStream, Stream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    convert::TryFrom,
     iter::FromIterator,
     ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use storage_interface::DbReaderWriter;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -38,7 +40,7 @@ mod tests;
 const EVENT_NOTIFICATION_CHANNEL_SIZE: usize = 100;
 const RECONFIG_NOTIFICATION_CHANNEL_SIZE: usize = 1;
 
-#[derive(Clone, Debug, Deserialize, Error, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
 pub enum Error {
     #[error("Cannot subscribe to zero event keys!")]
     CannotSubscribeToZeroEventKeys,
@@ -122,7 +124,6 @@ impl EventSubscriptionService {
         // Create a new event subscription
         let subscription_id = self.get_new_subscription_id();
         let event_subscription = EventSubscription {
-            subscription_id,
             notification_sender,
             event_buffer: vec![],
         };
@@ -132,10 +133,10 @@ impl EventSubscriptionService {
             .subscription_id_to_event_subscription
             .insert(subscription_id, event_subscription)
         {
-            panic!(
+            return Err(Error::UnexpectedErrorEncountered(format!(
                 "Duplicate event subscription found! This should not occur! ID: {}, subscription: {:?}",
                 subscription_id, old_subscription
-            );
+            )));
         }
 
         // Update the event key subscriptions to include the new subscription
@@ -166,7 +167,6 @@ impl EventSubscriptionService {
         // Create a new reconfiguration subscription
         let subscription_id = self.get_new_subscription_id();
         let reconfig_subscription = ReconfigSubscription {
-            subscription_id,
             notification_sender,
         };
 
@@ -175,10 +175,10 @@ impl EventSubscriptionService {
             .reconfig_subscriptions
             .insert(subscription_id, reconfig_subscription)
         {
-            panic!(
+            return Err(Error::UnexpectedErrorEncountered(format!(
                 "Duplicate reconfiguration subscription found! This should not occur! ID: {}, subscription: {:?}",
                 subscription_id, old_subscription
-            );
+            )));
         }
 
         Ok(ReconfigNotificationListener {
@@ -274,48 +274,39 @@ impl EventSubscriptionService {
                 .fetch_config_by_version(*config_id, version)
             {
                 if let Some(old_entry) = config_id_to_config.insert(*config_id, config.clone()) {
-                    panic!(
+                    return Err(Error::UnexpectedErrorEncountered(format!(
                         "Unexpected config values for duplicate config id found! Key: {}, Value: {:?}!",
-                        config_id, old_entry
-                    );
+                        config_id, old_entry)));
                 }
             }
         }
 
-        // Fetch the account state blob
-        let (account_state_blob, _) = self
+        let db_state_view = &self
             .storage
             .read()
             .reader
-            .get_account_state_with_proof_by_version(config_address(), version)
+            .state_view_at_version(Some(version))
             .map_err(|error| {
                 Error::UnexpectedErrorEncountered(format!(
-                    "Failed to fetch account state with proof {:?}",
+                    "Failed to create account state view {:?}",
                     error
                 ))
             })?;
-        let account_state_blob = account_state_blob.ok_or_else(|| {
-            Error::UnexpectedErrorEncountered("Missing account state blob!".into())
-        })?;
+        let diem_framework_account_view =
+            db_state_view.as_account_with_state_view(&CORE_CODE_ADDRESS);
 
-        // Fetch the new epoch from storage
-        let epoch = AccountState::try_from(&account_state_blob)
-            .and_then(|state| {
-                Ok(state
-                    .get_configuration_resource()?
-                    .ok_or_else(|| {
-                        Error::UnexpectedErrorEncountered(
-                            "Configuration resource does not exist!".into(),
-                        )
-                    })?
-                    .epoch())
-            })
+        let epoch = diem_framework_account_view
+            .get_configuration_resource()
             .map_err(|error| {
                 Error::UnexpectedErrorEncountered(format!(
-                    "Failed to fetch configuration resource! Error: {:?}",
+                    "Failed to fetch Configuration resource {:?}",
                     error
                 ))
-            })?;
+            })?
+            .ok_or_else(|| {
+                Error::UnexpectedErrorEncountered("Configuration resource does not exist!".into())
+            })?
+            .epoch();
 
         // Return the new on-chain config payload (containing all found configs at this version).
         Ok(OnChainConfigPayload::new(
@@ -355,9 +346,8 @@ type SubscriptionId = u64;
 /// send the corresponding notifications and a buffer to hold pending events.
 #[derive(Debug)]
 struct EventSubscription {
-    pub subscription_id: SubscriptionId,
     pub event_buffer: Vec<ContractEvent>,
-    pub notification_sender: channel::diem_channel::Sender<(), EventNotification>,
+    pub notification_sender: diem_channels::diem_channel::Sender<(), EventNotification>,
 }
 
 impl EventSubscription {
@@ -381,8 +371,7 @@ impl EventSubscription {
 /// corresponding notifications.
 #[derive(Debug)]
 struct ReconfigSubscription {
-    pub subscription_id: SubscriptionId,
-    pub notification_sender: channel::diem_channel::Sender<(), ReconfigNotification>,
+    pub notification_sender: diem_channels::diem_channel::Sender<(), ReconfigNotification>,
 }
 
 impl ReconfigSubscription {
@@ -425,7 +414,7 @@ pub type ReconfigNotificationListener = NotificationListener<ReconfigNotificatio
 /// The component responsible for listening to subscription notifications.
 #[derive(Debug)]
 pub struct NotificationListener<T> {
-    pub notification_receiver: channel::diem_channel::Receiver<(), T>,
+    pub notification_receiver: diem_channels::diem_channel::Receiver<(), T>,
 }
 
 impl<T> Stream for NotificationListener<T> {

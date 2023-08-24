@@ -1,26 +1,39 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
+use crate::{
+    core_mempool::{CoreMempool, TimelineState, TxnPointer},
+    network::MempoolSyncMsg,
+};
 use anyhow::{format_err, Result};
-use diem_config::config::NodeConfig;
+use diem_compression::metrics::CompressionClient;
+use diem_config::config::{NodeConfig, MAX_APPLICATION_MESSAGE_SIZE};
+use diem_consensus_types::common::TransactionInProgress;
 use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use diem_types::{
     account_address::AccountAddress,
-    account_config::{AccountSequenceInfo, XUS_NAME},
     chain_id::ChainId,
     mempool_status::MempoolStatusCode,
-    transaction::{GovernanceRole, RawTransaction, Script, SignedTransaction},
+    transaction::{RawTransaction, Script, SignedTransaction},
 };
 use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
-    (
-        CoreMempool::new(&NodeConfig::random()),
-        ConsensusMock::new(),
-    )
+    let mut config = NodeConfig::generate_random_config();
+    config.mempool.broadcast_buckets = vec![0];
+    (CoreMempool::new(&config), ConsensusMock::new())
+}
+
+pub(crate) fn setup_mempool_with_broadcast_buckets(
+    buckets: Vec<u64>,
+) -> (CoreMempool, ConsensusMock) {
+    let mut config = NodeConfig::generate_random_config();
+    config.mempool.broadcast_buckets = buckets;
+    (CoreMempool::new(&config), ConsensusMock::new())
 }
 
 static ACCOUNTS: Lazy<Vec<AccountAddress>> = Lazy::new(|| {
@@ -32,13 +45,12 @@ static ACCOUNTS: Lazy<Vec<AccountAddress>> = Lazy::new(|| {
     ]
 });
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TestTransaction {
     pub(crate) address: usize,
     pub(crate) sequence_number: u64,
     pub(crate) gas_price: u64,
-    pub(crate) governance_role: GovernanceRole,
-    pub(crate) account_seqno_type: AccountSequenceInfo,
+    pub(crate) account_seqno: u64,
 }
 
 impl TestTransaction {
@@ -47,18 +59,8 @@ impl TestTransaction {
             address,
             sequence_number,
             gas_price,
-            governance_role: GovernanceRole::NonGovernanceRole,
-            account_seqno_type: AccountSequenceInfo::Sequential(0),
+            account_seqno: 0,
         }
-    }
-
-    pub(crate) fn crsn(mut self, min_nonce: u64) -> Self {
-        // Default CRSN size to 128
-        self.account_seqno_type = AccountSequenceInfo::CRSN {
-            min_nonce,
-            size: 128,
-        };
-        self
     }
 
     pub(crate) fn make_signed_transaction_with_expiration_time(
@@ -72,11 +74,11 @@ impl TestTransaction {
         &self,
         max_gas_amount: u64,
     ) -> SignedTransaction {
-        self.make_signed_transaction_impl(max_gas_amount, u64::max_value())
+        self.make_signed_transaction_impl(max_gas_amount, u64::MAX)
     }
 
     pub(crate) fn make_signed_transaction(&self) -> SignedTransaction {
-        self.make_signed_transaction_impl(100, u64::max_value())
+        self.make_signed_transaction_impl(100, u64::MAX)
     }
 
     fn make_signed_transaction_impl(
@@ -90,7 +92,6 @@ impl TestTransaction {
             Script::new(vec![], vec![], vec![]),
             max_gas_amount,
             self.gas_price,
-            XUS_NAME.to_owned(),
             exp_timestamp_secs,
             ChainId::test(),
         );
@@ -118,11 +119,10 @@ pub(crate) fn add_txns_to_mempool(
         let txn = transaction.make_signed_transaction();
         pool.add_txn(
             txn.clone(),
-            0,
             txn.gas_unit_price(),
-            transaction.account_seqno_type,
+            transaction.account_seqno,
             TimelineState::NotReady,
-            transaction.governance_role,
+            false,
         );
         transactions.push(txn);
     }
@@ -137,11 +137,10 @@ pub(crate) fn add_signed_txn(pool: &mut CoreMempool, transaction: SignedTransact
     match pool
         .add_txn(
             transaction.clone(),
-            0,
             transaction.gas_unit_price(),
-            AccountSequenceInfo::Sequential(0),
+            0,
             TimelineState::NotReady,
-            GovernanceRole::NonGovernanceRole,
+            false,
         )
         .code
     {
@@ -155,9 +154,7 @@ pub(crate) fn batch_add_signed_txn(
     transactions: Vec<SignedTransaction>,
 ) -> Result<()> {
     for txn in transactions.into_iter() {
-        if let Err(e) = add_signed_txn(pool, txn) {
-            return Err(e);
-        }
+        add_signed_txn(pool, txn)?
     }
     Ok(())
 }
@@ -173,15 +170,24 @@ impl ConsensusMock {
     pub(crate) fn get_block(
         &mut self,
         mempool: &mut CoreMempool,
-        block_size: u64,
+        max_txns: u64,
+        max_bytes: u64,
     ) -> Vec<SignedTransaction> {
-        let block = mempool.get_block(block_size, self.0.clone());
+        let exclude_transactions: Vec<_> = self
+            .0
+            .iter()
+            .map(|txn| TransactionInProgress {
+                summary: *txn,
+                gas_unit_price: 0,
+            })
+            .collect();
+        let block = mempool.get_batch(max_txns, max_bytes, true, false, exclude_transactions);
         self.0 = self
             .0
             .union(
                 &block
                     .iter()
-                    .map(|t| (t.sender(), t.sequence_number()))
+                    .map(|t| TxnPointer::new(t.sender(), t.sequence_number()))
                     .collect(),
             )
             .cloned()
@@ -190,9 +196,15 @@ impl ConsensusMock {
     }
 }
 
-pub(crate) fn exist_in_metrics_cache(mempool: &CoreMempool, txn: &SignedTransaction) -> bool {
-    mempool
-        .metrics_cache
-        .get(&(txn.sender(), txn.sequence_number()))
-        .is_some()
+/// Decompresses and deserializes the raw message bytes into a message struct
+pub fn decompress_and_deserialize(message_bytes: &Vec<u8>) -> MempoolSyncMsg {
+    bcs::from_bytes(
+        &diem_compression::decompress(
+            message_bytes,
+            CompressionClient::Mempool,
+            MAX_APPLICATION_MESSAGE_SIZE,
+        )
+        .unwrap(),
+    )
+    .unwrap()
 }

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for nodes in the state Jellyfish Merkle Tree.
@@ -10,16 +11,16 @@
 
 use crate::schema::JELLYFISH_MERKLE_NODE_CF_NAME;
 use anyhow::Result;
-use byteorder::{BigEndian, WriteBytesExt};
 use diem_jellyfish_merkle::node_type::NodeKey;
-use diem_types::{account_state_blob::AccountStateBlob, transaction::Version};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, SeekKeyCodec, ValueCodec},
 };
+use diem_types::{state_store::state_key::StateKey, transaction::Version};
+use byteorder::{BigEndian, WriteBytesExt};
 use std::mem::size_of;
 
-type Node = diem_jellyfish_merkle::node_type::Node<AccountStateBlob>;
+type Node = diem_jellyfish_merkle::node_type::Node<StateKey>;
 
 define_schema!(
     JellyfishMerkleNodeSchema,

@@ -1,7 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use channel::{diem_channel, message_queues::QueueStyle};
+use diem_channels::{diem_channel, message_queues::QueueStyle};
 use futures::{executor::block_on, stream::StreamExt};
 use std::{
     io::{Cursor, Write},

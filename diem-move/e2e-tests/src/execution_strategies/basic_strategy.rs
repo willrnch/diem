@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -9,17 +10,17 @@ use crate::{
 };
 use diem_types::{transaction::SignedTransaction, vm_status::VMStatus};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BasicStrategy;
 
 impl PartitionStrategy for BasicStrategy {
     type Txn = SignedTransaction;
+
     fn partition(&mut self, block: Block<Self::Txn>) -> Vec<Block<SignedTransaction>> {
         vec![block]
     }
 }
 
-#[derive(Debug)]
 pub struct BasicExecutor {
     executor: FakeExecutor,
     strategy: BasicStrategy,
@@ -34,15 +35,16 @@ impl Default for BasicExecutor {
 impl BasicExecutor {
     pub fn new() -> Self {
         Self {
-            executor: FakeExecutor::from_genesis_file(),
+            executor: FakeExecutor::from_head_genesis(),
             strategy: BasicStrategy,
         }
     }
 }
 
 impl Executor for BasicExecutor {
-    type Txn = <BasicStrategy as PartitionStrategy>::Txn;
     type BlockResult = VMStatus;
+    type Txn = <BasicStrategy as PartitionStrategy>::Txn;
+
     fn execute_block(&mut self, txns: Block<Self::Txn>) -> ExecutorResult<Self::BlockResult> {
         let mut block = self.strategy.partition(txns);
         let outputs = self.executor.execute_block(block.remove(0))?;

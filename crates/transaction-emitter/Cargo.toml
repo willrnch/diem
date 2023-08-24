@@ -1,31 +1,26 @@
 [package]
-name = "transaction-emitter"
+name = "diem-transaction-emitter"
+description = "Diem transaction emitter for testing"
 version = "0.0.0"
-authors = ["Diem Association <opensource@diem.com>"]
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = { version = "1.0.52", features = ["backtrace"] }
-futures = "0.3.12"
-generate-key = { path = "../../config/generate-key" }
-itertools = "0.10.0"
-rand = "0.8.3"
-rand_core = "0.6.2"
-reqwest = { version = "0.11.2", features = ["blocking", "json"] }
-serde = { version = "1.0.124", features = ["derive"], default-features = false }
-serde_json = "1.0.64"
-structopt = "0.3.21"
-termion = "1.5.6"
-tokio = { version = "1.8.1", features = ["full"] }
-
-diem-client = { path = "../diem-client"}
-diem-rest-client = { path = "../diem-rest-client"}
-diem-config = { path = "../../config" }
-diem-crypto = { path = "../diem-crypto" }
-diem-logger = { path = "../../crates/diem-logger" }
-diem-sdk = { path = "../../sdk" }
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
+anyhow = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-logger = { workspace = true }
+diem-sdk = { workspace = true }
+diem-transaction-emitter-lib = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+tokio = { workspace = true }

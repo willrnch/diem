@@ -1,26 +1,38 @@
 [package]
-name = "forge-cli"
+name = "diem-forge-cli"
+description = "Diem end to end test framework CLI"
 version = "0.0.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Forged in Fire"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = { version = "1.0.52", features = ["backtrace"] }
-diem-sdk = { path = "../../sdk" }
-diem-rest-client = { path = "../../crates/diem-rest-client"}
-forge = { path = "../forge" }
-itertools = "0.10.0"
-rand_core = "0.6.2"
-structopt = "0.3.21"
-tokio = { version = "1.8.1", features = ["full"] }
-testcases = { path = "../testcases" }
-url = "2.2.2"
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
+anyhow = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-config = { workspace = true }
+diem-forge = { workspace = true }
+diem-framework = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-logger = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-sdk = { workspace = true }
+diem-testcases = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+random_word = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+jemallocator = { workspace = true }
 
 [[bin]]
 name = "forge"

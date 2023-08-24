@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,20 +8,23 @@ use crate::{
         buffer_manager::{OrderedBlocks, ResetAck, ResetRequest},
         errors::Error,
     },
+    payload_manager::PayloadManager,
     state_replication::{StateComputer, StateComputerCommitCallBackType},
+    transaction_deduper::TransactionDeduper,
+    transaction_shuffler::TransactionShuffler,
 };
 use anyhow::Result;
-use consensus_types::{block::Block, executed_block::ExecutedBlock};
+use diem_consensus_types::{block::Block, executed_block::ExecutedBlock};
 use diem_crypto::HashValue;
+use diem_executor_types::{Error as ExecutionError, StateComputeResult};
 use diem_logger::prelude::*;
-use diem_types::ledger_info::LedgerInfoWithSignatures;
-use executor_types::{Error as ExecutionError, StateComputeResult};
+use diem_types::{epoch_state::EpochState, ledger_info::LedgerInfoWithSignatures};
 use fail::fail_point;
 use futures::{
     channel::{mpsc::UnboundedSender, oneshot},
     SinkExt,
 };
-use std::{boxed::Box, sync::Arc};
+use std::sync::Arc;
 
 /// Ordering-only execution proxy
 /// implements StateComputer traits.
@@ -116,4 +120,16 @@ impl StateComputer for OrderingStateComputer {
         self.state_computer_for_sync.sync_to(target).await?;
         Ok(())
     }
+
+    fn new_epoch(
+        &self,
+        _: &EpochState,
+        _payload_manager: Arc<PayloadManager>,
+        _: Arc<dyn TransactionShuffler>,
+        _: Option<u64>,
+        _: Arc<dyn TransactionDeduper>,
+    ) {
+    }
+
+    fn end_epoch(&self) {}
 }

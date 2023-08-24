@@ -1,26 +1,26 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
-use std::sync::Arc;
-
-use consensus_types::{
-    block::{block_test_utils::certificate_for_genesis, Block},
-    executed_block::ExecutedBlock,
-    quorum_cert::QuorumCert,
-};
-use diem_crypto::HashValue;
-use diem_types::{ledger_info::LedgerInfo, validator_verifier::random_validator_verifier};
-use executor_types::{Error, StateComputeResult};
 
 use crate::{
     experimental::{
         buffer_manager::create_channel,
         execution_phase::{ExecutionPhase, ExecutionRequest, ExecutionResponse},
-        pipeline_phase::PipelinePhase,
+        pipeline_phase::{CountedRequest, PipelinePhase},
         tests::phase_tester::PhaseTester,
     },
     test_utils::{consensus_runtime, RandomComputeResultStateComputer},
 };
+use diem_consensus_types::{
+    block::{block_test_utils::certificate_for_genesis, Block},
+    common::Payload,
+    executed_block::ExecutedBlock,
+    quorum_cert::QuorumCert,
+};
+use diem_crypto::HashValue;
+use diem_executor_types::{Error, StateComputeResult};
+use diem_types::{ledger_info::LedgerInfo, validator_verifier::random_validator_verifier};
+use std::sync::Arc;
 
 pub fn prepare_execution_phase() -> (HashValue, ExecutionPhase) {
     let execution_proxy = Arc::new(RandomComputeResultStateComputer::new());
@@ -35,7 +35,15 @@ fn add_execution_phase_test_cases(
 ) {
     let genesis_qc = certificate_for_genesis();
     let (signers, _validators) = random_validator_verifier(1, None, false);
-    let block = Block::new_proposal(vec![], 1, 1, genesis_qc, &signers[0]);
+    let block = Block::new_proposal(
+        Payload::empty(false),
+        1,
+        1,
+        genesis_qc,
+        &signers[0],
+        Vec::new(),
+    )
+    .unwrap();
 
     // happy path
     phase_tester.add_test_case(
@@ -63,7 +71,8 @@ fn add_execution_phase_test_cases(
         &LedgerInfo::mock_genesis(None),
         random_hash_value,
     );
-    let bad_block = Block::new_proposal(vec![], 1, 1, bad_qc, &signers[0]);
+    let bad_block =
+        Block::new_proposal(Payload::empty(false), 1, 1, bad_qc, &signers[0], Vec::new()).unwrap();
     phase_tester.add_test_case(
         ExecutionRequest {
             ordered_blocks: vec![ExecutedBlock::new(
@@ -86,7 +95,7 @@ fn execution_phase_tests() {
     unit_phase_tester.unit_test(&execution_phase);
 
     // e2e tests
-    let (in_channel_tx, in_channel_rx) = create_channel::<ExecutionRequest>();
+    let (in_channel_tx, in_channel_rx) = create_channel::<CountedRequest<ExecutionRequest>>();
     let (out_channel_tx, out_channel_rx) = create_channel::<ExecutionResponse>();
 
     let execution_phase_pipeline = PipelinePhase::new(

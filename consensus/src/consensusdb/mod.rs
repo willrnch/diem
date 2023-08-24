@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
@@ -6,20 +7,41 @@ mod consensusdb_test;
 mod schema;
 
 use crate::{
-    consensusdb::schema::{
-        block::BlockSchema,
-        quorum_certificate::QCSchema,
-        single_entry::{SingleEntryKey, SingleEntrySchema},
-    },
+    dag::{CertifiedNode, Node},
     error::DbError,
 };
 use anyhow::Result;
-use consensus_types::{block::Block, quorum_cert::QuorumCert};
+use diem_consensus_types::{block::Block, quorum_cert::QuorumCert};
 use diem_crypto::HashValue;
 use diem_logger::prelude::*;
-use schema::{BLOCK_CF_NAME, QC_CF_NAME, SINGLE_ENTRY_CF_NAME};
-use schemadb::{Options, ReadOptions, SchemaBatch, DB, DEFAULT_CF_NAME};
+use diem_schemadb::{Options, ReadOptions, SchemaBatch, DB, DEFAULT_COLUMN_FAMILY_NAME};
+use schema::{
+    block::BlockSchema,
+    dag::{CertifiedNodeSchema, NodeSchema},
+    quorum_certificate::QCSchema,
+    single_entry::{SingleEntryKey, SingleEntrySchema},
+    BLOCK_CF_NAME, CERTIFIED_NODE_CF_NAME, NODE_CF_NAME, QC_CF_NAME, SINGLE_ENTRY_CF_NAME,
+};
 use std::{collections::HashMap, iter::Iterator, path::Path, time::Instant};
+
+/// The name of the consensus db file
+pub const CONSENSUS_DB_NAME: &str = "consensus_db";
+
+/// Creates new physical DB checkpoint in directory specified by `checkpoint_path`.
+pub fn create_checkpoint<P: AsRef<Path> + Clone>(db_path: P, checkpoint_path: P) -> Result<()> {
+    let start = Instant::now();
+    let consensus_db_checkpoint_path = checkpoint_path.as_ref().join(CONSENSUS_DB_NAME);
+    std::fs::remove_dir_all(&consensus_db_checkpoint_path).unwrap_or(());
+    ConsensusDB::new(db_path)
+        .db
+        .create_checkpoint(&consensus_db_checkpoint_path)?;
+    info!(
+        path = consensus_db_checkpoint_path,
+        time_ms = %start.elapsed().as_millis(),
+        "Made ConsensusDB checkpoint."
+    );
+    Ok(())
+}
 
 pub struct ConsensusDB {
     db: DB,
@@ -28,13 +50,15 @@ pub struct ConsensusDB {
 impl ConsensusDB {
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
         let column_families = vec![
-            /* UNUSED CF = */ DEFAULT_CF_NAME,
+            /* UNUSED CF = */ DEFAULT_COLUMN_FAMILY_NAME,
             BLOCK_CF_NAME,
             QC_CF_NAME,
             SINGLE_ENTRY_CF_NAME,
+            NODE_CF_NAME,
+            CERTIFIED_NODE_CF_NAME,
         ];
 
-        let path = db_root_path.as_ref().join("consensusdb");
+        let path = db_root_path.as_ref().join(CONSENSUS_DB_NAME);
         let instant = Instant::now();
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -56,55 +80,34 @@ impl ConsensusDB {
     ) -> Result<(
         Option<Vec<u8>>,
         Option<Vec<u8>>,
-        Option<Vec<u8>>,
         Vec<Block>,
         Vec<QuorumCert>,
     )> {
         let last_vote = self.get_last_vote()?;
-        let highest_timeout_certificate = self.get_highest_timeout_certificate()?;
         let highest_2chain_timeout_certificate = self.get_highest_2chain_timeout_certificate()?;
-        let consensus_blocks = self
-            .get_blocks()?
-            .into_iter()
-            .map(|(_block_hash, block_content)| block_content)
-            .collect::<Vec<_>>();
+        let consensus_blocks = self.get_blocks()?.into_values().collect::<Vec<_>>();
         let consensus_qcs = self
             .get_quorum_certificates()?
-            .into_iter()
-            .map(|(_block_hash, qc)| qc)
+            .into_values()
             .collect::<Vec<_>>();
         Ok((
             last_vote,
-            highest_timeout_certificate,
             highest_2chain_timeout_certificate,
             consensus_blocks,
             consensus_qcs,
         ))
     }
 
-    pub fn save_highest_timeout_certificate(
-        &self,
-        highest_timeout_certificate: Vec<u8>,
-    ) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.put::<SingleEntrySchema>(
-            &SingleEntryKey::HighestTimeoutCertificate,
-            &highest_timeout_certificate,
-        )?;
-        self.commit(batch)?;
-        Ok(())
-    }
-
     pub fn save_highest_2chain_timeout_certificate(&self, tc: Vec<u8>) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
+        let batch = SchemaBatch::new();
         batch.put::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert, &tc)?;
         self.commit(batch)?;
         Ok(())
     }
 
     pub fn save_vote(&self, last_vote: Vec<u8>) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.put::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg, &last_vote)?;
+        let batch = SchemaBatch::new();
+        batch.put::<SingleEntrySchema>(&SingleEntryKey::LastVote, &last_vote)?;
         self.commit(batch)
     }
 
@@ -116,7 +119,7 @@ impl ConsensusDB {
         if block_data.is_empty() && qc_data.is_empty() {
             return Err(anyhow::anyhow!("Consensus block and qc data is empty!").into());
         }
-        let mut batch = SchemaBatch::new();
+        let batch = SchemaBatch::new();
         block_data
             .iter()
             .try_for_each(|block| batch.put::<BlockSchema>(&block.id(), block))?;
@@ -133,7 +136,7 @@ impl ConsensusDB {
         if block_ids.is_empty() {
             return Err(anyhow::anyhow!("Consensus block ids is empty!").into());
         }
-        let mut batch = SchemaBatch::new();
+        let batch = SchemaBatch::new();
         block_ids.iter().try_for_each(|hash| {
             batch.delete::<BlockSchema>(hash)?;
             batch.delete::<QCSchema>(hash)
@@ -149,41 +152,28 @@ impl ConsensusDB {
     }
 
     /// Get latest timeout certificates (we only store the latest highest timeout certificates).
-    fn get_highest_timeout_certificate(&self) -> Result<Option<Vec<u8>>, DbError> {
-        Ok(self
-            .db
-            .get::<SingleEntrySchema>(&SingleEntryKey::HighestTimeoutCertificate)?)
-    }
-
-    /// Get latest timeout certificates (we only store the latest highest timeout certificates).
     fn get_highest_2chain_timeout_certificate(&self) -> Result<Option<Vec<u8>>, DbError> {
         Ok(self
             .db
             .get::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?)
     }
 
-    /// Delete the timeout certificates
-    pub fn delete_highest_timeout_certificate(&self) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.delete::<SingleEntrySchema>(&SingleEntryKey::HighestTimeoutCertificate)?;
-        self.commit(batch)
-    }
-
     pub fn delete_highest_2chain_timeout_certificate(&self) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
+        let batch = SchemaBatch::new();
         batch.delete::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?;
         self.commit(batch)
     }
+
     /// Get serialized latest vote (if available)
     fn get_last_vote(&self) -> Result<Option<Vec<u8>>, DbError> {
         Ok(self
             .db
-            .get::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg)?)
+            .get::<SingleEntrySchema>(&SingleEntryKey::LastVote)?)
     }
 
     pub fn delete_last_vote_msg(&self) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.delete::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg)?;
+        let batch = SchemaBatch::new();
+        batch.delete::<SingleEntrySchema>(&SingleEntryKey::LastVote)?;
         self.commit(batch)?;
         Ok(())
     }
@@ -200,5 +190,35 @@ impl ConsensusDB {
         let mut iter = self.db.iter::<QCSchema>(ReadOptions::default())?;
         iter.seek_to_first();
         Ok(iter.collect::<Result<HashMap<HashValue, QuorumCert>>>()?)
+    }
+
+    pub fn save_node(&self, node: &Node) -> Result<(), DbError> {
+        let batch = SchemaBatch::new();
+        batch.put::<NodeSchema>(&node.digest(), node)?;
+        self.commit(batch)?;
+        Ok(())
+    }
+
+    pub fn save_certified_node(&self, node: &CertifiedNode) -> Result<(), DbError> {
+        let batch = SchemaBatch::new();
+        batch.put::<CertifiedNodeSchema>(&node.digest(), node)?;
+        self.commit(batch)?;
+        Ok(())
+    }
+
+    pub fn get_certified_nodes(&self) -> Result<HashMap<HashValue, CertifiedNode>, DbError> {
+        let mut iter = self
+            .db
+            .iter::<CertifiedNodeSchema>(ReadOptions::default())?;
+        iter.seek_to_first();
+        Ok(iter.collect::<Result<HashMap<HashValue, CertifiedNode>>>()?)
+    }
+
+    pub fn delete_certified_nodes(&self, digests: Vec<HashValue>) -> Result<(), DbError> {
+        let batch = SchemaBatch::new();
+        digests
+            .iter()
+            .try_for_each(|hash| batch.delete::<CertifiedNodeSchema>(hash))?;
+        self.commit(batch)
     }
 }

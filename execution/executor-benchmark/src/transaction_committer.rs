@@ -1,25 +1,26 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::pipeline::CommitBlockMessage;
 use diem_crypto::hash::HashValue;
-use diem_logger::prelude::*;
-use diem_types::{
-    block_info::BlockInfo,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    transaction::Version,
-};
-use diem_vm::DiemVM;
-use diemdb::metrics::DIEM_STORAGE_API_LATENCY_SECONDS;
-use executor::{
-    block_executor::BlockExecutor,
+use diem_db::metrics::API_LATENCY_SECONDS;
+use diem_executor::{
+    block_executor::{BlockExecutor, TransactionBlockExecutor},
     metrics::{
         DIEM_EXECUTOR_COMMIT_BLOCKS_SECONDS, DIEM_EXECUTOR_EXECUTE_BLOCK_SECONDS,
         DIEM_EXECUTOR_VM_EXECUTE_BLOCK_SECONDS,
     },
 };
-use executor_types::BlockExecutorTrait;
+use diem_executor_types::BlockExecutorTrait;
+use diem_logger::prelude::*;
+use diem_types::{
+    aggregate_signature::AggregateSignature,
+    block_info::BlockInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    transaction::Version,
+};
 use std::{
-    collections::BTreeMap,
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
@@ -40,20 +41,26 @@ pub(crate) fn gen_li_with_sigs(
         block_info,
         HashValue::zero(), /* consensus_data_hash, doesn't matter */
     );
-    LedgerInfoWithSignatures::new(ledger_info, BTreeMap::new() /* signatures */)
+    LedgerInfoWithSignatures::new(
+        ledger_info,
+        AggregateSignature::empty(), /* signatures */
+    )
 }
 
-pub struct TransactionCommitter {
-    executor: Arc<BlockExecutor<DiemVM>>,
+pub struct TransactionCommitter<V> {
+    executor: Arc<BlockExecutor<V>>,
     version: Version,
-    block_receiver: mpsc::Receiver<(HashValue, HashValue, Instant, Instant, Duration, usize)>,
+    block_receiver: mpsc::Receiver<CommitBlockMessage>,
 }
 
-impl TransactionCommitter {
+impl<V> TransactionCommitter<V>
+where
+    V: TransactionBlockExecutor,
+{
     pub fn new(
-        executor: Arc<BlockExecutor<DiemVM>>,
+        executor: Arc<BlockExecutor<V>>,
         version: Version,
-        block_receiver: mpsc::Receiver<(HashValue, HashValue, Instant, Instant, Duration, usize)>,
+        block_receiver: mpsc::Receiver<CommitBlockMessage>,
     ) -> Self {
         Self {
             version,
@@ -66,27 +73,29 @@ impl TransactionCommitter {
         let start_version = self.version;
         info!("Start with version: {}", start_version);
 
-        while let Ok((
-            block_id,
-            root_hash,
-            global_start_time,
-            execution_start_time,
-            execution_time,
-            num_txns,
-        )) = self.block_receiver.recv()
-        {
+        while let Ok(msg) = self.block_receiver.recv() {
+            let CommitBlockMessage {
+                block_id,
+                root_hash,
+                first_block_start_time,
+                current_block_start_time,
+                partition_time,
+                execution_time,
+                num_txns,
+            } = msg;
             self.version += num_txns as u64;
             let commit_start = std::time::Instant::now();
             let ledger_info_with_sigs = gen_li_with_sigs(block_id, root_hash, self.version);
             self.executor
-                .commit_blocks(vec![block_id], ledger_info_with_sigs)
+                .commit_blocks_ext(vec![block_id], ledger_info_with_sigs, false)
                 .unwrap();
 
             report_block(
                 start_version,
                 self.version,
-                global_start_time,
-                execution_start_time,
+                first_block_start_time,
+                current_block_start_time,
+                partition_time,
                 execution_time,
                 Instant::now().duration_since(commit_start),
                 num_txns,
@@ -98,28 +107,33 @@ impl TransactionCommitter {
 fn report_block(
     start_version: Version,
     version: Version,
-    global_start_time: Instant,
-    execution_start_time: Instant,
+    first_block_start_time: Instant,
+    current_block_start_time: Instant,
+    partition_time: Duration,
     execution_time: Duration,
     commit_time: Duration,
     block_size: usize,
 ) {
     let total_versions = (version - start_version) as f64;
     info!(
-        "Version: {}. latency: {} ms, execute time: {} ms. commit time: {} ms. TPS: {:.0}. Accumulative TPS: {:.0}",
+        "Version: {}. latency: {} ms, partition time: {} ms, execute time: {} ms. commit time: {} ms. TPS: {:.0} (partition: {:.0}, execution: {:.0}, commit: {:.0}). Accumulative TPS: {:.0}",
         version,
-        Instant::now().duration_since(execution_start_time).as_millis(),
+        Instant::now().duration_since(current_block_start_time).as_millis(),
+        partition_time.as_millis(),
         execution_time.as_millis(),
         commit_time.as_millis(),
-        block_size as f64 / (std::cmp::max(execution_time, commit_time)).as_secs_f64(),
-        total_versions / global_start_time.elapsed().as_secs_f64(),
+        block_size as f64 / (std::cmp::max(std::cmp::max(partition_time, execution_time), commit_time)).as_secs_f64(),
+        block_size as f64 / partition_time.as_secs_f64(),
+        block_size as f64 / execution_time.as_secs_f64(),
+        block_size as f64 / commit_time.as_secs_f64(),
+        total_versions / first_block_start_time.elapsed().as_secs_f64(),
     );
     info!(
             "Accumulative total: VM time: {:.0} secs, executor time: {:.0} secs, commit time: {:.0} secs, DB commit time: {:.0} secs",
             DIEM_EXECUTOR_VM_EXECUTE_BLOCK_SECONDS.get_sample_sum(),
             DIEM_EXECUTOR_EXECUTE_BLOCK_SECONDS.get_sample_sum() - DIEM_EXECUTOR_VM_EXECUTE_BLOCK_SECONDS.get_sample_sum(),
             DIEM_EXECUTOR_COMMIT_BLOCKS_SECONDS.get_sample_sum(),
-            DIEM_STORAGE_API_LATENCY_SECONDS.get_metric_with_label_values(&["save_transactions", "Ok"]).expect("must exist.").get_sample_sum(),
+            API_LATENCY_SECONDS.get_metric_with_label_values(&["save_transactions", "Ok"]).expect("must exist.").get_sample_sum(),
         );
     const NANOS_PER_SEC: f64 = 1_000_000_000.0;
     info!(
@@ -130,7 +144,7 @@ fn report_block(
                 / total_versions,
             DIEM_EXECUTOR_COMMIT_BLOCKS_SECONDS.get_sample_sum() * NANOS_PER_SEC
                 / total_versions,
-            DIEM_STORAGE_API_LATENCY_SECONDS.get_metric_with_label_values(&["save_transactions", "Ok"]).expect("must exist.").get_sample_sum() * NANOS_PER_SEC
+            API_LATENCY_SECONDS.get_metric_with_label_values(&["save_transactions", "Ok"]).expect("must exist.").get_sample_sum() * NANOS_PER_SEC
                 / total_versions,
         );
 }

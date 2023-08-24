@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{self as dl};
@@ -11,7 +12,7 @@ use tracing::{
 use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
 /// A layer that translates tracing events into diem-logger events.
-pub struct TracingToDiemLoggerLayer;
+pub struct TracingToDiemDataLayer;
 
 fn translate_level(level: &Level) -> Option<dl::Level> {
     if *level == Level::ERROR {
@@ -84,8 +85,6 @@ fn translate_metadata(metadata: &Metadata<'static>) -> Option<dl::Metadata> {
         metadata.target(),
         metadata.module_path().unwrap_or(""),
         metadata.file().unwrap_or(""),
-        metadata.line().unwrap_or(0),
-        "",
     ))
 }
 
@@ -114,7 +113,7 @@ impl<'a, 'b> dl::Schema for EventKeyValueAdapter<'a, 'b> {
     }
 }
 
-impl<S> Layer<S> for TracingToDiemLoggerLayer
+impl<S> Layer<S> for TracingToDiemDataLayer
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
@@ -155,7 +154,7 @@ where
                     event.metadata().level()
                 );
                 return;
-            }
+            },
         };
 
         let mut acc = BTreeMap::new();

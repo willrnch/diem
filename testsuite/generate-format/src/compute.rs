@@ -1,25 +1,26 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use clap::Parser;
 use generate_format::Corpus;
 use std::{fs::File, io::Write};
-use structopt::StructOpt;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     name = "Diem format generator",
     about = "Trace serde (de)serialization to generate format descriptions for Diem types"
 )]
 struct Options {
-    #[structopt(long, possible_values = &Corpus::variants(), default_value = "Diem", case_insensitive = true)]
+    #[clap(long, value_enum, default_value_t = Corpus::Diem, ignore_case = true)]
     corpus: Corpus,
 
-    #[structopt(long)]
+    #[clap(long)]
     record: bool,
 }
 
 fn main() {
-    let options = Options::from_args();
+    let options = Options::parse();
 
     let registry = options.corpus.get_registry();
     let output_file = options.corpus.output_file();
@@ -30,10 +31,16 @@ fn main() {
             Some(path) => {
                 let mut f = File::create("testsuite/generate-format/".to_string() + path).unwrap();
                 write!(f, "{}", content).unwrap();
-            }
+            },
             None => panic!("Corpus {:?} doesn't record formats on disk", options.corpus),
         }
     } else {
         println!("{}", content);
     }
+}
+
+#[test]
+fn verify_tool() {
+    use clap::CommandFactory;
+    Options::command().debug_assert()
 }

@@ -1,9 +1,10 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! An abstraction of x25519 elliptic curve keys required for
 //! [Diffie-Hellman key exchange](https://en.wikipedia.org/wiki/Diffie%E2%80%93Hellman_key_exchange)
-//! in the Diem project.
+//!
 //! Ideally, only `x25519::PrivateKey` and `x25519::PublicKey` should be used throughout the
 //! codebase, until the bytes are actually used in cryptographic operations.
 //!
@@ -35,20 +36,17 @@ use crate::{
     x25519,
 };
 use diem_crypto_derive::{DeserializeKey, SerializeKey, SilentDebug, SilentDisplay};
-use rand::{CryptoRng, RngCore};
-use std::convert::{TryFrom, TryInto};
-
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-
+use rand::{CryptoRng, RngCore};
+use std::convert::{TryFrom, TryInto};
 //
 // Underlying Implementation
 // =========================
 //
 // We re-export the dalek-x25519 library,
-// This makes it easier to uniformalize build dalek-x25519 in diem-core.
+// This makes it easier to uniformalize build dalek-x25519.
 //
-
 pub use x25519_dalek;
 
 //
@@ -96,7 +94,7 @@ impl PrivateKey {
         shared_secret.as_bytes().to_owned()
     }
 
-    /// Deserialize an X25119 PrivateKey given the sha512 pre-image of a hash
+    /// Deserialize an X25519 PrivateKey given the sha512 pre-image of a hash
     /// whose least significant half is a canonical X25519 scalar, following
     /// the XEdDSA approach.
     ///
@@ -131,7 +129,7 @@ impl PublicKey {
         &self.0
     }
 
-    /// Deserialize an X25119 PublicKey from its representation as an
+    /// Deserialize an X25519 PublicKey from its representation as an
     /// Ed25519PublicKey, following the XEdDSA approach. This is meant to
     /// compensate for the poor key storage capabilities of key management
     /// solutions, and NOT to promote double usage of keys under several
@@ -249,7 +247,7 @@ impl traits::ValidCryptoMaterial for PublicKey {
 
 impl std::fmt::Display for PublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 

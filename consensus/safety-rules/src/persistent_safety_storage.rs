@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,16 +7,12 @@ use crate::{
     logging::{self, LogEntry, LogEvent},
     Error,
 };
-use consensus_types::{common::Author, safety_data::SafetyData};
-use diem_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
-    hash::CryptoHash,
-};
-use diem_global_constants::{CONSENSUS_KEY, EXECUTION_KEY, OWNER_ACCOUNT, SAFETY_DATA, WAYPOINT};
+use diem_consensus_types::{common::Author, safety_data::SafetyData};
+use diem_crypto::{bls12381, PrivateKey};
+use diem_global_constants::{CONSENSUS_KEY, OWNER_ACCOUNT, SAFETY_DATA, WAYPOINT};
 use diem_logger::prelude::*;
-use diem_secure_storage::{CryptoStorage, KVStorage, Storage};
+use diem_secure_storage::{KVStorage, Storage};
 use diem_types::waypoint::Waypoint;
-use serde::Serialize;
 
 /// SafetyRules needs an abstract storage interface to act as a common utility for storing
 /// persistent data to local disk, cloud, secrets managers, or even memory (for tests)
@@ -37,19 +34,13 @@ impl PersistentSafetyStorage {
     pub fn initialize(
         mut internal_store: Storage,
         author: Author,
-        consensus_private_key: Ed25519PrivateKey,
-        execution_private_key: Ed25519PrivateKey,
+        consensus_private_key: bls12381::PrivateKey,
         waypoint: Waypoint,
         enable_cached_safety_data: bool,
     ) -> Self {
         // Initialize the keys and accounts
-        Self::initialize_keys_and_accounts(
-            &mut internal_store,
-            author,
-            consensus_private_key,
-            execution_private_key,
-        )
-        .expect("Unable to initialize keys and accounts in storage");
+        Self::initialize_keys_and_accounts(&mut internal_store, author, consensus_private_key)
+            .expect("Unable to initialize keys and accounts in storage");
 
         // Create the new persistent safety storage
         let safety_data = SafetyData::new(1, 0, 0, 0, None);
@@ -73,10 +64,9 @@ impl PersistentSafetyStorage {
     fn initialize_keys_and_accounts(
         internal_store: &mut Storage,
         author: Author,
-        consensus_private_key: Ed25519PrivateKey,
-        execution_private_key: Ed25519PrivateKey,
+        consensus_private_key: bls12381::PrivateKey,
     ) -> Result<(), Error> {
-        let result = internal_store.import_private_key(CONSENSUS_KEY, consensus_private_key);
+        let result = internal_store.set(CONSENSUS_KEY, consensus_private_key);
         // Attempting to re-initialize existing storage. This can happen in environments like
         // forge. Rather than be rigid here, leave it up to the developer to detect
         // inconsistencies or why they did not reset storage between rounds. Do not repeat the
@@ -87,7 +77,6 @@ impl PersistentSafetyStorage {
             return Ok(());
         }
 
-        internal_store.import_private_key(EXECUTION_KEY, execution_private_key)?;
         internal_store.set(OWNER_ACCOUNT, author)?;
         Ok(())
     }
@@ -109,31 +98,17 @@ impl PersistentSafetyStorage {
 
     pub fn consensus_key_for_version(
         &self,
-        version: Ed25519PublicKey,
-    ) -> Result<Ed25519PrivateKey, Error> {
+        version: bls12381::PublicKey,
+    ) -> Result<bls12381::PrivateKey, Error> {
         let _timer = counters::start_timer("get", CONSENSUS_KEY);
-        Ok(self
-            .internal_store
-            .export_private_key_for_version(CONSENSUS_KEY, version)?)
-    }
-
-    pub fn execution_public_key(&self) -> Result<Ed25519PublicKey, Error> {
-        let _timer = counters::start_timer("get", EXECUTION_KEY);
-        Ok(self
-            .internal_store
-            .get_public_key(EXECUTION_KEY)
-            .map(|r| r.public_key)?)
-    }
-
-    pub fn sign<T: Serialize + CryptoHash>(
-        &self,
-        key_name: String,
-        key_version: Ed25519PublicKey,
-        message: &T,
-    ) -> Result<Ed25519Signature, Error> {
-        Ok(self
-            .internal_store
-            .sign_using_version(&key_name, key_version, message)?)
+        let key: bls12381::PrivateKey = self.internal_store.get(CONSENSUS_KEY).map(|v| v.value)?;
+        if key.public_key() != version {
+            return Err(Error::SecureStorageMissingDataError(format!(
+                "PrivateKey for {:?} not found",
+                version
+            )));
+        }
+        Ok(key)
     }
 
     pub fn safety_data(&mut self) -> Result<SafetyData, Error> {
@@ -162,11 +137,11 @@ impl PersistentSafetyStorage {
             Ok(_) => {
                 self.cached_safety_data = Some(data);
                 Ok(())
-            }
+            },
             Err(error) => {
                 self.cached_safety_data = None;
                 Err(Error::SecureStorageUnexpectedError(error.to_string()))
-            }
+            },
         }
     }
 
@@ -195,26 +170,35 @@ impl PersistentSafetyStorage {
 mod tests {
     use super::*;
     use crate::counters;
-    use diem_crypto::{hash::HashValue, Uniform};
+    use diem_crypto::hash::HashValue;
     use diem_secure_storage::InMemoryStorage;
     use diem_types::{
         block_info::BlockInfo, epoch_state::EpochState, ledger_info::LedgerInfo,
         transaction::Version, validator_signer::ValidatorSigner, waypoint::Waypoint,
     };
+    use rusty_fork::rusty_fork_test;
 
-    #[test]
-    fn test_safety_data_counters() {
-        let consensus_private_key = ValidatorSigner::from_int(0).private_key().clone();
-        let storage = Storage::from(InMemoryStorage::new());
-        let mut safety_storage = PersistentSafetyStorage::initialize(
-            storage,
-            Author::random(),
-            consensus_private_key,
-            Ed25519PrivateKey::generate_for_testing(),
-            Waypoint::default(),
-            true,
-        );
+    // Metrics are globally instantiated. We use rusty_fork to prevent concurrent tests
+    // from interfering with the metrics while we run this test.
+    rusty_fork_test! {
+        #[test]
+        fn test_counters() {
+            let consensus_private_key = ValidatorSigner::from_int(0).private_key().clone();
+            let storage = Storage::from(InMemoryStorage::new());
+            let mut safety_storage = PersistentSafetyStorage::initialize(
+                storage,
+                Author::random(),
+                consensus_private_key,
+                Waypoint::default(),
+                true,
+            );
+            // they both touch the global counters, running it serially to prevent race condition.
+            test_safety_data_counters(&mut safety_storage);
+            test_waypoint_counters(&mut safety_storage);
+        }
+    }
 
+    fn test_safety_data_counters(safety_storage: &mut PersistentSafetyStorage) {
         let safety_data = safety_storage.safety_data().unwrap();
         assert_eq!(safety_data.epoch, 1);
         assert_eq!(safety_data.last_voted_round, 0);
@@ -236,19 +220,7 @@ mod tests {
         assert_eq!(counters::get_state(counters::PREFERRED_ROUND), 1);
     }
 
-    #[test]
-    fn test_waypoint_counters() {
-        let consensus_private_key = ValidatorSigner::from_int(0).private_key().clone();
-        let storage = Storage::from(InMemoryStorage::new());
-        let mut safety_storage = PersistentSafetyStorage::initialize(
-            storage,
-            Author::random(),
-            consensus_private_key,
-            Ed25519PrivateKey::generate_for_testing(),
-            Waypoint::default(),
-            true,
-        );
-
+    fn test_waypoint_counters(safety_storage: &mut PersistentSafetyStorage) {
         let waypoint = safety_storage.waypoint().unwrap();
         assert_eq!(waypoint.version(), Version::default());
         assert_eq!(

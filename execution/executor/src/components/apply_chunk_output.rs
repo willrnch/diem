@@ -1,76 +1,175 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use crate::{components::chunk_output::ChunkOutput, metrics::DIEM_EXECUTOR_ERRORS};
-use anyhow::{anyhow, bail, ensure, Result};
+use crate::{
+    components::{
+        chunk_output::ChunkOutput, in_memory_state_calculator_v2::InMemoryStateCalculatorV2,
+    },
+    metrics::{DIEM_EXECUTOR_ERRORS, DIEM_EXECUTOR_OTHER_TIMERS_SECONDS},
+};
+use anyhow::{ensure, Result};
 use diem_crypto::{
-    hash::{CryptoHash, EventAccumulatorHasher, TransactionAccumulatorHasher},
+    hash::{CryptoHash, EventAccumulatorHasher},
     HashValue,
 };
-use diem_logger::error;
-use diem_types::{
-    account_address::{AccountAddress, HashAccountAddress},
-    account_state::AccountState,
-    account_state_blob::AccountStateBlob,
-    contract_event::ContractEvent,
-    epoch_state::EpochState,
-    event::EventKey,
-    nibble::nibble_path::NibblePath,
-    on_chain_config,
-    proof::accumulator::InMemoryAccumulator,
-    transaction::{
-        Transaction, TransactionInfo, TransactionOutput, TransactionPayload, TransactionStatus,
-    },
-    write_set::{WriteOp, WriteSet},
+use diem_executor_types::{
+    in_memory_state_calculator::InMemoryStateCalculator, ExecutedBlock, ExecutedChunk,
+    ParsedTransactionOutput, TransactionData,
 };
-use executor_types::{ExecutedChunk, ExecutedTrees, ProofReader, TransactionData};
-use once_cell::sync::Lazy;
+use diem_logger::error;
+use diem_storage_interface::ExecutedTrees;
+use diem_types::{
+    contract_event::ContractEvent,
+    proof::accumulator::InMemoryAccumulator,
+    state_store::{state_key::StateKey, state_value::StateValue, ShardedStateUpdates},
+    transaction::{
+        ExecutionStatus, Transaction, TransactionInfo, TransactionOutput, TransactionStatus,
+        TransactionToCommit,
+    },
+    write_set::WriteSet,
+};
 use rayon::prelude::*;
-use scratchpad::SparseMerkleTree;
 use std::{
-    collections::{hash_map, HashMap, HashSet},
-    convert::TryFrom,
-    iter::repeat,
-    ops::Deref,
+    collections::HashMap,
+    iter::{once, repeat},
     sync::Arc,
 };
-use storage_interface::{state_view::StateCache, DbReader, TreeState};
 
 pub struct ApplyChunkOutput;
 
 impl ApplyChunkOutput {
-    pub fn apply(
+    pub fn apply_block(
         chunk_output: ChunkOutput,
-        base_accumulator: &Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
+        base_view: &ExecutedTrees,
+        append_state_checkpoint_to_block: Option<HashValue>,
+    ) -> Result<(ExecutedBlock, Vec<Transaction>, Vec<Transaction>)> {
+        let ChunkOutput {
+            state_cache,
+            transactions,
+            transaction_outputs,
+        } = chunk_output;
+        let (new_epoch, status, to_keep, to_discard, to_retry) = {
+            let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+                .with_label_values(&["sort_transactions"])
+                .start_timer();
+            // Separate transactions with different VM statuses, i.e., Keep, Discard and Retry.
+            // Will return transactions with Retry txns sorted after Keep/Discard txns.
+            // If the transactions contain no reconfiguration txn, will insert the StateCheckpoint txn
+            // at the boundary of Keep/Discard txns and Retry txns.
+            Self::sort_transactions_with_state_checkpoint(
+                transactions,
+                transaction_outputs,
+                append_state_checkpoint_to_block,
+            )?
+        };
+
+        // Apply the write set, get the latest state.
+        let (
+            state_updates_vec,
+            state_checkpoint_hashes,
+            result_state,
+            next_epoch_state,
+            block_state_updates,
+            sharded_state_cache,
+        ) = {
+            let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+                .with_label_values(&["calculate_for_transaction_block"])
+                .start_timer();
+            InMemoryStateCalculatorV2::calculate_for_transaction_block(
+                base_view.state(),
+                state_cache,
+                &to_keep,
+                new_epoch,
+            )?
+        };
+
+        // Calculate TransactionData and TransactionInfo, i.e. the ledger history diff.
+        let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+            .with_label_values(&["assemble_ledger_diff_for_block"])
+            .start_timer();
+        let (to_commit, transaction_info_hashes, reconfig_events) =
+            Self::assemble_ledger_diff_for_block(
+                to_keep,
+                state_updates_vec,
+                state_checkpoint_hashes,
+            );
+        let result_view = ExecutedTrees::new(
+            result_state,
+            Arc::new(base_view.txn_accumulator().append(&transaction_info_hashes)),
+        );
+
+        Ok((
+            ExecutedBlock {
+                status,
+                to_commit,
+                result_view,
+                next_epoch_state,
+                reconfig_events,
+                transaction_info_hashes,
+                block_state_updates,
+                sharded_state_cache,
+            },
+            to_discard,
+            to_retry,
+        ))
+    }
+
+    pub fn apply_chunk(
+        chunk_output: ChunkOutput,
+        base_view: &ExecutedTrees,
+        append_state_checkpoint_to_block: Option<HashValue>,
     ) -> Result<(ExecutedChunk, Vec<Transaction>, Vec<Transaction>)> {
         let ChunkOutput {
             state_cache,
             transactions,
             transaction_outputs,
         } = chunk_output;
-
-        // Separate transactions with different VM statuses.
-        let (new_epoch, status, to_keep, to_discard, to_retry) =
-            Self::sort_transactions(transactions, transaction_outputs)?;
+        let (new_epoch, status, to_keep, to_discard, to_retry) = {
+            let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+                .with_label_values(&["sort_transactions"])
+                .start_timer();
+            // Separate transactions with different VM statuses, i.e., Keep, Discard and Retry.
+            // Will return transactions with Retry txns sorted after Keep/Discard txns.
+            // If the transactions contain no reconfiguration txn, will insert the StateCheckpoint txn
+            // at the boundary of Keep/Discard txns and Retry txns.
+            Self::sort_transactions_with_state_checkpoint(
+                transactions,
+                transaction_outputs,
+                append_state_checkpoint_to_block,
+            )?
+        };
 
         // Apply the write set, get the latest state.
-        let (account_blobs, roots_with_node_hashes, result_state, next_epoch_state) =
-            Self::apply_write_set(state_cache, new_epoch, &to_keep)?;
+        let (state_updates_vec, state_checkpoint_hashes, result_state, next_epoch_state) = {
+            let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+                .with_label_values(&["calculate_for_transaction_chunk"])
+                .start_timer();
+            InMemoryStateCalculator::new(base_view.state(), state_cache)
+                .calculate_for_transaction_chunk(&to_keep, new_epoch)?
+        };
 
         // Calculate TransactionData and TransactionInfo, i.e. the ledger history diff.
-        let (to_commit, transaction_info_hashes) =
-            Self::assemble_ledger_diff(to_keep, account_blobs, roots_with_node_hashes);
+        let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+            .with_label_values(&["assemble_ledger_diff_for_chunk"])
+            .start_timer();
+        let (to_commit, transaction_info_hashes) = Self::assemble_ledger_diff_for_chunk(
+            to_keep,
+            state_updates_vec,
+            state_checkpoint_hashes,
+        );
+        let result_view = ExecutedTrees::new(
+            result_state,
+            Arc::new(base_view.txn_accumulator().append(&transaction_info_hashes)),
+        );
 
         Ok((
             ExecutedChunk {
                 status,
                 to_commit,
-                result_view: ExecutedTrees::new_copy(
-                    result_state,
-                    Arc::new(base_accumulator.append(&transaction_info_hashes)),
-                ),
+                result_view,
                 next_epoch_state,
                 ledger_info: None,
             },
@@ -79,9 +178,10 @@ impl ApplyChunkOutput {
         ))
     }
 
-    fn sort_transactions(
+    fn sort_transactions_with_state_checkpoint(
         mut transactions: Vec<Transaction>,
         transaction_outputs: Vec<TransactionOutput>,
+        append_state_checkpoint_to_block: Option<HashValue>,
     ) -> Result<(
         bool,
         Vec<TransactionStatus>,
@@ -89,7 +189,6 @@ impl ApplyChunkOutput {
         Vec<Transaction>,
         Vec<Transaction>,
     )> {
-        let num_txns = transactions.len();
         let mut transaction_outputs: Vec<ParsedTransactionOutput> =
             transaction_outputs.into_iter().map(Into::into).collect();
         // N.B. off-by-1 intentionally, for exclusive index
@@ -98,29 +197,56 @@ impl ApplyChunkOutput {
             .position(|o| o.is_reconfig())
             .map(|idx| idx + 1);
 
-        // Transactions after the epoch ending are all to be retried.
+        let block_gas_limit_marker = transaction_outputs
+            .iter()
+            .position(|o| matches!(o.status(), TransactionStatus::Retry));
+
+        // Transactions after the epoch ending txn are all to be retried.
+        // Transactions after the txn that exceeded per-block gas limit are also to be retried.
         let to_retry = if let Some(pos) = new_epoch_marker {
+            transaction_outputs.drain(pos..);
+            transactions.drain(pos..).collect()
+        } else if let Some(pos) = block_gas_limit_marker {
             transaction_outputs.drain(pos..);
             transactions.drain(pos..).collect()
         } else {
             vec![]
         };
 
-        // N.B. Transaction status after the epoch marker are ignored and set to Retry forcibly.
-        let status = transaction_outputs
-            .iter()
-            .map(|t| t.status())
-            .cloned()
-            .chain(repeat(TransactionStatus::Retry))
-            .take(num_txns)
-            .collect();
+        let state_checkpoint_to_add =
+            new_epoch_marker.map_or_else(|| append_state_checkpoint_to_block, |_| None);
+
+        let keeps_and_discards = transaction_outputs.iter().map(|t| t.status()).cloned();
+        let retries = repeat(TransactionStatus::Retry).take(to_retry.len());
+
+        let status = if state_checkpoint_to_add.is_some() {
+            keeps_and_discards
+                .chain(once(TransactionStatus::Keep(ExecutionStatus::Success)))
+                .chain(retries)
+                .collect()
+        } else {
+            keeps_and_discards.chain(retries).collect()
+        };
 
         // Separate transactions with the Keep status out.
-        let (to_keep, to_discard) =
+        let (mut to_keep, to_discard) =
             itertools::zip_eq(transactions.into_iter(), transaction_outputs.into_iter())
                 .partition::<Vec<(Transaction, ParsedTransactionOutput)>, _>(|(_, o)| {
                     matches!(o.status(), TransactionStatus::Keep(_))
                 });
+
+        // Append the StateCheckpoint transaction to the end of to_keep
+        if let Some(block_id) = state_checkpoint_to_add {
+            let state_checkpoint_txn = Transaction::StateCheckpoint(block_id);
+            let state_checkpoint_txn_output: ParsedTransactionOutput =
+                Into::into(TransactionOutput::new(
+                    WriteSet::default(),
+                    Vec::new(),
+                    0,
+                    TransactionStatus::Keep(ExecutionStatus::Success),
+                ));
+            to_keep.push((state_checkpoint_txn, state_checkpoint_txn_output));
+        }
 
         // Sanity check transactions with the Discard status:
         let to_discard = to_discard
@@ -153,136 +279,52 @@ impl ApplyChunkOutput {
         ))
     }
 
-    fn apply_write_set(
-        state_cache: StateCache,
-        new_epoch: bool,
-        to_keep: &[(Transaction, ParsedTransactionOutput)],
-    ) -> Result<(
-        Vec<HashMap<AccountAddress, AccountStateBlob>>,
-        Vec<(HashValue, HashMap<NibblePath, HashValue>)>,
-        SparseMerkleTree<AccountStateBlob>,
-        Option<EpochState>,
-    )> {
-        let StateCache {
-            frozen_base,
-            mut accounts,
-            proofs,
-        } = state_cache;
-
-        // Apply write sets to account states in the AccountCache, resulting in new account states.
-        let account_states = to_keep
-            .iter()
-            .map(|(t, o)| process_write_set(t, &mut accounts, o.write_set().clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let account_blobs = account_states
-            .par_iter()
-            .with_min_len(100)
-            .map(|account_to_state| {
-                account_to_state
-                    .iter()
-                    .map(|(addr, state)| Ok((*addr, AccountStateBlob::try_from(state)?)))
-                    .collect::<Result<HashMap<_, _>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Apply new account states to the base state tree, resulting in updated state tree.
-        let (roots_with_node_hashes, result_state) = frozen_base
-            .serial_update(
-                Self::account_blobs_to_smt_updates(&account_blobs),
-                &ProofReader::new(proofs),
-            )
-            .map_err(|e| anyhow!("Failed to update state tree. err: {:?}", e))?;
-        // Release ASAP the ref to the base SMT to allow old in-mem nodes to be dropped,
-        // now that we don't require access to them.
-        let result_state = result_state.unfreeze();
-
-        // Get the updated validator set from updated account state.
-        let next_epoch_state = if new_epoch {
-            Some(Self::parse_validator_set(&accounts)?)
-        } else {
-            None
-        };
-
-        Ok((
-            account_blobs,
-            roots_with_node_hashes,
-            result_state,
-            next_epoch_state,
-        ))
-    }
-
-    fn account_blobs_to_smt_updates(
-        account_blobs: &[HashMap<AccountAddress, AccountStateBlob>],
-    ) -> Vec<Vec<(HashValue, &AccountStateBlob)>> {
-        account_blobs
-            .iter()
-            .map(|m| {
-                m.iter()
-                    .map(|(account, blob)| (HashAccountAddress::hash(account), blob))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    fn parse_validator_set(accounts: &HashMap<AccountAddress, AccountState>) -> Result<EpochState> {
-        let validator_set = accounts
-            .get(&on_chain_config::config_address())
-            .map(|state| {
-                state
-                    .get_validator_set()?
-                    .ok_or_else(|| anyhow!("ValidatorSet does not exist"))
-            })
-            .ok_or_else(|| anyhow!("ValidatorSet account does not exist"))??;
-        let configuration = accounts
-            .get(&on_chain_config::config_address())
-            .map(|state| {
-                state
-                    .get_configuration_resource()?
-                    .ok_or_else(|| anyhow!("Configuration does not exist"))
-            })
-            .ok_or_else(|| anyhow!("Association account does not exist"))??;
-
-        Ok(EpochState {
-            epoch: configuration.epoch(),
-            verifier: (&validator_set).into(),
-        })
-    }
-
-    fn assemble_ledger_diff(
+    fn assemble_ledger_diff_for_chunk(
         to_keep: Vec<(Transaction, ParsedTransactionOutput)>,
-        account_blobs: Vec<HashMap<AccountAddress, AccountStateBlob>>,
-        roots_with_node_hashes: Vec<(HashValue, HashMap<NibblePath, HashValue>)>,
+        state_updates_vec: Vec<HashMap<StateKey, Option<StateValue>>>,
+        state_checkpoint_hashes: Vec<Option<HashValue>>,
     ) -> (Vec<(Transaction, TransactionData)>, Vec<HashValue>) {
-        let mut to_commit = vec![];
-        let mut txn_info_hashes = vec![];
-        for ((txn, txn_output), ((state_tree_hash, new_node_hashes), blobs)) in itertools::zip_eq(
+        // these are guaranteed by caller side logic
+        assert_eq!(to_keep.len(), state_updates_vec.len());
+        assert_eq!(to_keep.len(), state_checkpoint_hashes.len());
+
+        let num_txns = to_keep.len();
+        let mut to_commit = Vec::with_capacity(num_txns);
+        let mut txn_info_hashes = Vec::with_capacity(num_txns);
+        let hashes_vec = Self::calculate_events_and_writeset_hashes(&to_keep);
+
+        for (
+            (txn, txn_output),
+            state_checkpoint_hash,
+            state_updates,
+            (event_hashes, write_set_hash),
+        ) in itertools::izip!(
             to_keep,
-            itertools::zip_eq(roots_with_node_hashes, account_blobs),
+            state_checkpoint_hashes,
+            state_updates_vec,
+            hashes_vec
         ) {
             let (write_set, events, reconfig_events, gas_used, status) = txn_output.unpack();
-            let event_tree = {
-                let event_hashes: Vec<_> = events.iter().map(CryptoHash::hash).collect();
-                InMemoryAccumulator::<EventAccumulatorHasher>::from_leaves(&event_hashes)
-            };
+            let event_tree =
+                InMemoryAccumulator::<EventAccumulatorHasher>::from_leaves(&event_hashes);
 
             let txn_info = match &status {
                 TransactionStatus::Keep(status) => TransactionInfo::new(
                     txn.hash(),
-                    state_tree_hash,
+                    write_set_hash,
                     event_tree.root_hash(),
+                    state_checkpoint_hash,
                     gas_used,
                     status.clone(),
                 ),
                 _ => unreachable!("Transaction sorted by status already."),
             };
-
             let txn_info_hash = txn_info.hash();
             txn_info_hashes.push(txn_info_hash);
             to_commit.push((
                 txn,
                 TransactionData::new(
-                    blobs,
-                    new_node_hashes,
+                    state_updates,
                     write_set,
                     events,
                     reconfig_events,
@@ -296,6 +338,98 @@ impl ApplyChunkOutput {
         }
         (to_commit, txn_info_hashes)
     }
+
+    fn assemble_ledger_diff_for_block(
+        to_keep: Vec<(Transaction, ParsedTransactionOutput)>,
+        state_updates_vec: Vec<ShardedStateUpdates>,
+        state_checkpoint_hashes: Vec<Option<HashValue>>,
+    ) -> (
+        Vec<Arc<TransactionToCommit>>,
+        Vec<HashValue>,
+        Vec<ContractEvent>,
+    ) {
+        // these are guaranteed by caller side logic
+        assert_eq!(to_keep.len(), state_updates_vec.len());
+        assert_eq!(to_keep.len(), state_checkpoint_hashes.len());
+
+        let num_txns = to_keep.len();
+        let mut to_commit = Vec::with_capacity(num_txns);
+        let mut txn_info_hashes = Vec::with_capacity(num_txns);
+        let hashes_vec = Self::calculate_events_and_writeset_hashes(&to_keep);
+        let hashes_vec: Vec<(HashValue, HashValue)> = hashes_vec
+            .into_par_iter()
+            .map(|(event_hashes, write_set_hash)| {
+                (
+                    InMemoryAccumulator::<EventAccumulatorHasher>::from_leaves(&event_hashes)
+                        .root_hash(),
+                    write_set_hash,
+                )
+            })
+            .collect();
+
+        let mut all_reconfig_events = Vec::new();
+        for (
+            (txn, txn_output),
+            state_checkpoint_hash,
+            state_updates,
+            (event_root_hash, write_set_hash),
+        ) in itertools::izip!(
+            to_keep,
+            state_checkpoint_hashes,
+            state_updates_vec,
+            hashes_vec
+        ) {
+            let (write_set, events, per_txn_reconfig_events, gas_used, status) =
+                txn_output.unpack();
+
+            let txn_info = match &status {
+                TransactionStatus::Keep(status) => TransactionInfo::new(
+                    txn.hash(),
+                    write_set_hash,
+                    event_root_hash,
+                    state_checkpoint_hash,
+                    gas_used,
+                    status.clone(),
+                ),
+                _ => unreachable!("Transaction sorted by status already."),
+            };
+            let txn_info_hash = txn_info.hash();
+            txn_info_hashes.push(txn_info_hash);
+            let txn_to_commit = TransactionToCommit::new(
+                txn,
+                txn_info,
+                state_updates,
+                write_set,
+                events,
+                !per_txn_reconfig_events.is_empty(),
+            );
+            all_reconfig_events.extend(per_txn_reconfig_events);
+            to_commit.push(Arc::new(txn_to_commit));
+        }
+        (to_commit, txn_info_hashes, all_reconfig_events)
+    }
+
+    fn calculate_events_and_writeset_hashes(
+        to_keep: &Vec<(Transaction, ParsedTransactionOutput)>,
+    ) -> Vec<(Vec<HashValue>, HashValue)> {
+        let _timer = DIEM_EXECUTOR_OTHER_TIMERS_SECONDS
+            .with_label_values(&["calculate_events_and_writeset_hashes"])
+            .start_timer();
+        to_keep
+            .par_iter()
+            .with_min_len(16)
+            .map(|(_, txn_output)| {
+                (
+                    txn_output
+                        .events()
+                        .iter()
+                        .map(CryptoHash::hash)
+                        .collect::<Vec<_>>(),
+                    CryptoHash::hash(txn_output.write_set()),
+                )
+            })
+            .collect::<Vec<_>>()
+    }
 }
 
 pub fn ensure_no_discard(to_discard: Vec<Transaction>) -> Result<()> {
@@ -306,133 +440,4 @@ pub fn ensure_no_discard(to_discard: Vec<Transaction>) -> Result<()> {
 pub fn ensure_no_retry(to_retry: Vec<Transaction>) -> Result<()> {
     ensure!(to_retry.is_empty(), "Chunk crosses epoch boundary.",);
     Ok(())
-}
-
-/// For all accounts modified by this transaction, find the previous blob and update it based
-/// on the write set. Returns the blob value of all these accounts.
-pub fn process_write_set(
-    transaction: &Transaction,
-    account_to_state: &mut HashMap<AccountAddress, AccountState>,
-    write_set: WriteSet,
-) -> Result<HashMap<AccountAddress, AccountState>> {
-    let mut updated_blobs = HashMap::new();
-
-    // Find all addresses this transaction touches while processing each write op.
-    let mut addrs = HashSet::new();
-    for (access_path, write_op) in write_set.into_iter() {
-        let address = access_path.address;
-        let path = access_path.path;
-        match account_to_state.entry(address) {
-            hash_map::Entry::Occupied(mut entry) => {
-                update_account_state(entry.get_mut(), path, write_op);
-            }
-            hash_map::Entry::Vacant(entry) => {
-                // Before writing to an account, VM should always read that account. So we
-                // should not reach this code path. The exception is genesis transaction (and
-                // maybe other writeset transactions).
-                match transaction {
-                    Transaction::GenesisTransaction(_) => (),
-                    Transaction::BlockMetadata(_) => {
-                        bail!("Write set should be a subset of read set.")
-                    }
-                    Transaction::UserTransaction(txn) => match txn.payload() {
-                        TransactionPayload::ModuleBundle(_)
-                        | TransactionPayload::Script(_)
-                        | TransactionPayload::ScriptFunction(_) => {
-                            bail!("Write set should be a subset of read set.")
-                        }
-                        TransactionPayload::WriteSet(_) => (),
-                    },
-                    Transaction::StateCheckpoint => {}
-                }
-
-                let mut account_state = Default::default();
-                update_account_state(&mut account_state, path, write_op);
-                entry.insert(account_state);
-            }
-        }
-        addrs.insert(address);
-    }
-
-    for addr in addrs {
-        let account_state = account_to_state.get(&addr).expect("Address should exist.");
-        updated_blobs.insert(addr, account_state.clone());
-    }
-
-    Ok(updated_blobs)
-}
-
-fn update_account_state(account_state: &mut AccountState, path: Vec<u8>, write_op: WriteOp) {
-    match write_op {
-        WriteOp::Value(new_value) => account_state.insert(path, new_value),
-        WriteOp::Deletion => account_state.remove(&path),
-    };
-}
-
-pub trait IntoLedgerView {
-    fn into_ledger_view(self, db: &Arc<dyn DbReader>) -> Result<ExecutedTrees>;
-}
-
-impl IntoLedgerView for TreeState {
-    fn into_ledger_view(self, _db: &Arc<dyn DbReader>) -> Result<ExecutedTrees> {
-        Ok(ExecutedTrees::new(
-            self.account_state_root_hash,
-            self.ledger_frozen_subtree_hashes,
-            self.num_transactions,
-        ))
-    }
-}
-
-static NEW_EPOCH_EVENT_KEY: Lazy<EventKey> = Lazy::new(on_chain_config::new_epoch_event_key);
-
-struct ParsedTransactionOutput {
-    output: TransactionOutput,
-    reconfig_events: Vec<ContractEvent>,
-}
-
-impl From<TransactionOutput> for ParsedTransactionOutput {
-    fn from(output: TransactionOutput) -> Self {
-        let reconfig_events = output
-            .events()
-            .iter()
-            .filter(|e| *e.key() == *NEW_EPOCH_EVENT_KEY)
-            .cloned()
-            .collect();
-        Self {
-            output,
-            reconfig_events,
-        }
-    }
-}
-
-impl Deref for ParsedTransactionOutput {
-    type Target = TransactionOutput;
-
-    fn deref(&self) -> &Self::Target {
-        &self.output
-    }
-}
-
-impl ParsedTransactionOutput {
-    fn is_reconfig(&self) -> bool {
-        !self.reconfig_events.is_empty()
-    }
-
-    pub fn unpack(
-        self,
-    ) -> (
-        WriteSet,
-        Vec<ContractEvent>,
-        Vec<ContractEvent>,
-        u64,
-        TransactionStatus,
-    ) {
-        let Self {
-            output,
-            reconfig_events,
-        } = self;
-        let (write_set, events, gas_used, status) = output.unpack();
-
-        (write_set, events, reconfig_events, gas_used, status)
-    }
 }

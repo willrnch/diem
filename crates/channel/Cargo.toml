@@ -1,21 +1,24 @@
 [package]
-name = "channel"
+name = "diem-channels"
+description = "An implementation of a channel with configurable QoS"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem channel"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-futures = "0.3.12"
-diem-metrics = { path = "../../crates/diem-metrics" }
-diem-infallible = { path = "../../crates/diem-infallible" }
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
+anyhow = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
-diem-types = { path = "../../types"  }
-tokio = { version = "1.8.1", features = ["full"] }
+diem-types = { workspace = true }
+tokio = { workspace = true }

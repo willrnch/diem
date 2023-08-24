@@ -1,11 +1,12 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug, Deserialize, Error, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
 pub enum Error {
     #[error("Entropy error: {0}")]
     EntropyError(String),
@@ -58,16 +59,6 @@ impl From<diem_vault_client::Error> for Error {
         match error {
             diem_vault_client::Error::NotFound(_, key) => Self::KeyNotSet(key),
             diem_vault_client::Error::HttpError(403, _, _) => Self::PermissionDenied,
-            _ => Self::InternalError(format!("{}", error)),
-        }
-    }
-}
-
-impl From<diem_github_client::Error> for Error {
-    fn from(error: diem_github_client::Error) -> Self {
-        match error {
-            diem_github_client::Error::NotFound(key) => Self::KeyNotSet(key),
-            diem_github_client::Error::HttpError(403, _, _) => Self::PermissionDenied,
             _ => Self::InternalError(format!("{}", error)),
         }
     }

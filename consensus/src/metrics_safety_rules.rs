@@ -1,22 +1,21 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::persistent_liveness_storage::PersistentLivenessStorage;
-use consensus_types::{
+use crate::{monitor, persistent_liveness_storage::PersistentLivenessStorage};
+use diem_consensus_types::{
     block_data::BlockData,
-    timeout::Timeout,
     timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
     vote::Vote,
-    vote_proposal::MaybeSignedVoteProposal,
+    vote_proposal::VoteProposal,
 };
-use diem_crypto::ed25519::Ed25519Signature;
+use diem_crypto::bls12381;
 use diem_logger::prelude::info;
-use diem_metrics::monitor;
+use diem_safety_rules::{ConsensusState, Error, TSafetyRules};
 use diem_types::{
     epoch_change::EpochChangeProof,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
 };
-use safety_rules::{ConsensusState, Error, TSafetyRules};
 use std::sync::Arc;
 
 /// Wrap safety rules with counters.
@@ -58,7 +57,7 @@ impl MetricsSafetyRules {
                     waypoint_version = curr_version;
                     info!("Previous waypoint version {}, updated version {}, current epoch {}, provided epoch {}", prev_version, curr_version, current_epoch, provided_epoch);
                     continue;
-                }
+                },
                 result => return result,
             }
         }
@@ -75,7 +74,7 @@ impl MetricsSafetyRules {
             | Err(Error::WaypointOutOfDate(_, _, _, _)) => {
                 self.perform_initialize()?;
                 f(&mut self.inner)
-            }
+            },
             _ => result,
         }
     }
@@ -90,26 +89,15 @@ impl TSafetyRules for MetricsSafetyRules {
         monitor!("safety_rules", self.inner.initialize(proof))
     }
 
-    fn construct_and_sign_vote(
-        &mut self,
-        vote_proposal: &MaybeSignedVoteProposal,
-    ) -> Result<Vote, Error> {
-        self.retry(|inner| monitor!("safety_rules", inner.construct_and_sign_vote(vote_proposal)))
-    }
-
-    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<Ed25519Signature, Error> {
+    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<bls12381::Signature, Error> {
         self.retry(|inner| monitor!("safety_rules", inner.sign_proposal(block_data)))
-    }
-
-    fn sign_timeout(&mut self, timeout: &Timeout) -> Result<Ed25519Signature, Error> {
-        self.retry(|inner| monitor!("safety_rules", inner.sign_timeout(timeout)))
     }
 
     fn sign_timeout_with_qc(
         &mut self,
         timeout: &TwoChainTimeout,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         self.retry(|inner| {
             monitor!(
                 "safety_rules",
@@ -120,7 +108,7 @@ impl TSafetyRules for MetricsSafetyRules {
 
     fn construct_and_sign_vote_two_chain(
         &mut self,
-        vote_proposal: &MaybeSignedVoteProposal,
+        vote_proposal: &VoteProposal,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
     ) -> Result<Vote, Error> {
         self.retry(|inner| {
@@ -135,7 +123,7 @@ impl TSafetyRules for MetricsSafetyRules {
         &mut self,
         ledger_info: LedgerInfoWithSignatures,
         new_ledger_info: LedgerInfo,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         self.retry(|inner| {
             monitor!(
                 "safety_rules",
@@ -148,20 +136,19 @@ impl TSafetyRules for MetricsSafetyRules {
 #[cfg(test)]
 mod tests {
     use crate::{metrics_safety_rules::MetricsSafetyRules, test_utils::EmptyStorage};
-    use claim::{assert_matches, assert_ok};
-    use consensus_types::{
+    use diem_consensus_types::{
         block_data::BlockData,
-        timeout::Timeout,
         timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
         vote::Vote,
-        vote_proposal::MaybeSignedVoteProposal,
+        vote_proposal::VoteProposal,
     };
-    use diem_crypto::ed25519::Ed25519Signature;
+    use diem_crypto::bls12381;
+    use diem_safety_rules::{ConsensusState, Error, TSafetyRules};
     use diem_types::{
         epoch_change::EpochChangeProof,
         ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     };
-    use safety_rules::{ConsensusState, Error, TSafetyRules};
+    use claims::{assert_matches, assert_ok};
 
     pub struct MockSafetyRules {
         // number of initialize() calls
@@ -206,15 +193,7 @@ mod tests {
             self.last_init_result.clone()
         }
 
-        fn construct_and_sign_vote(&mut self, _: &MaybeSignedVoteProposal) -> Result<Vote, Error> {
-            unimplemented!()
-        }
-
-        fn sign_proposal(&mut self, _: &BlockData) -> Result<Ed25519Signature, Error> {
-            unimplemented!()
-        }
-
-        fn sign_timeout(&mut self, _: &Timeout) -> Result<Ed25519Signature, Error> {
+        fn sign_proposal(&mut self, _: &BlockData) -> Result<bls12381::Signature, Error> {
             unimplemented!()
         }
 
@@ -222,13 +201,13 @@ mod tests {
             &mut self,
             _: &TwoChainTimeout,
             _: Option<&TwoChainTimeoutCertificate>,
-        ) -> Result<Ed25519Signature, Error> {
+        ) -> Result<bls12381::Signature, Error> {
             unimplemented!()
         }
 
         fn construct_and_sign_vote_two_chain(
             &mut self,
-            _: &MaybeSignedVoteProposal,
+            _: &VoteProposal,
             _: Option<&TwoChainTimeoutCertificate>,
         ) -> Result<Vote, Error> {
             unimplemented!()
@@ -238,7 +217,7 @@ mod tests {
             &mut self,
             _: LedgerInfoWithSignatures,
             _: LedgerInfo,
-        ) -> Result<Ed25519Signature, Error> {
+        ) -> Result<bls12381::Signature, Error> {
             unimplemented!()
         }
     }

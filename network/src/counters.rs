@@ -1,16 +1,17 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::protocols::wire::handshake::v1::ProtocolId;
 use diem_config::network_id::NetworkContext;
-use diem_metrics::{
+use diem_metrics_core::{
     register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
     Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
+use diem_netcore::transport::ConnectionOrigin;
+use diem_short_hex_str::AsShortHexStr;
 use diem_types::PeerId;
-use netcore::transport::ConnectionOrigin;
 use once_cell::sync::Lazy;
-use short_hex_str::AsShortHexStr;
 
 // some type labels
 pub const REQUEST_LABEL: &str = "request";
@@ -156,11 +157,13 @@ pub static DIEM_NETWORK_DISCOVERY_NOTES: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 
 pub static DIEM_NETWORK_RPC_MESSAGES: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "diem_network_rpc_messages",
-        "Number of RPC messages",
-        &["role_type", "network_id", "peer_id", "type", "state"]
-    )
+    register_int_counter_vec!("diem_network_rpc_messages", "Number of RPC messages", &[
+        "role_type",
+        "network_id",
+        "peer_id",
+        "type",
+        "state"
+    ])
     .unwrap()
 });
 
@@ -394,6 +397,24 @@ pub static PENDING_WIRE_MESSAGES: Lazy<IntGauge> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Counter of messages pending in queue to be sent out on the multiplex channel
+pub static PENDING_MULTIPLEX_MESSAGE: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "diem_network_pending_multiplex_messages",
+        "Number of pending multiplex messages"
+    )
+    .unwrap()
+});
+
+/// Counter of stream messages pending in queue to be sent out on the multiplex channel
+pub static PENDING_MULTIPLEX_STREAM: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "diem_network_pending_multiplex_stream",
+        "Number of pending multiplex stream messages"
+    )
+    .unwrap()
+});
+
 /// Counter of pending requests in Direct Send
 pub static PENDING_DIRECT_SEND_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
@@ -474,3 +495,65 @@ pub static NETWORK_RATE_LIMIT_METRICS: Lazy<HistogramVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+pub static NETWORK_APPLICATION_INBOUND_METRIC: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "diem_network_app_inbound_traffic",
+        "Network Inbound Traffic by application",
+        &[
+            "role_type",
+            "network_id",
+            "peer_id",
+            "protocol_id",
+            "metric"
+        ]
+    )
+    .unwrap()
+});
+
+pub fn network_application_inbound_traffic(
+    network_context: NetworkContext,
+    protocol_id: ProtocolId,
+    size: u64,
+) {
+    NETWORK_APPLICATION_INBOUND_METRIC
+        .with_label_values(&[
+            network_context.role().as_str(),
+            network_context.network_id().as_str(),
+            network_context.peer_id().short_str().as_str(),
+            protocol_id.as_str(),
+            "size",
+        ])
+        .observe(size as f64);
+}
+
+pub static NETWORK_APPLICATION_OUTBOUND_METRIC: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "diem_network_app_outbound_traffic",
+        "Network Outbound Traffic by application",
+        &[
+            "role_type",
+            "network_id",
+            "peer_id",
+            "protocol_id",
+            "metric"
+        ]
+    )
+    .unwrap()
+});
+
+pub fn network_application_outbound_traffic(
+    network_context: NetworkContext,
+    protocol_id: ProtocolId,
+    size: u64,
+) {
+    NETWORK_APPLICATION_OUTBOUND_METRIC
+        .with_label_values(&[
+            network_context.role().as_str(),
+            network_context.network_id().as_str(),
+            network_context.peer_id().short_str().as_str(),
+            protocol_id.as_str(),
+            "size",
+        ])
+        .observe(size as f64);
+}

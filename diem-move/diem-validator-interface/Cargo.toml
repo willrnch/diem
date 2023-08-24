@@ -1,23 +1,29 @@
 [package]
 name = "diem-validator-interface"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
 description = "Defines interfaces between the diem nodes and local move infrastructure"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-diem-config = { path = "../../config" }
-diem-client = { path = "../../crates/diem-client" }
-diem-types = { path = "../../types" }
-diemdb = { path = "../../storage/diemdb" }
-diem-workspace-hack = { path = "../../crates/diem-workspace-hack" }
-storage-interface = { path = "../../storage/storage-interface" }
-scratchpad = { path = "../../storage/scratchpad" }
-diem-state-view = { path = "../../storage/state-view" }
-move-binary-format = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-bcs = "0.1.2"
+anyhow = { workspace = true }
+diem-api-types = { workspace = true }
+diem-config = { workspace = true }
+diem-db = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+itertools = { workspace = true }
+lru = { workspace = true }
+move-binary-format = { workspace = true }
+tokio = { workspace = true }

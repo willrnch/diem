@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines all kinds of structures in the Sparse Merkle Tree maintained in scratch pad.
@@ -113,6 +114,7 @@ impl<V> Node<V> {
         }
     }
 
+    #[cfg(test)]
     pub fn new_internal(left: SubTree<V>, right: SubTree<V>, generation: u64) -> Self {
         Self {
             generation,
@@ -215,6 +217,7 @@ impl<V: CryptoHash> SubTree<V> {
         }
     }
 
+    #[cfg(test)]
     pub fn new_internal(left: Self, right: Self, generation: u64) -> Self {
         let internal = Node::new_internal(left, right, generation);
 
@@ -256,13 +259,10 @@ impl<V: CryptoHash> SubTree<V> {
 
     #[cfg(test)]
     pub fn is_unknown(&self) -> bool {
-        matches!(
-            self,
-            Self::NonEmpty {
-                root: NodeHandle::Weak(_),
-                ..
-            }
-        )
+        matches!(self, Self::NonEmpty {
+            root: NodeHandle::Weak(_),
+            ..
+        })
     }
 
     #[cfg(test)]

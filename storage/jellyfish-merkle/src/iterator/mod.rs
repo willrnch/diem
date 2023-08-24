@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module implements `JellyfishMerkleIterator`. Initialized with a version and a key, the
@@ -13,7 +14,7 @@ use crate::{
     node_type::{Child, InternalNode, Node, NodeKey},
     TreeReader,
 };
-use anyhow::{bail, ensure, format_err, Result};
+use anyhow::{bail, ensure, Result};
 use diem_crypto::HashValue;
 use diem_types::{
     nibble::{nibble_path::NibblePath, Nibble, ROOT_NIBBLE_HEIGHT},
@@ -37,7 +38,7 @@ struct NodeVisitInfo {
 
     /// This integer always has exactly one 1-bit. The position of the 1-bit (from LSB) indicates
     /// the next child to visit in the iteration process. All the ones on the left have already
-    /// been visited. All the chilren on the right (including this one) have not been visited yet.
+    /// been visited. All the children on the right (including this one) have not been visited yet.
     next_child_to_visit: u16,
 }
 
@@ -94,7 +95,7 @@ impl NodeVisitInfo {
 }
 
 /// The `JellyfishMerkleIterator` implementation.
-pub struct JellyfishMerkleIterator<R, V> {
+pub struct JellyfishMerkleIterator<R, K> {
     /// The storage engine from which we can read nodes using node keys.
     reader: Arc<R>,
 
@@ -109,13 +110,13 @@ pub struct JellyfishMerkleIterator<R, V> {
     /// additional bit.
     done: bool,
 
-    phantom_value: PhantomData<V>,
+    phantom_value: PhantomData<K>,
 }
 
-impl<R, V> JellyfishMerkleIterator<R, V>
+impl<R, K> JellyfishMerkleIterator<R, K>
 where
-    R: TreeReader<V>,
-    V: crate::Value,
+    R: TreeReader<K>,
+    K: crate::Key,
 {
     /// Constructs a new iterator. This puts the internal state in the correct position, so the
     /// following `next` call will yield the smallest key that is greater or equal to
@@ -125,7 +126,7 @@ where
         let mut done = false;
 
         let mut current_node_key = NodeKey::new_empty_path(version);
-        let nibble_path = NibblePath::new(starting_key.to_vec());
+        let nibble_path = NibblePath::new_even(starting_key.to_vec());
         let mut nibble_iter = nibble_path.nibbles();
 
         while let Node::Internal(internal_node) = reader.get_node(&current_node_key)? {
@@ -140,7 +141,7 @@ where
                     ));
                     current_node_key =
                         current_node_key.gen_child_node_key(child.version, child_index);
-                }
+                },
                 None => {
                     let (bitmap, _) = internal_node.generate_bitmaps();
                     if u32::from(u8::from(child_index)) < 15 - bitmap.leading_zeros() {
@@ -163,7 +164,7 @@ where
                         done,
                         phantom_value: PhantomData,
                     });
-                }
+                },
             }
         }
 
@@ -176,8 +177,10 @@ where
                         done = true;
                     }
                 }
-            }
-            Node::Null => done = true,
+            },
+            Node::Null => {
+                done = true;
+            },
         }
 
         Ok(Self {
@@ -207,10 +210,7 @@ where
 
         let mut current_node_key = NodeKey::new_empty_path(version);
         let mut current_node = reader.get_node(&current_node_key)?;
-        let total_leaves = current_node
-            .leaf_count()
-            .ok_or_else(|| format_err!("Leaf counts not available."))?;
-        if start_idx >= total_leaves {
+        if start_idx >= current_node.leaf_count() {
             return Ok(Self {
                 reader,
                 version,
@@ -223,9 +223,6 @@ where
         let mut leaves_skipped = 0;
         for _ in 0..=ROOT_NIBBLE_HEIGHT {
             match current_node {
-                Node::Null => {
-                    unreachable!("The Node::Null case has already been covered before loop.")
-                }
                 Node::Leaf(_) => {
                     ensure!(
                         leaves_skipped == start_idx,
@@ -238,7 +235,7 @@ where
                         done: false,
                         phantom_value: PhantomData,
                     });
-                }
+                },
                 Node::Internal(internal_node) => {
                     let (nibble, child) =
                         Self::skip_leaves(&internal_node, &mut leaves_skipped, start_idx)?;
@@ -249,7 +246,8 @@ where
                         nibble,
                     ));
                     current_node_key = next_node_key;
-                }
+                },
+                Node::Null => unreachable!("Null node has leaf count 0 so here is unreachable"),
             };
             current_node = reader.get_node(&current_node_key)?;
         }
@@ -263,7 +261,7 @@ where
         target_leaf_idx: usize,
     ) -> Result<(Nibble, &'a Child)> {
         for (nibble, child) in internal_node.children_sorted() {
-            let child_leaf_count = child.leaf_count().expect("Leaf count available.");
+            let child_leaf_count = child.leaf_count();
             // n.b. The index is 0-based, so to reach leaf at N, N previous ones need to be skipped.
             if *leaves_skipped + child_leaf_count <= target_leaf_idx {
                 *leaves_skipped += child_leaf_count;
@@ -276,12 +274,12 @@ where
     }
 }
 
-impl<R, V> Iterator for JellyfishMerkleIterator<R, V>
+impl<R, K> Iterator for JellyfishMerkleIterator<R, K>
 where
-    R: TreeReader<V>,
-    V: crate::Value,
+    R: TreeReader<K>,
+    K: crate::Key,
 {
-    type Item = Result<(HashValue, V)>;
+    type Item = Result<(HashValue, (K, Version))>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -297,14 +295,19 @@ where
                     // true in `new`). Return the node and mark `self.done` so next time we return
                     // None.
                     self.done = true;
-                    return Some(Ok((leaf_node.account_key(), leaf_node.value().clone())));
-                }
+                    return Some(Ok((
+                        leaf_node.account_key(),
+                        leaf_node.value_index().clone(),
+                    )));
+                },
                 Ok(Node::Internal(_)) => {
                     // This means `starting_key` is bigger than every key in this tree, or we have
                     // iterated past the last key.
                     return None;
-                }
-                Ok(Node::Null) => unreachable!("We would have set done to true in new."),
+                },
+                Ok(Node::Null) => {
+                    unreachable!("When tree is empty, done should be already set to true")
+                },
                 Err(err) => return Some(Err(err)),
             }
         }
@@ -328,13 +331,15 @@ where
                 Ok(Node::Internal(internal_node)) => {
                     let visit_info = NodeVisitInfo::new(node_key, internal_node);
                     self.parent_stack.push(visit_info);
-                }
+                },
                 Ok(Node::Leaf(leaf_node)) => {
-                    let ret = (leaf_node.account_key(), leaf_node.value().clone());
+                    let ret = (leaf_node.account_key(), leaf_node.value_index().clone());
                     Self::cleanup_stack(&mut self.parent_stack);
                     return Some(Ok(ret));
-                }
-                Ok(Node::Null) => return Some(Err(format_err!("Should not reach a null node."))),
+                },
+                Ok(Node::Null) => {
+                    unreachable!("When tree is empty, done should be already set to true")
+                },
                 Err(err) => return Some(Err(err)),
             }
         }

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines the physical storage schema for information related to outdated state
@@ -11,7 +12,7 @@
 //!
 //! ```text
 //! |<--------------key-------------->|
-//! | stale_since_vesrion | node_key |
+//! | stale_since_version | node_key |
 //! ```
 //!
 //! `stale_since_version` is serialized in big endian so that records in RocksDB will be in order of
@@ -19,13 +20,13 @@
 
 use crate::schema::{ensure_slice_len_eq, ensure_slice_len_gt, STALE_NODE_INDEX_CF_NAME};
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use diem_jellyfish_merkle::{node_type::NodeKey, StaleNodeIndex};
-use diem_types::transaction::Version;
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, SeekKeyCodec, ValueCodec},
 };
+use diem_types::transaction::Version;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::{io::Write, mem::size_of};
 
 define_schema!(

@@ -1,31 +1,33 @@
 [package]
 name = "generate-format"
+description = "Diem core type checker to ensure compatibility"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem types"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-rand = "0.8.3"
-serde = { version = "1.0.124", features = ["derive"] }
-serde-reflection = "0.3.5"
-serde_yaml = "0.8.17"
-structopt = "0.3.21"
-
-consensus = { path = "../../consensus", features=["fuzzing"] }
-consensus-types = { path = "../../consensus/consensus-types", features=["fuzzing"] }
-bcs = "0.1.2"
-diem-config = { path = "../../config" }
-diem-crypto = { path = "../../crates/diem-crypto", features=["fuzzing"] }
-diem-crypto-derive = { path = "../../crates/diem-crypto-derive"}
-diem-types = { path = "../../types", features=["fuzzing"] }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-network = { path = "../../network" }
-move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860", features=["fuzzing"] }
+diem-api-types = { workspace = true }
+diem-config = { workspace = true }
+diem-consensus = { workspace = true, features = ["fuzzing"] }
+diem-consensus-types = { workspace = true }
+diem-crypto = { workspace = true }
+diem-crypto-derive = { workspace = true }
+diem-network = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+clap = { workspace = true }
+move-core-types = { workspace = true, features = ["fuzzing"] }
+rand = { workspace = true }
+serde = { workspace = true }
+serde-reflection = { workspace = true }
+serde_yaml = { workspace = true }
 
 [[bin]]
 name = "compute"

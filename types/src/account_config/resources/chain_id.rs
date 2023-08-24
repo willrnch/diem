@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::chain_id::ChainId;
@@ -21,7 +22,7 @@ impl ChainIdResource {
 }
 
 impl MoveStructType for ChainIdResource {
-    const MODULE_NAME: &'static IdentStr = ident_str!("ChainId");
+    const MODULE_NAME: &'static IdentStr = ident_str!("chain_id");
     const STRUCT_NAME: &'static IdentStr = ident_str!("ChainId");
 }
 

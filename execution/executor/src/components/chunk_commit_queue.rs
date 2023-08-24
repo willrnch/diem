@@ -1,14 +1,13 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, Result};
-
-use crate::components::apply_chunk_output::IntoLedgerView;
-use executor_types::{ExecutedChunk, ExecutedTrees};
+use diem_executor_types::ExecutedChunk;
+use diem_storage_interface::{DbReader, ExecutedTrees};
 use std::{collections::VecDeque, sync::Arc};
-use storage_interface::DbReader;
 
 pub struct ChunkCommitQueue {
     persisted_view: ExecutedTrees,
@@ -17,11 +16,7 @@ pub struct ChunkCommitQueue {
 
 impl ChunkCommitQueue {
     pub fn new_from_db(db: &Arc<dyn DbReader>) -> Result<Self> {
-        let persisted_view = db
-            .get_startup_info()?
-            .ok_or_else(|| anyhow!("DB not bootstrapped."))?
-            .into_latest_tree_state()
-            .into_ledger_view(db)?;
+        let persisted_view = db.get_latest_executed_trees()?;
         Ok(Self::new(persisted_view))
     }
 

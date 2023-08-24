@@ -1,25 +1,30 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This file defines ledger store APIs that are related to the main ledger accumulator, from the
 //! root(LedgerInfo) to leaf(TransactionInfo).
 
 use crate::{
-    change_set::ChangeSet,
     errors::DiemDbError,
+    ledger_db::LedgerDb,
     schema::{
-        epoch_by_version::EpochByVersionSchema, ledger_info::LedgerInfoSchema,
-        transaction_accumulator::TransactionAccumulatorSchema,
+        db_metadata::DbMetadataKey, epoch_by_version::EpochByVersionSchema,
+        ledger_info::LedgerInfoSchema, transaction_accumulator::TransactionAccumulatorSchema,
         transaction_info::TransactionInfoSchema,
     },
+    utils::{
+        get_progress,
+        iterators::{EpochEndingLedgerInfoIter, ExpectContinuousVersions},
+    },
 };
-use accumulator::{HashReader, MerkleAccumulator};
-use anyhow::{ensure, format_err, Result};
-use arc_swap::ArcSwap;
+use anyhow::{anyhow, ensure, format_err, Result};
+use diem_accumulator::{HashReader, MerkleAccumulator};
 use diem_crypto::{
     hash::{CryptoHash, TransactionAccumulatorHasher},
     HashValue,
 };
+use diem_schemadb::{ReadOptions, SchemaBatch};
 use diem_types::{
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
@@ -27,16 +32,15 @@ use diem_types::{
         definition::LeafCount, position::Position, AccumulatorConsistencyProof,
         TransactionAccumulatorProof, TransactionAccumulatorRangeProof, TransactionInfoWithProof,
     },
-    transaction::{TransactionInfo, Version},
+    transaction::{TransactionInfo, TransactionToCommit, Version},
 };
+use arc_swap::ArcSwap;
 use itertools::Itertools;
-use schemadb::{ReadOptions, SchemaIterator, DB};
-use std::{ops::Deref, sync::Arc};
-use storage_interface::{StartupInfo, TreeState};
+use std::{borrow::Borrow, ops::Deref, sync::Arc};
 
 #[derive(Debug)]
-pub(crate) struct LedgerStore {
-    db: Arc<DB>,
+pub struct LedgerStore {
+    pub ledger_db: Arc<LedgerDb>,
 
     /// We almost always need the latest ledger info and signatures to serve read requests, so we
     /// cache it in memory in order to avoid reading DB and deserializing the object frequently. It
@@ -45,10 +49,11 @@ pub(crate) struct LedgerStore {
 }
 
 impl LedgerStore {
-    pub fn new(db: Arc<DB>) -> Self {
+    pub fn new(ledger_db: Arc<LedgerDb>) -> Self {
         // Upon restart, read the latest ledger info and signatures and cache them in memory.
         let ledger_info = {
-            let mut iter = db
+            let mut iter = ledger_db
+                .metadata_db()
                 .iter::<LedgerInfoSchema>(ReadOptions::default())
                 .expect("Constructing iterator should work.");
             iter.seek_to_last();
@@ -59,14 +64,15 @@ impl LedgerStore {
         };
 
         Self {
-            db,
+            ledger_db,
             latest_ledger_info: ArcSwap::from(Arc::new(ledger_info)),
         }
     }
 
     pub fn get_epoch(&self, version: Version) -> Result<u64> {
         let mut iter = self
-            .db
+            .ledger_db
+            .metadata_db()
             .iter::<EpochByVersionSchema>(ReadOptions::default())?;
         // Search for the end of the previous epoch.
         iter.seek_for_prev(&version)?;
@@ -77,7 +83,7 @@ impl LedgerStore {
                 // transaction), so this normally doesn't happen. However this part of
                 // implementation doesn't need to rely on this assumption.
                 return Ok(0);
-            }
+            },
         };
         ensure!(
             epoch_end_version <= version,
@@ -102,7 +108,8 @@ impl LedgerStore {
     ) -> Result<LedgerInfoWithSignatures> {
         let epoch = self.get_epoch(version)?;
         let li = self
-            .db
+            .ledger_db
+            .metadata_db()
             .get::<LedgerInfoSchema>(&epoch)?
             .ok_or_else(|| DiemDbError::NotFound(format!("LedgerInfo for epoch {}.", epoch)))?;
         ensure!(
@@ -135,20 +142,24 @@ impl LedgerStore {
     }
 
     pub fn get_latest_ledger_info_in_epoch(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
-        self.db.get::<LedgerInfoSchema>(&epoch)?.ok_or_else(|| {
-            DiemDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch)).into()
-        })
+        self.ledger_db
+            .metadata_db()
+            .get::<LedgerInfoSchema>(&epoch)?
+            .ok_or_else(|| {
+                DiemDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch)).into()
+            })
     }
 
-    fn get_epoch_state(&self, epoch: u64) -> Result<EpochState> {
+    pub fn get_epoch_state(&self, epoch: u64) -> Result<EpochState> {
         ensure!(epoch > 0, "EpochState only queryable for epoch >= 1.",);
 
-        let ledger_info_with_sigs =
-            self.db
-                .get::<LedgerInfoSchema>(&(epoch - 1))?
-                .ok_or_else(|| {
-                    DiemDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch - 1))
-                })?;
+        let ledger_info_with_sigs = self
+            .ledger_db
+            .metadata_db()
+            .get::<LedgerInfoSchema>(&(epoch - 1))?
+            .ok_or_else(|| {
+                DiemDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch - 1))
+            })?;
         let latest_epoch_state = ledger_info_with_sigs
             .ledger_info()
             .next_epoch_state()
@@ -157,100 +168,39 @@ impl LedgerStore {
         Ok(latest_epoch_state.clone())
     }
 
-    pub fn get_tree_state(
-        &self,
-        num_transactions: LeafCount,
-        transaction_info: TransactionInfo,
-    ) -> Result<TreeState> {
-        Ok(TreeState::new(
-            num_transactions,
-            self.get_frozen_subtree_hashes(num_transactions)?,
-            transaction_info.state_change_hash(),
-        ))
-    }
-
     pub fn get_frozen_subtree_hashes(&self, num_transactions: LeafCount) -> Result<Vec<HashValue>> {
         Accumulator::get_frozen_subtree_hashes(self, num_transactions)
     }
 
-    pub fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
-        // Get the latest ledger info. Return None if not bootstrapped.
-        let latest_ledger_info = match self.get_latest_ledger_info_option() {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-        let latest_epoch_state_if_not_in_li =
-            match latest_ledger_info.ledger_info().next_epoch_state() {
-                Some(_) => None,
-                // If the latest LedgerInfo doesn't carry a validator set, we look for the previous
-                // LedgerInfo which should always carry a validator set.
-                None => Some(self.get_epoch_state(latest_ledger_info.ledger_info().epoch())?),
-            };
-
-        let li_version = latest_ledger_info.ledger_info().version();
-        let (latest_version, latest_txn_info) = self.get_latest_transaction_info()?;
-        assert!(latest_version >= li_version);
-        let (commited_tree_state, synced_tree_state) = if latest_version == li_version {
-            (
-                self.get_tree_state(latest_version + 1, latest_txn_info)?,
-                None,
-            )
-        } else {
-            let commited_txn_info = self.get_transaction_info(li_version)?;
-            (
-                self.get_tree_state(li_version + 1, commited_txn_info)?,
-                Some(self.get_tree_state(latest_version + 1, latest_txn_info)?),
-            )
-        };
-
-        Ok(Some(StartupInfo::new(
-            latest_ledger_info,
-            latest_epoch_state_if_not_in_li,
-            commited_tree_state,
-            synced_tree_state,
-        )))
-    }
-
     /// Get transaction info given `version`
     pub fn get_transaction_info(&self, version: Version) -> Result<TransactionInfo> {
-        self.db
+        self.ledger_db
+            .transaction_info_db()
             .get::<TransactionInfoSchema>(&version)?
             .ok_or_else(|| format_err!("No TransactionInfo at version {}", version))
     }
 
-    pub fn get_latest_transaction_info_option(&self) -> Result<Option<(Version, TransactionInfo)>> {
-        let mut iter = self
-            .db
-            .iter::<TransactionInfoSchema>(ReadOptions::default())?;
-        iter.seek_to_last();
-        iter.next().transpose()
-    }
-
-    /// Get latest transaction info together with its version. Note that during node syncing, this
-    /// version can be greater than what's in the latest LedgerInfo.
-    pub fn get_latest_transaction_info(&self) -> Result<(Version, TransactionInfo)> {
-        self.get_latest_transaction_info_option()?
-            .ok_or_else(|| DiemDbError::NotFound(String::from("Genesis TransactionInfo.")).into())
+    pub fn get_latest_version(&self) -> Result<Version> {
+        get_progress(
+            self.ledger_db.metadata_db(),
+            &DbMetadataKey::OverallCommitProgress,
+        )?
+        .ok_or(anyhow!("No progress in db."))
     }
 
     /// Gets an iterator that yields `num_transaction_infos` transaction infos starting from
     /// `start_version`.
-    pub fn get_transaction_info_iter(
+    pub(crate) fn get_transaction_info_iter(
         &self,
         start_version: Version,
         num_transaction_infos: usize,
-    ) -> Result<TransactionInfoIter> {
+    ) -> Result<impl Iterator<Item = Result<TransactionInfo>> + '_> {
         let mut iter = self
-            .db
+            .ledger_db
+            .transaction_info_db()
             .iter::<TransactionInfoSchema>(ReadOptions::default())?;
         iter.seek(&start_version)?;
-        Ok(TransactionInfoIter {
-            inner: iter,
-            expected_next_version: start_version,
-            end_version: start_version
-                .checked_add(num_transaction_infos as u64)
-                .ok_or_else(|| format_err!("Too many transaction infos requested."))?,
-        })
+        iter.expect_continuous_versions(start_version, num_transaction_infos)
     }
 
     /// Gets an iterator that yields epoch ending ledger infos, starting
@@ -260,13 +210,20 @@ impl LedgerStore {
         start_epoch: u64,
         end_epoch: u64,
     ) -> Result<EpochEndingLedgerInfoIter> {
-        let mut iter = self.db.iter::<LedgerInfoSchema>(ReadOptions::default())?;
+        let mut iter = self
+            .ledger_db
+            .metadata_db()
+            .iter::<LedgerInfoSchema>(ReadOptions::default())?;
         iter.seek(&start_epoch)?;
-        Ok(EpochEndingLedgerInfoIter {
-            inner: iter,
-            next_epoch: start_epoch,
-            end_epoch,
-        })
+        Ok(EpochEndingLedgerInfoIter::new(iter, start_epoch, end_epoch))
+    }
+
+    pub fn ensure_epoch_ending(&self, version: Version) -> Result<()> {
+        self.ledger_db
+            .metadata_db()
+            .get::<EpochByVersionSchema>(&version)?
+            .ok_or_else(|| format_err!("Version {} is not epoch ending.", version))?;
+        Ok(())
     }
 
     /// Get transaction info at `version` with proof towards root of ledger at `ledger_version`.
@@ -320,19 +277,22 @@ impl LedgerStore {
         Accumulator::get_consistency_proof(self, ledger_num_leaves, client_known_num_leaves)
     }
 
-    /// Write `txn_infos` to `batch`. Assigned `first_version` to the the version number of the
+    /// Write `txn_infos` to `batch`. Assigned `first_version` to the version number of the
     /// first transaction, and so on.
     pub fn put_transaction_infos(
         &self,
         first_version: u64,
         txn_infos: &[TransactionInfo],
-        cs: &mut ChangeSet,
+        // TODO(grao): Consider remove this function and migrate all callers to use the two functions
+        // below.
+        transaction_info_batch: &SchemaBatch,
+        transaction_accumulator_batch: &SchemaBatch,
     ) -> Result<HashValue> {
         // write txn_info
         (first_version..first_version + txn_infos.len() as u64)
             .zip_eq(txn_infos.iter())
             .try_for_each(|(version, txn_info)| {
-                cs.batch.put::<TransactionInfoSchema>(&version, txn_info)
+                transaction_info_batch.put::<TransactionInfoSchema>(&version, txn_info)
             })?;
 
         // write hash of txn_info into the accumulator
@@ -342,27 +302,57 @@ impl LedgerStore {
             first_version, /* num_existing_leaves */
             &txn_hashes,
         )?;
-        writes
-            .iter()
-            .try_for_each(|(pos, hash)| cs.batch.put::<TransactionAccumulatorSchema>(pos, hash))?;
+        writes.iter().try_for_each(|(pos, hash)| {
+            transaction_accumulator_batch.put::<TransactionAccumulatorSchema>(pos, hash)
+        })?;
         Ok(root_hash)
     }
 
-    /// Write `ledger_info` to `cs`.
+    pub fn put_transaction_accumulator(
+        &self,
+        first_version: Version,
+        txns_to_commit: &[impl Borrow<TransactionToCommit>],
+        transaction_accumulator_batch: &SchemaBatch,
+    ) -> Result<HashValue> {
+        let txn_hashes: Vec<_> = txns_to_commit
+            .iter()
+            .map(|t| t.borrow().transaction_info().hash())
+            .collect();
+
+        let (root_hash, writes) = Accumulator::append(
+            self,
+            first_version, /* num_existing_leaves */
+            &txn_hashes,
+        )?;
+        writes.iter().try_for_each(|(pos, hash)| {
+            transaction_accumulator_batch.put::<TransactionAccumulatorSchema>(pos, hash)
+        })?;
+
+        Ok(root_hash)
+    }
+
+    pub fn put_transaction_info(
+        &self,
+        version: Version,
+        transaction_info: &TransactionInfo,
+        transaction_info_batch: &SchemaBatch,
+    ) -> Result<()> {
+        transaction_info_batch.put::<TransactionInfoSchema>(&version, transaction_info)
+    }
+
+    /// Write `ledger_info_with_sigs` to `batch`.
     pub fn put_ledger_info(
         &self,
         ledger_info_with_sigs: &LedgerInfoWithSignatures,
-        cs: &mut ChangeSet,
+        batch: &SchemaBatch,
     ) -> Result<()> {
         let ledger_info = ledger_info_with_sigs.ledger_info();
 
         if ledger_info.ends_epoch() {
             // This is the last version of the current epoch, update the epoch by version index.
-            cs.batch
-                .put::<EpochByVersionSchema>(&ledger_info.version(), &ledger_info.epoch())?;
+            batch.put::<EpochByVersionSchema>(&ledger_info.version(), &ledger_info.epoch())?;
         }
-        cs.batch
-            .put::<LedgerInfoSchema>(&ledger_info.epoch(), ledger_info_with_sigs)
+        batch.put::<LedgerInfoSchema>(&ledger_info.epoch(), ledger_info_with_sigs)
     }
 
     pub fn get_root_hash(&self, version: Version) -> Result<HashValue> {
@@ -374,86 +364,16 @@ pub(crate) type Accumulator = MerkleAccumulator<LedgerStore, TransactionAccumula
 
 impl HashReader for LedgerStore {
     fn get(&self, position: Position) -> Result<HashValue> {
-        self.db
+        self.ledger_db
+            .transaction_accumulator_db()
             .get::<TransactionAccumulatorSchema>(&position)?
             .ok_or_else(|| format_err!("{} does not exist.", position))
     }
 }
 
-pub struct TransactionInfoIter<'a> {
-    inner: SchemaIterator<'a, TransactionInfoSchema>,
-    expected_next_version: Version,
-    end_version: Version,
-}
-
-impl<'a> TransactionInfoIter<'a> {
-    fn next_impl(&mut self) -> Result<Option<TransactionInfo>> {
-        if self.expected_next_version >= self.end_version {
-            return Ok(None);
-        }
-
-        let ret = match self.inner.next().transpose()? {
-            Some((version, transaction_info)) => {
-                ensure!(
-                    version == self.expected_next_version,
-                    "Transaction info versions are not consecutive.",
-                );
-                self.expected_next_version += 1;
-                Some(transaction_info)
-            }
-            _ => None,
-        };
-
-        Ok(ret)
-    }
-}
-
-impl<'a> Iterator for TransactionInfoIter<'a> {
-    type Item = Result<TransactionInfo>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_impl().transpose()
-    }
-}
-
-pub struct EpochEndingLedgerInfoIter<'a> {
-    inner: SchemaIterator<'a, LedgerInfoSchema>,
-    next_epoch: u64,
-    end_epoch: u64,
-}
-
-impl<'a> EpochEndingLedgerInfoIter<'a> {
-    fn next_impl(&mut self) -> Result<Option<LedgerInfoWithSignatures>> {
-        if self.next_epoch >= self.end_epoch {
-            return Ok(None);
-        }
-
-        let ret = match self.inner.next().transpose()? {
-            Some((epoch, li)) => {
-                if !li.ledger_info().ends_epoch() {
-                    None
-                } else {
-                    ensure!(epoch == self.next_epoch, "Epochs are not consecutive.");
-                    self.next_epoch += 1;
-                    Some(li)
-                }
-            }
-            _ => None,
-        };
-
-        Ok(ret)
-    }
-}
-
-impl<'a> Iterator for EpochEndingLedgerInfoIter<'a> {
-    type Item = Result<LedgerInfoWithSignatures>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_impl().transpose()
-    }
-}
-
 #[cfg(test)]
 mod ledger_info_test;
+#[cfg(test)]
+pub(crate) mod ledger_info_test_utils;
 #[cfg(test)]
 mod transaction_info_test;

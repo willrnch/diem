@@ -1,11 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     namespaced::NAMESPACE_SEPARATOR, CryptoStorage, Error, GetResponse, KVStorage,
     PublicKeyResponse,
 };
-use chrono::DateTime;
 use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
     hash::CryptoHash,
@@ -13,22 +13,22 @@ use diem_crypto::{
 use diem_infallible::RwLock;
 use diem_time_service::{TimeService, TimeServiceTrait};
 use diem_vault_client::Client;
+#[cfg(any(test, feature = "testing"))]
+use diem_vault_client::ReadResponse;
+use chrono::DateTime;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-#[cfg(any(test, feature = "testing"))]
-use diem_vault_client::ReadResponse;
-
 const TRANSIT_NAMESPACE_SEPARATOR: &str = "__";
 
-/// VaultStorage utilizes Vault for maintaining encrypted, authenticated data for Diem. This
+/// VaultStorage utilizes Vault for maintaining encrypted, authenticated data. This
 /// version currently matches the behavior of OnDiskStorage and InMemoryStorage. In the future,
 /// Vault will be able to create keys, sign messages, and handle permissions across different
 /// services. The specific vault service leveraged herein is called KV (Key Value) Secrets Engine -
-/// Version 2 (https://www.vaultproject.io/api/secret/kv/kv-v2.html). So while Diem Secure Storage
+/// Version 2 (<https://www.vaultproject.io/api/secret/kv/kv-v2.html>). So while Secure Storage
 /// calls pointers to data keys, Vault has actually a secret that contains multiple key value
 /// pairs.
 pub struct VaultStorage {
@@ -261,7 +261,7 @@ impl CryptoStorage for VaultStorage {
                     .ok_or_else(|| Error::KeyVersionNotFound(name, "previous version".into()))?
                     .value
                     .clone())
-            }
+            },
             None => Err(Error::KeyVersionNotFound(name, "previous version".into())),
         }
     }
@@ -315,11 +315,11 @@ pub mod policy {
 
     const DIEM_DEFAULT: &str = "diem_default";
 
-    /// VaultStorage utilizes Vault for maintaining encrypted, authenticated data for Diem. This
+    /// VaultStorage utilizes Vault for maintaining encrypted, authenticated data. This
     /// version currently matches the behavior of OnDiskStorage and InMemoryStorage. In the future,
     /// Vault will be able to create keys, sign messages, and handle permissions across different
     /// services. The specific vault service leveraged herein is called KV (Key Value) Secrets Engine -
-    /// Version 2 (https://www.vaultproject.io/api/secret/kv/kv-v2.html). So while Diem Secure Storage
+    /// Version 2 (https://www.vaultproject.io/api/secret/kv/kv-v2.html). So while Secure Storage
     /// calls pointers to data keys, Vault has actually a secret that contains multiple key value
     /// pairs.
     pub struct VaultPolicy {
@@ -388,18 +388,18 @@ pub mod policy {
                         let export_capability = vec![vault::Capability::Read];
                         let export_policy = format!("transit/export/signing-key/{}", key);
                         vault_policy.add_policy(&export_policy, export_capability);
-                    }
+                    },
                     Capability::Read => core_capabilities.push(vault::Capability::Read),
                     Capability::Rotate => {
                         let rotate_capability = vec![vault::Capability::Update];
                         let rotate_policy = format!("transit/keys/{}/rotate", key);
                         vault_policy.add_policy(&rotate_policy, rotate_capability);
-                    }
+                    },
                     Capability::Sign => {
                         let sign_capability = vec![vault::Capability::Update];
                         let sign_policy = format!("transit/sign/{}", key);
                         vault_policy.add_policy(&sign_policy, sign_capability);
-                    }
+                    },
                     Capability::Write => core_capabilities.push(vault::Capability::Update),
                 }
             }
@@ -421,7 +421,7 @@ pub mod policy {
                     Identity::User(id) => self.set_policy(id, engine, name, &perm.capabilities)?,
                     Identity::Anyone => {
                         self.set_policy(DIEM_DEFAULT, engine, name, &perm.capabilities)?
-                    }
+                    },
                     Identity::NoOne => (),
                 };
             }

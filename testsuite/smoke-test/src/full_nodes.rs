@@ -1,18 +1,20 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    smoke_test_environment::new_local_swarm,
+    smoke_test_environment::SwarmBuilder,
     test_utils::{
-        assert_balance, create_and_fund_account, transfer_coins, transfer_coins_non_blocking,
+        assert_balance, create_and_fund_account, transfer_coins, MAX_CATCH_UP_WAIT_SECS,
+        MAX_CONNECTIVITY_WAIT_SECS, MAX_HEALTHY_WAIT_SECS,
     },
 };
 use diem_config::{
     config::{DiscoveryMethod, NodeConfig, Peer, PeerRole, HANDSHAKE_VERSION},
     network_id::NetworkId,
 };
+use diem_forge::{LocalSwarm, NodeExt, Swarm, SwarmExt};
 use diem_types::network_address::{NetworkAddress, Protocol};
-use forge::{NodeExt, Swarm, SwarmExt};
 use std::{
     collections::HashSet,
     net::Ipv4Addr,
@@ -21,34 +23,21 @@ use std::{
 
 #[tokio::test]
 async fn test_full_node_basic_flow() {
-    let mut swarm = new_local_swarm(1).await;
-
-    let transaction_factory = swarm.chain_info().transaction_factory();
-    let version = swarm.versions().max().unwrap();
+    let mut swarm = local_swarm_with_fullnodes(1, 1).await;
     let validator_peer_id = swarm.validators().next().unwrap().peer_id();
-    let vfn_peer_id = swarm
-        .add_validator_fullnode(
-            &version,
-            NodeConfig::default_for_validator_full_node(),
-            validator_peer_id,
-        )
-        .await
-        .unwrap();
+    let vfn_peer_id = swarm.full_nodes().next().unwrap().peer_id();
+    let version = swarm.versions().max().unwrap();
     let pfn_peer_id = swarm
-        .add_full_node(&version, NodeConfig::default_for_public_full_node())
-        .unwrap();
-    swarm
-        .validator_mut(validator_peer_id)
-        .unwrap()
-        .wait_until_healthy(Instant::now() + Duration::from_secs(10))
+        .add_full_node(&version, NodeConfig::get_default_pfn_config())
         .await
         .unwrap();
     for fullnode in swarm.full_nodes_mut() {
         fullnode
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
+            .wait_until_healthy(Instant::now() + Duration::from_secs(MAX_HEALTHY_WAIT_SECS))
             .await
             .unwrap();
     }
+    let transaction_factory = swarm.chain_info().transaction_factory();
 
     // create clients for all nodes
     let validator_client = swarm.validator(validator_peer_id).unwrap().rest_client();
@@ -59,7 +48,7 @@ async fn test_full_node_basic_flow() {
     let account_1 = create_and_fund_account(&mut swarm, 10).await;
 
     swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(10))
+        .wait_for_all_nodes_to_catchup(Duration::from_secs(MAX_CATCH_UP_WAIT_SECS))
         .await
         .unwrap();
 
@@ -123,49 +112,42 @@ async fn test_full_node_basic_flow() {
 
 #[tokio::test]
 async fn test_vfn_failover() {
-    let mut swarm = new_local_swarm(4).await;
+    // VFN failover happens when validator is down even for default_failovers = 0
+    let mut vfn_config = NodeConfig::get_default_vfn_config();
+    vfn_config.mempool.default_failovers = 0;
+    let mut swarm = SwarmBuilder::new_local(4)
+        .with_num_fullnodes(4)
+        .with_diem()
+        .with_vfn_config(vfn_config)
+        .build()
+        .await;
     let transaction_factory = swarm.chain_info().transaction_factory();
-    let version = swarm.versions().max().unwrap();
-    let validator_peer_ids = swarm.validators().map(|v| v.peer_id()).collect::<Vec<_>>();
 
-    let validator = validator_peer_ids[1];
-    let vfn = swarm
-        .add_validator_fullnode(
-            &version,
-            NodeConfig::default_for_validator_full_node(),
-            validator,
-        )
-        .await
-        .unwrap();
-
-    for validator in swarm.validators_mut() {
-        validator
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-            .await
-            .unwrap();
-    }
     for fullnode in swarm.full_nodes_mut() {
         fullnode
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
+            .wait_until_healthy(Instant::now() + Duration::from_secs(MAX_HEALTHY_WAIT_SECS))
             .await
             .unwrap();
         fullnode
-            .wait_for_connectivity(Instant::now() + Duration::from_secs(60))
+            .wait_for_connectivity(Instant::now() + Duration::from_secs(MAX_CONNECTIVITY_WAIT_SECS))
             .await
             .unwrap();
     }
 
     // Setup accounts
-    let mut account_0 = create_and_fund_account(&mut swarm, 100).await;
-    let account_1 = create_and_fund_account(&mut swarm, 100).await;
+    let mut account_0 = create_and_fund_account(&mut swarm, 10).await;
+    let account_1 = create_and_fund_account(&mut swarm, 10).await;
 
     swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(10))
+        .wait_for_all_nodes_to_catchup(Duration::from_secs(MAX_CATCH_UP_WAIT_SECS))
         .await
         .unwrap();
 
     // set up client
-    let vfn_client = swarm.full_node(vfn).unwrap().rest_client();
+    let validator_peer_ids = swarm.validators().map(|v| v.peer_id()).collect::<Vec<_>>();
+    let vfn_peer_ids = swarm.full_nodes().map(|v| v.peer_id()).collect::<Vec<_>>();
+    let validator = validator_peer_ids[1];
+    let vfn_client = swarm.full_node(vfn_peer_ids[1]).unwrap().rest_client();
 
     // submit client requests directly to VFN of dead V
     swarm.validator_mut(validator).unwrap().stop();
@@ -179,16 +161,8 @@ async fn test_vfn_failover() {
     )
     .await;
 
-    for _ in 0..8 {
-        transfer_coins_non_blocking(
-            &vfn_client,
-            &transaction_factory,
-            &mut account_0,
-            &account_1,
-            1,
-        )
-        .await;
-    }
+    assert_balance(&vfn_client, &account_0, 9).await;
+    assert_balance(&vfn_client, &account_1, 11).await;
 
     transfer_coins(
         &vfn_client,
@@ -198,23 +172,27 @@ async fn test_vfn_failover() {
         1,
     )
     .await;
+
+    assert_balance(&vfn_client, &account_0, 8).await;
+    assert_balance(&vfn_client, &account_1, 12).await;
 }
 
 #[tokio::test]
 async fn test_private_full_node() {
-    let mut swarm = new_local_swarm(4).await;
+    let mut swarm = local_swarm_with_fullnodes(4, 1).await;
+    let vfn_peer_id = swarm.full_nodes().next().unwrap().peer_id();
+
     let transaction_factory = swarm.chain_info().transaction_factory();
-    let version = swarm.versions().max().unwrap();
 
     // Here we want to add two swarms, a private full node, followed by a user full node connected to it
-    let mut private_config = NodeConfig::default_for_public_full_node();
+    let mut private_config = NodeConfig::get_default_pfn_config();
     let private_network = private_config.full_node_networks.first_mut().unwrap();
     // Disallow public connections
     private_network.max_inbound_connections = 0;
     // Also, we only want it to purposely connect to 1 VFN
     private_network.max_outbound_connections = 1;
 
-    let mut user_config = NodeConfig::default_for_public_full_node();
+    let mut user_config = NodeConfig::get_default_pfn_config();
     let user_network = user_config.full_node_networks.first_mut().unwrap();
     // Disallow fallbacks to VFNs
     user_network.max_outbound_connections = 1;
@@ -229,13 +207,14 @@ async fn test_private_full_node() {
     );
 
     // Now we need to connect the VFNs to the private swarm
+    let version = swarm.versions().max().unwrap();
     add_node_to_seeds(
         &mut private_config,
-        swarm.validators().next().unwrap().config(),
+        swarm.fullnode(vfn_peer_id).unwrap().config(),
         NetworkId::Public,
         PeerRole::PreferredUpstream,
     );
-    let private = swarm.add_full_node(&version, private_config).unwrap();
+    let private = swarm.add_full_node(&version, private_config).await.unwrap();
 
     // And connect the user to the private swarm
     add_node_to_seeds(
@@ -244,10 +223,10 @@ async fn test_private_full_node() {
         NetworkId::Public,
         PeerRole::PreferredUpstream,
     );
-    let user = swarm.add_full_node(&version, user_config).unwrap();
+    let user = swarm.add_full_node(&version, user_config).await.unwrap();
 
     swarm
-        .wait_for_connectivity(Instant::now() + Duration::from_secs(60))
+        .wait_for_connectivity(Instant::now() + Duration::from_secs(MAX_CONNECTIVITY_WAIT_SECS))
         .await
         .unwrap();
 
@@ -273,7 +252,7 @@ async fn test_private_full_node() {
     let account_1 = create_and_fund_account(&mut swarm, 10).await;
 
     swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(60))
+        .wait_for_all_nodes_to_catchup(Duration::from_secs(MAX_CATCH_UP_WAIT_SECS))
         .await
         .unwrap();
 
@@ -321,10 +300,13 @@ fn add_node_to_seeds(
             .iter()
             .find(|protocol| matches!(protocol, Protocol::Tcp(_)))
             .unwrap();
-        let address = NetworkAddress::from(Protocol::Ip4(Ipv4Addr::new(127, 0, 0, 1)))
-            .push(port_protocol.clone())
-            .push(Protocol::NoiseIK(seed_key))
-            .push(Protocol::Handshake(HANDSHAKE_VERSION));
+        let address = NetworkAddress::from_protocols(vec![
+            Protocol::Ip4(Ipv4Addr::new(127, 0, 0, 1)),
+            port_protocol.clone(),
+            Protocol::NoiseIK(seed_key),
+            Protocol::Handshake(HANDSHAKE_VERSION),
+        ])
+        .unwrap();
 
         Peer::new(vec![address], HashSet::new(), peer_role)
     } else {
@@ -335,4 +317,12 @@ fn add_node_to_seeds(
     };
 
     dest_network_config.seeds.insert(seed_peer_id, seed_peer);
+}
+
+async fn local_swarm_with_fullnodes(num_validators: usize, num_fullnodes: usize) -> LocalSwarm {
+    SwarmBuilder::new_local(num_validators)
+        .with_num_fullnodes(num_fullnodes)
+        .with_diem()
+        .build()
+        .await
 }

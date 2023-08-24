@@ -1,6 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
 #![forbid(unsafe_code)]
+
 use std::{
     fmt::Debug,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
@@ -20,12 +23,12 @@ pub struct U32IdGenerator {
 }
 
 impl U32IdGenerator {
-    /// Creates a new [`InOrderIdGenerator`] initialized to `0`
+    /// Creates a new [`U32IdGenerator`] initialized to `0`
     pub const fn new() -> Self {
         Self::new_with_value(0)
     }
 
-    /// Creates a new [`InOrderIdGenerator`] with an `initial_value`
+    /// Creates a new [`U32IdGenerator`] with an `initial_value`
     pub const fn new_with_value(initial_value: u32) -> Self {
         Self {
             inner: AtomicU32::new(initial_value),
@@ -41,18 +44,18 @@ impl IdGenerator<u32> for U32IdGenerator {
 }
 
 /// A generic in order [`IdGenerator`] using an [`AtomicU64`] to guarantee uniqueness
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct U64IdGenerator {
     inner: AtomicU64,
 }
 
 impl U64IdGenerator {
-    /// Creates a new [`InOrderIdGenerator`] initialized to `0`
+    /// Creates a new [`U64IdGenerator`] initialized to `0`
     pub const fn new() -> Self {
         Self::new_with_value(0)
     }
 
-    /// Creates a new [`InOrderIdGenerator`] with an `initial_value`
+    /// Creates a new [`U64IdGenerator`] with an `initial_value`
     pub const fn new_with_value(initial_value: u64) -> Self {
         Self {
             inner: AtomicU64::new(initial_value),

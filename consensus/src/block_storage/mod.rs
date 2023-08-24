@@ -1,19 +1,18 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use consensus_types::{
-    executed_block::ExecutedBlock, quorum_cert::QuorumCert, timeout_certificate::TimeoutCertificate,
+use diem_consensus_types::{
+    executed_block::ExecutedBlock, quorum_cert::QuorumCert, sync_info::SyncInfo,
+    timeout_2chain::TwoChainTimeoutCertificate,
 };
 use diem_crypto::HashValue;
-use std::sync::Arc;
+pub use block_store::{sync_manager::BlockRetriever, BlockStore};
+use std::{sync::Arc, time::Duration};
 
 mod block_store;
 mod block_tree;
 pub mod tracing;
-
-pub use block_store::{sync_manager::BlockRetriever, BlockStore};
-use consensus_types::{sync_info::SyncInfo, timeout_2chain::TwoChainTimeoutCertificate};
-use diem_types::ledger_info::LedgerInfoWithSignatures;
 
 pub trait BlockReader: Send + Sync {
     /// Check if a block with the block_id exist in the BlockTree.
@@ -51,14 +50,17 @@ pub trait BlockReader: Send + Sync {
     fn highest_ordered_cert(&self) -> Arc<QuorumCert>;
 
     /// Return the highest timeout certificate if available.
-    fn highest_timeout_cert(&self) -> Option<Arc<TimeoutCertificate>>;
-
-    /// Return the highest timeout certificate if available.
     fn highest_2chain_timeout_cert(&self) -> Option<Arc<TwoChainTimeoutCertificate>>;
 
-    /// Return the highest commit decision ledger info.
-    fn highest_ledger_info(&self) -> LedgerInfoWithSignatures;
+    /// Return the highest commit decision quorum certificate.
+    fn highest_commit_cert(&self) -> Arc<QuorumCert>;
 
     /// Return the combination of highest quorum cert, timeout cert and commit cert.
     fn sync_info(&self) -> SyncInfo;
+
+    /// Return if the consensus is backpressured
+    fn vote_back_pressure(&self) -> bool;
+
+    // Return time difference between last committed block and new proposal
+    fn pipeline_pending_latency(&self, proposal_timestamp: Duration) -> Duration;
 }

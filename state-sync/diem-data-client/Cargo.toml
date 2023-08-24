@@ -1,42 +1,48 @@
 [package]
 name = "diem-data-client"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
 description = "The Diem data client"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-async-trait = "0.1.42"
-futures = "0.3.12"
-itertools = "0.10.0"
-rand = "0.8.3"
-serde = { version = "1.0.124", default-features = false }
-thiserror = "1.0.24"
-
-diem-config = { path = "../../config" }
-diem-crypto = { path = "../../crates/diem-crypto" }
-diem-id-generator = { path = "../../crates/diem-id-generator" }
-diem-infallible = { path = "../../crates/diem-infallible" }
-diem-logger = { path = "../../crates/diem-logger" }
-diem-metrics = { path = "../../crates/diem-metrics" }
-diem-time-service = { path = "../../crates/diem-time-service", features = ["async"] }
-diem-types = { path = "../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-network = { path = "../../network" }
-storage-service-client = { path = "../storage-service/client" }
-storage-service-types = { path = "../storage-service/types" }
-storage-service-server = { path = "../storage-service/server" }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-id-generator = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-netcore = { workspace = true }
+diem-network = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-storage-service-client = { workspace = true }
+diem-storage-service-types = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-claim = "0.5.0"
-maplit = "1.0.2"
-tokio = { version = "1.8.1", features = ["rt", "macros"], default-features = false }
-
-bcs = "0.1.2"
-channel = { path = "../../crates/channel" }
-diem-time-service = { path = "../../crates/diem-time-service", features = ["async", "testing"] }
-network = { path = "../../network", features = ["fuzzing"] }
+anyhow = { workspace = true }
+diem-channels = { workspace = true }
+diem-network = { workspace = true, features = ["fuzzing"] }
+diem-storage-service-server = { workspace = true }
+diem-time-service = { workspace = true, features = ["async", "testing"] }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+claims = { workspace = true }
+maplit = { workspace = true }
+mockall = { workspace = true }
+tokio = { workspace = true }

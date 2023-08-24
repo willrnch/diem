@@ -1,14 +1,18 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::test_helper::{
-    arb_existent_kvs_and_nonexistent_keys, arb_kv_pair_with_distinct_last_nibble,
-    arb_tree_with_index, test_get_leaf_count, test_get_range_proof, test_get_with_proof,
-    test_get_with_proof_with_distinct_last_nibble, ValueBlob,
+use crate::{
+    node_type::NodeType,
+    test_helper::{
+        arb_existent_kvs_and_nonexistent_keys, arb_kv_pair_with_distinct_last_nibble,
+        arb_tree_with_index, gen_value, test_get_leaf_count, test_get_range_proof,
+        test_get_with_proof, test_get_with_proof_with_distinct_last_nibble, ValueBlob,
+    },
 };
 use diem_crypto::HashValue;
-use diem_types::{nibble::Nibble, transaction::PRE_GENESIS_VERSION};
+use diem_types::nibble::Nibble;
 use mock_tree_store::MockTreeStore;
 use proptest::{collection::hash_set, prelude::*};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -18,11 +22,15 @@ fn update_nibble(original_key: &HashValue, n: usize, nibble: u8) -> HashValue {
     assert!(nibble < 16);
     let mut key = original_key.to_vec();
     key[n / 2] = if n % 2 == 0 {
-        key[n / 2] & 0x0f | nibble << 4
+        key[n / 2] & 0x0F | nibble << 4
     } else {
-        key[n / 2] & 0xf0 | nibble
+        key[n / 2] & 0xF0 | nibble
     };
     HashValue::from_slice(&key).unwrap()
+}
+
+fn gen_leaf(k: HashValue, v: &(HashValue, ValueBlob), version: Version) -> Node<ValueBlob> {
+    LeafNode::new(k, v.0, (v.1.clone(), version)).into()
 }
 
 #[test]
@@ -33,52 +41,32 @@ fn test_insert_to_empty_tree() {
     // Tree is initially empty. Root is a null node. We'll insert a key-value pair which creates a
     // leaf node.
     let key = HashValue::random();
-    let value = ValueBlob::from(vec![1u8, 2u8, 3u8, 4u8]);
+    let state_key = ValueBlob::from(vec![1u8, 2u8, 3u8, 4u8]);
+    let value_hash = HashValue::random();
 
     // batch version
     let (_new_root_hash, batch) = tree
-        .batch_put_value_sets(vec![vec![(key, value.clone())]], None, 0 /* version */)
-        .unwrap();
-    assert!(batch.stale_node_index_batch.is_empty());
-
-    db.write_tree_update_batch(batch).unwrap();
-
-    assert_eq!(tree.get(key, 0).unwrap().unwrap(), value);
-}
-
-#[test]
-fn test_insert_to_pre_genesis() {
-    // Set up DB with pre-genesis state (one single leaf node).
-    let db = MockTreeStore::default();
-    let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
-    let value1 = ValueBlob::from(vec![1u8, 2u8]);
-    let pre_genesis_root_key = NodeKey::new_empty_path(PRE_GENESIS_VERSION);
-    db.put_node(pre_genesis_root_key, Node::new_leaf(key1, value1.clone()))
-        .unwrap();
-
-    // Genesis inserts one more leaf.
-    let tree = JellyfishMerkleTree::new(&db);
-    let key2 = update_nibble(&key1, 0, 15);
-    let value2 = ValueBlob::from(vec![3u8, 4u8]);
-    // batch version
-    let (_root_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key2, value2.clone())]],
-            None,
+        .put_value_set_test(
+            vec![(key, Some(&(value_hash, state_key)))],
             0, /* version */
         )
         .unwrap();
+    assert!(batch
+        .stale_node_index_batch
+        .iter()
+        .flatten()
+        .next()
+        .is_none());
 
-    // Check pre-genesis node prunes okay.
-    assert_eq!(batch.stale_node_index_batch.len(), 1);
     db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(db.num_nodes(), 4);
-    db.purge_stale_nodes(0).unwrap();
-    assert_eq!(db.num_nodes(), 3);
+    assert_eq!(tree.get(key, 0).unwrap().unwrap(), value_hash);
 
-    // Check mixed state reads okay.
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
-    assert_eq!(tree.get(key2, 0).unwrap().unwrap(), value2);
+    let (empty_root_hash, batch) = tree
+        .put_value_set_test(vec![(key, None)], 1 /* version */)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(tree.get(key, 1).unwrap(), None);
+    assert_eq!(empty_root_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH);
 }
 
 #[test]
@@ -87,46 +75,43 @@ fn test_insert_at_leaf_with_internal_created() {
     let tree = JellyfishMerkleTree::new(&db);
 
     let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
-    let value1 = ValueBlob::from(vec![1u8, 2u8]);
+    let value1 = gen_value();
 
-    let (_root0_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key1, value1.clone())]],
-            None,
-            0, /* version */
-        )
+    let (root0_hash, batch) = tree
+        .put_value_set_test(vec![(key1, Some(&value1))], 0 /* version */)
         .unwrap();
 
-    assert!(batch.stale_node_index_batch.is_empty());
+    assert!(batch
+        .stale_node_index_batch
+        .iter()
+        .flatten()
+        .next()
+        .is_none());
     db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
 
     // Insert at the previous leaf node. Should generate an internal node at the root.
     // Change the 1st nibble to 15.
     let key2 = update_nibble(&key1, 0, 15);
-    let value2 = ValueBlob::from(vec![3u8, 4u8]);
+    let value2 = gen_value();
 
     let (_root1_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key2, value2.clone())]],
-            None,
-            1, /* version */
-        )
+        .put_value_set_test(vec![(key2, Some(&value2))], 1 /* version */)
         .unwrap();
-    assert_eq!(batch.stale_node_index_batch.len(), 1);
+    assert_eq!(batch.num_stale_node(), 1);
     db.write_tree_update_batch(batch).unwrap();
 
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
     assert!(tree.get(key2, 0).unwrap().is_none());
-    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2);
+    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2.0);
 
     // get # of nodes
     assert_eq!(db.num_nodes(), 4 /* 1 + 3 */);
 
     let internal_node_key = NodeKey::new_empty_path(1);
 
-    let leaf1 = Node::new_leaf(key1, value1);
-    let leaf2 = Node::new_leaf(key2, value2);
+    let leaf1 = gen_leaf(key1, &value1, 0);
+    let leaf2 = gen_leaf(key2, &value2, 1);
     let mut children = HashMap::new();
     children.insert(
         Nibble::from(0),
@@ -149,6 +134,21 @@ fn test_insert_at_leaf_with_internal_created() {
         leaf2
     );
     assert_eq!(db.get_node(&internal_node_key).unwrap(), internal);
+
+    // Deletion
+    let (root2_hash, batch) = tree
+        .put_value_set_test(vec![(key2, None)], 2 /* version */)
+        .unwrap();
+    assert_eq!(batch.num_stale_node(), 3);
+    db.write_tree_update_batch(batch).unwrap();
+
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
+    assert!(tree.get(key2, 0).unwrap().is_none());
+    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2.0);
+    assert!(tree.get(key2, 2).unwrap().is_none());
+    assert_eq!(root0_hash, root2_hash);
+    // get # of nodes
+    assert_eq!(db.num_nodes(), 5 /* 1 + 3 + 1 */);
 }
 
 #[test]
@@ -158,41 +158,33 @@ fn test_insert_at_leaf_with_multiple_internals_created() {
 
     // 1. Insert the first leaf into empty tree
     let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
-    let value1 = ValueBlob::from(vec![1u8, 2u8]);
+    let value1 = gen_value();
 
     let (_root0_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key1, value1.clone())]],
-            None,
-            0, /* version */
-        )
+        .put_value_set_test(vec![(key1, Some(&value1))], 0 /* version */)
         .unwrap();
     db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
 
     // 2. Insert at the previous leaf node. Should generate a branch node at root.
     // Change the 2nd nibble to 1.
     let key2 = update_nibble(&key1, 1 /* nibble_index */, 1 /* nibble */);
-    let value2 = ValueBlob::from(vec![3u8, 4u8]);
+    let value2 = gen_value();
 
     let (_root1_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key2, value2.clone())]],
-            None,
-            1, /* version */
-        )
+        .put_value_set_test(vec![(key2, Some(&value2))], 1 /* version */)
         .unwrap();
     db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
     assert!(tree.get(key2, 0).unwrap().is_none());
-    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2);
+    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2.0);
 
     assert_eq!(db.num_nodes(), 5);
 
     let internal_node_key = NodeKey::new(1, NibblePath::new_odd(vec![0x00]));
 
-    let leaf1 = Node::new_leaf(key1, value1.clone());
-    let leaf2 = Node::new_leaf(key2, value2.clone());
+    let leaf1 = gen_leaf(key1, &value1, 0);
+    let leaf2 = gen_leaf(key2, &value2, 1);
     let internal = {
         let mut children = HashMap::new();
         children.insert(
@@ -237,18 +229,14 @@ fn test_insert_at_leaf_with_multiple_internals_created() {
     );
 
     // 3. Update leaf2 with new value
-    let value2_update = ValueBlob::from(vec![5u8, 6u8]);
+    let value2_update = gen_value();
     let (_root2_hash, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![(key2, value2_update.clone())]],
-            None,
-            2, /* version */
-        )
+        .put_value_set_test(vec![(key2, Some(&value2_update))], 2 /* version */)
         .unwrap();
     db.write_tree_update_batch(batch).unwrap();
     assert!(tree.get(key2, 0).unwrap().is_none());
-    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2);
-    assert_eq!(tree.get(key2, 2).unwrap().unwrap(), value2_update);
+    assert_eq!(tree.get(key2, 1).unwrap().unwrap(), value2.0);
+    assert_eq!(tree.get(key2, 2).unwrap().unwrap(), value2_update.0);
 
     // Get # of nodes.
     assert_eq!(db.num_nodes(), 8);
@@ -258,8 +246,19 @@ fn test_insert_at_leaf_with_multiple_internals_created() {
     assert_eq!(db.num_nodes(), 7);
     db.purge_stale_nodes(2).unwrap();
     assert_eq!(db.num_nodes(), 4);
-    assert_eq!(tree.get(key1, 2).unwrap().unwrap(), value1);
-    assert_eq!(tree.get(key2, 2).unwrap().unwrap(), value2_update);
+    assert_eq!(tree.get(key1, 2).unwrap().unwrap(), value1.0);
+    assert_eq!(tree.get(key2, 2).unwrap().unwrap(), value2_update.0);
+
+    // 4. Delete leaf2
+    let (_root2_hash, batch) = tree
+        .put_value_set_test(vec![(key2, None)], 3 /* version */)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    // Get # of nodes.
+    assert_eq!(db.num_nodes(), 5);
+    db.purge_stale_nodes(3).unwrap();
+    assert_eq!(db.num_nodes(), 1);
+    assert_eq!(tree.get(key1, 3).unwrap().unwrap(), value1.0);
 }
 
 #[test]
@@ -282,32 +281,32 @@ fn test_batch_insertion() {
     // Total: 12 nodes
     // ```
     let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
-    let value1 = ValueBlob::from(vec![1u8]);
+    let value1 = gen_value();
 
     let key2 = update_nibble(&key1, 0, 2);
-    let value2 = ValueBlob::from(vec![2u8]);
-    let value2_update = ValueBlob::from(vec![22u8]);
+    let value2 = gen_value();
+    let value2_update = gen_value();
 
     let key3 = update_nibble(&key1, 1, 3);
-    let value3 = ValueBlob::from(vec![3u8]);
+    let value3 = gen_value();
 
     let key4 = update_nibble(&key1, 1, 4);
-    let value4 = ValueBlob::from(vec![4u8]);
+    let value4 = gen_value();
 
     let key5 = update_nibble(&key1, 5, 5);
-    let value5 = ValueBlob::from(vec![5u8]);
+    let value5 = gen_value();
 
     let key6 = update_nibble(&key1, 3, 6);
-    let value6 = ValueBlob::from(vec![6u8]);
+    let value6 = gen_value();
 
     let batches = vec![
-        vec![(key1, value1)],
-        vec![(key2, value2)],
-        vec![(key3, value3)],
-        vec![(key4, value4)],
-        vec![(key5, value5)],
-        vec![(key6, value6)],
-        vec![(key2, value2_update)],
+        vec![(key1, Some(&value1))],
+        vec![(key2, Some(&value2))],
+        vec![(key3, Some(&value3))],
+        vec![(key4, Some(&value4))],
+        vec![(key5, Some(&value5))],
+        vec![(key6, Some(&value6))],
+        vec![(key2, Some(&value2_update))],
     ];
     let one_batch = batches.iter().flatten().cloned().collect::<Vec<_>>();
 
@@ -318,7 +317,7 @@ fn test_batch_insertion() {
                      version: Version| {
         to_verify
             .iter()
-            .for_each(|(k, v)| assert_eq!(tree.get(*k, version).unwrap().unwrap(), *v))
+            .for_each(|(k, v)| assert_eq!(tree.get(*k, version).unwrap().unwrap(), v.unwrap().0))
     };
 
     // Insert as one batch and update one by one.
@@ -326,7 +325,7 @@ fn test_batch_insertion() {
         let db = MockTreeStore::default();
         let tree = JellyfishMerkleTree::new(&db);
 
-        let (_root, batch) = tree.put_value_set(one_batch, 0 /* version */).unwrap();
+        let (_root, batch) = tree.put_value_set_test(one_batch, 0 /* version */).unwrap();
         db.write_tree_update_batch(batch).unwrap();
         verify_fn(&tree, 0);
 
@@ -339,10 +338,10 @@ fn test_batch_insertion() {
         let db = MockTreeStore::default();
         let tree = JellyfishMerkleTree::new(&db);
 
-        let (_roots, batch) = tree
-            .batch_put_value_sets(batches, None, 0 /* first_version */)
-            .unwrap();
-        db.write_tree_update_batch(batch).unwrap();
+        for (idx, kvs) in batches.into_iter().enumerate() {
+            let (_roots, batch) = tree.put_value_set_test(kvs, idx as Version).unwrap();
+            db.write_tree_update_batch(batch).unwrap();
+        }
         verify_fn(&tree, 6);
 
         // get # of nodes
@@ -440,6 +439,106 @@ fn test_batch_insertion() {
 }
 
 #[test]
+fn test_deletion() {
+    // ```text
+    //                             internal(root)
+    //                            /        \
+    //                       internal       2        <- nibble 0
+    //                      /   |   \
+    //              internal    3    4               <- nibble 1
+    //                 |
+    //              internal                         <- nibble 2
+    //              /      \
+    //        internal      6                        <- nibble 3
+    //           |
+    //        internal                               <- nibble 4
+    //        /      \
+    //       1        5                              <- nibble 5
+    //
+    // Total: 12 nodes
+    // ```
+    let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
+    let value1 = gen_value();
+
+    let key2 = update_nibble(&key1, 0, 2);
+    let value2 = gen_value();
+
+    let key3 = update_nibble(&key1, 1, 3);
+    let value3 = gen_value();
+
+    let key4 = update_nibble(&key1, 1, 4);
+    let value4 = gen_value();
+
+    let key5 = update_nibble(&key1, 5, 5);
+    let value5 = gen_value();
+
+    let key6 = update_nibble(&key1, 3, 6);
+    let value6 = gen_value();
+
+    let batches = vec![
+        vec![(key1, Some(&value1))],
+        vec![(key2, Some(&value2))],
+        vec![(key3, Some(&value3))],
+        vec![(key4, Some(&value4))],
+        vec![(key5, Some(&value5))],
+        vec![(key6, Some(&value6))],
+    ];
+    let db = MockTreeStore::default();
+    let tree = JellyfishMerkleTree::new(&db);
+    let mut idx = batches.len() as u64;
+
+    for (idx, kvs) in batches.into_iter().enumerate() {
+        let (_roots, batch) = tree.put_value_set_test(kvs, idx as Version).unwrap();
+        db.write_tree_update_batch(batch).unwrap();
+    }
+    db.purge_stale_nodes(6).unwrap();
+    assert_eq!(db.num_nodes(), 12);
+
+    // Delete key3
+    let (_roots, batch) = tree
+        .put_value_set_test(vec![(key3, None)], idx as Version)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(db.num_nodes(), 14 /* 12 + 2 */);
+    db.purge_stale_nodes(idx).unwrap();
+    assert_eq!(db.num_nodes(), 11);
+
+    idx += 1;
+    // Delete key1
+    let (_roots, batch) = tree
+        .put_value_set_test(vec![(key1, None)], idx as Version)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(db.num_nodes(), 16 /* 11 + 5 */);
+    db.purge_stale_nodes(idx).unwrap();
+    assert_eq!(db.num_nodes(), 8);
+
+    idx += 1;
+    // Delete key5, key6 and key4
+    let (_roots, batch) = tree
+        .put_value_set_test(
+            vec![(key4, None), (key5, None), (key6, None)],
+            idx as Version,
+        )
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(db.num_nodes(), 9 /* 8 + 1 */);
+    db.purge_stale_nodes(idx).unwrap();
+    assert_eq!(db.num_nodes(), 1);
+
+    idx += 1;
+    // Delete key2
+    let (root, batch) = tree
+        .put_value_set_test(vec![(key2, None)], idx as Version)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(db.num_nodes(), 2 /* 1 + 1 */);
+    db.purge_stale_nodes(idx).unwrap();
+    assert_eq!(db.num_nodes(), 1);
+    assert_eq!(root, *SPARSE_MERKLE_PLACEHOLDER_HASH);
+}
+
+#[test]
 fn test_non_existence() {
     let db = MockTreeStore::default();
     let tree = JellyfishMerkleTree::new(&db);
@@ -454,29 +553,28 @@ fn test_non_existence() {
     // Total: 7 nodes
     // ```
     let key1 = HashValue::new([0x00u8; HashValue::LENGTH]);
-    let value1 = ValueBlob::from(vec![1u8]);
+    let value1 = gen_value();
 
     let key2 = update_nibble(&key1, 0, 15);
-    let value2 = ValueBlob::from(vec![2u8]);
+    let value2 = gen_value();
 
     let key3 = update_nibble(&key1, 2, 3);
-    let value3 = ValueBlob::from(vec![3u8]);
+    let value3 = gen_value();
 
-    let (roots, batch) = tree
-        .batch_put_value_sets(
-            vec![vec![
-                (key1, value1.clone()),
-                (key2, value2.clone()),
-                (key3, value3.clone()),
-            ]],
-            None,
+    let (root, batch) = tree
+        .put_value_set_test(
+            vec![
+                (key1, Some(&value1)),
+                (key2, Some(&value2)),
+                (key3, Some(&value3)),
+            ],
             0, /* version */
         )
         .unwrap();
     db.write_tree_update_batch(batch).unwrap();
-    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1);
-    assert_eq!(tree.get(key2, 0).unwrap().unwrap(), value2);
-    assert_eq!(tree.get(key3, 0).unwrap().unwrap(), value3);
+    assert_eq!(tree.get(key1, 0).unwrap().unwrap(), value1.0);
+    assert_eq!(tree.get(key2, 0).unwrap().unwrap(), value2.0);
+    assert_eq!(tree.get(key3, 0).unwrap().unwrap(), value3.0);
     // get # of nodes
     assert_eq!(db.num_nodes(), 6);
 
@@ -486,21 +584,21 @@ fn test_non_existence() {
         let non_existing_key = update_nibble(&key1, 0, 1);
         let (value, proof) = tree.get_with_proof(non_existing_key, 0).unwrap();
         assert_eq!(value, None);
-        assert!(proof.verify(roots[0], non_existing_key, None).is_ok());
+        assert!(proof.verify_by_hash(root, non_existing_key, None).is_ok());
     }
     // 2. Non-existing node at non-root internal node
     {
         let non_existing_key = update_nibble(&key1, 1, 15);
         let (value, proof) = tree.get_with_proof(non_existing_key, 0).unwrap();
         assert_eq!(value, None);
-        assert!(proof.verify(roots[0], non_existing_key, None).is_ok());
+        assert!(proof.verify_by_hash(root, non_existing_key, None).is_ok());
     }
     // 3. Non-existing node at leaf node
     {
         let non_existing_key = update_nibble(&key1, 2, 4);
         let (value, proof) = tree.get_with_proof(non_existing_key, 0).unwrap();
         assert_eq!(value, None);
-        assert!(proof.verify(roots[0], non_existing_key, None).is_ok());
+        assert!(proof.verify_by_hash(root, non_existing_key, None).is_ok());
     }
 }
 
@@ -517,59 +615,6 @@ fn test_missing_root() {
     assert_eq!(err.version, 0);
 }
 
-#[test]
-fn test_put_value_sets() {
-    let mut keys = vec![];
-    let mut values = vec![];
-    let total_updates = 20;
-    for _i in 0..total_updates {
-        keys.push(HashValue::random());
-        values.push(ValueBlob::from(HashValue::random().to_vec()));
-    }
-
-    let mut root_hashes_one_by_one = vec![];
-    let mut batch_one_by_one = TreeUpdateBatch::default();
-    {
-        let mut iter = keys.clone().into_iter().zip(values.clone().into_iter());
-        let db = MockTreeStore::default();
-        let tree = JellyfishMerkleTree::new(&db);
-        for version in 0..10 {
-            let mut keyed_value_set = vec![];
-            for _ in 0..total_updates / 10 {
-                keyed_value_set.push(iter.next().unwrap());
-            }
-            let (root, batch) = tree
-                .put_value_set(keyed_value_set, version as Version)
-                .unwrap();
-            db.write_tree_update_batch(batch.clone()).unwrap();
-            root_hashes_one_by_one.push(root);
-            batch_one_by_one.node_batch.extend(batch.node_batch);
-            batch_one_by_one
-                .stale_node_index_batch
-                .extend(batch.stale_node_index_batch);
-            batch_one_by_one.node_stats.extend(batch.node_stats);
-        }
-    }
-    {
-        let mut iter = keys.into_iter().zip(values.into_iter());
-        let db = MockTreeStore::default();
-        let tree = JellyfishMerkleTree::new(&db);
-        let mut value_sets = vec![];
-        for _ in 0..10 {
-            let mut keyed_value_set = vec![];
-            for _ in 0..total_updates / 10 {
-                keyed_value_set.push(iter.next().unwrap());
-            }
-            value_sets.push(keyed_value_set);
-        }
-        let (root_hashes, batch) = tree
-            .batch_put_value_sets(value_sets, None, 0 /* version */)
-            .unwrap();
-        assert_eq!(root_hashes, root_hashes_one_by_one);
-        assert_eq!(batch, batch_one_by_one);
-    }
-}
-
 fn many_keys_get_proof_and_verify_tree_root(seed: &[u8], num_keys: usize) {
     assert!(seed.len() < 32);
     let mut actual_seed = [0u8; 32];
@@ -580,21 +625,79 @@ fn many_keys_get_proof_and_verify_tree_root(seed: &[u8], num_keys: usize) {
     let tree = JellyfishMerkleTree::new(&db);
 
     let mut kvs = vec![];
-    for _i in 0..num_keys {
+
+    let values: Vec<_> = (0..num_keys).map(|_i| gen_value()).collect();
+
+    for (index, _) in values.iter().enumerate() {
         let key = HashValue::random_with_rng(&mut rng);
-        let value = ValueBlob::from(HashValue::random_with_rng(&mut rng).to_vec());
-        kvs.push((key, value));
+        kvs.push((key, Some(&values[index])));
     }
 
-    let (roots, batch) = tree
-        .batch_put_value_sets(vec![kvs.clone()], None, 0 /* version */)
+    let (root, batch) = tree
+        .put_value_set_test(kvs.clone(), 0 /* version */)
         .unwrap();
     db.write_tree_update_batch(batch).unwrap();
 
     for (k, v) in &kvs {
         let (value, proof) = tree.get_with_proof(*k, 0).unwrap();
-        assert_eq!(value.unwrap(), *v);
-        assert!(proof.verify(roots[0], *k, Some(v)).is_ok());
+        assert_eq!(value.as_ref().unwrap().0, v.unwrap().0);
+        assert_eq!(value.as_ref().unwrap().1 .0, v.unwrap().1);
+        assert!(proof.verify_by_hash(root, *k, v.map(|x| x.0)).is_ok());
+    }
+}
+
+fn many_keys_deletion(seed: &[u8], num_keys: usize) {
+    assert!(seed.len() < 32);
+    let mut actual_seed = [0u8; 32];
+    actual_seed[..seed.len()].copy_from_slice(seed);
+    let mut rng: StdRng = StdRng::from_seed(actual_seed);
+
+    let db = MockTreeStore::default();
+    let tree = JellyfishMerkleTree::new(&db);
+
+    let mut first_batch = vec![];
+
+    let values: Vec<_> = (0..2 * num_keys).map(|_i| gen_value()).collect();
+
+    for (index, _) in values.iter().enumerate() {
+        let key = HashValue::random_with_rng(&mut rng);
+        first_batch.push((key, Some(&values[index])));
+    }
+
+    let mut second_batch = first_batch[..num_keys]
+        .iter()
+        .map(|(k, _)| (*k, None))
+        .collect::<Vec<_>>();
+
+    let values: Vec<_> = (0..num_keys).map(|_i| gen_value()).collect();
+    for (index, _) in values.iter().enumerate() {
+        let key = HashValue::random_with_rng(&mut rng);
+        second_batch.push((key, Some(&values[index])));
+    }
+
+    let (_root, batch) = tree
+        .put_value_set_test(first_batch.clone(), 0 /* version */)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    let (root, batch) = tree
+        .put_value_set_test(second_batch.clone(), 1 /* version */)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+
+    for (k, v) in first_batch[num_keys..]
+        .iter()
+        .chain(second_batch[num_keys..].iter())
+    {
+        let (value, proof) = tree.get_with_proof(*k, 1).unwrap();
+        assert_eq!(value.as_ref().unwrap().0, v.unwrap().0);
+        assert_eq!(value.as_ref().unwrap().1 .0, v.unwrap().1);
+        assert!(proof.verify_by_hash(root, *k, v.map(|x| x.0)).is_ok());
+    }
+
+    for (k, _v) in first_batch[0..num_keys].iter() {
+        let (value, proof) = tree.get_with_proof(*k, 1).unwrap();
+        assert!(value.is_none());
+        assert!(proof.verify_by_hash(root, *k, None).is_ok());
     }
 }
 
@@ -602,6 +705,12 @@ fn many_keys_get_proof_and_verify_tree_root(seed: &[u8], num_keys: usize) {
 fn test_1000_keys() {
     let seed: &[_] = &[1, 2, 3, 4];
     many_keys_get_proof_and_verify_tree_root(seed, 1000);
+}
+
+#[test]
+fn test_2000_keys_deletion() {
+    let seed: &[_] = &[1, 2, 3, 4];
+    many_keys_deletion(seed, 2000);
 }
 
 fn many_versions_get_proof_and_verify_tree_root(seed: &[u8], num_versions: usize) {
@@ -616,18 +725,20 @@ fn many_versions_get_proof_and_verify_tree_root(seed: &[u8], num_versions: usize
     let mut kvs = vec![];
     let mut roots = vec![];
 
-    for _i in 0..num_versions {
+    let values: Vec<_> = (0..num_versions).map(|_i| gen_value()).collect();
+
+    let new_values: Vec<_> = (0..num_versions).map(|_i| gen_value()).collect();
+
+    for i in 0..num_versions {
         let key = HashValue::random_with_rng(&mut rng);
-        let value = ValueBlob::from(HashValue::random_with_rng(&mut rng).to_vec());
-        let new_value = ValueBlob::from(HashValue::random_with_rng(&mut rng).to_vec());
-        kvs.push((key, value.clone(), new_value.clone()));
+        kvs.push((key, Some(&values[i]), Some(&new_values[i])));
     }
 
     for (idx, kvs) in kvs.iter().enumerate() {
         let (root, batch) = tree
-            .batch_put_value_sets(vec![vec![(kvs.0, kvs.1.clone())]], None, idx as Version)
+            .put_value_set_test(vec![(kvs.0, kvs.1)], idx as Version)
             .unwrap();
-        roots.push(root[0]);
+        roots.push(root);
         db.write_tree_update_batch(batch).unwrap();
     }
 
@@ -635,24 +746,30 @@ fn many_versions_get_proof_and_verify_tree_root(seed: &[u8], num_versions: usize
     for (idx, kvs) in kvs.iter().enumerate() {
         let version = (num_versions + idx) as Version;
         let (root, batch) = tree
-            .batch_put_value_sets(vec![vec![(kvs.0, kvs.2.clone())]], None, version)
+            .put_value_set_test(vec![(kvs.0, kvs.2)], version)
             .unwrap();
-        roots.push(root[0]);
+        roots.push(root);
         db.write_tree_update_batch(batch).unwrap();
     }
 
     for (i, (k, v, _)) in kvs.iter().enumerate() {
-        let random_version = rng.gen_range(i..i + num_versions);
+        let random_version = rng.gen_range(i, i + num_versions);
         let (value, proof) = tree.get_with_proof(*k, random_version as Version).unwrap();
-        assert_eq!(value.unwrap(), *v);
-        assert!(proof.verify(roots[random_version], *k, Some(v)).is_ok());
+        assert_eq!(value.as_ref().unwrap().0, v.unwrap().0);
+        assert_eq!(value.as_ref().unwrap().1 .0, v.unwrap().1);
+        assert!(proof
+            .verify_by_hash(roots[random_version], *k, v.map(|x| x.0))
+            .is_ok());
     }
 
     for (i, (k, _, v)) in kvs.iter().enumerate() {
-        let random_version = rng.gen_range(i + num_versions..2 * num_versions);
+        let random_version = rng.gen_range(i + num_versions, 2 * num_versions);
         let (value, proof) = tree.get_with_proof(*k, random_version as Version).unwrap();
-        assert_eq!(value.unwrap(), *v);
-        assert!(proof.verify(roots[random_version], *k, Some(v)).is_ok());
+        assert_eq!(value.as_ref().unwrap().0, v.unwrap().0);
+        assert_eq!(value.as_ref().unwrap().1 .0, v.unwrap().1);
+        assert!(proof
+            .verify_by_hash(roots[random_version], *k, v.map(|x| x.0))
+            .is_ok());
     }
 }
 
@@ -681,7 +798,7 @@ proptest! {
     }
 
     #[test]
-    fn proptest_get_leaf_count(keys in hash_set(any::<HashValue>(), 1..1000)) {
+    fn proptest_get_leaf_count(keys in hash_set(any::<HashValue>(), 3..2000)) {
         test_get_leaf_count(keys)
     }
 }

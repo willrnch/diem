@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -9,12 +10,12 @@ use crate::{
 use diem_crypto::hash::HashValue;
 use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
 use diem_types::{
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
 };
 use mirai_annotations::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub enum BlockType {
@@ -23,13 +24,22 @@ pub enum BlockType {
         payload: Payload,
         /// Author of the block that can be validated by the author's public key and the signature
         author: Author,
+        /// Failed authors from the parent's block to this block.
+        /// I.e. the list of consecutive proposers from the
+        /// immediately preceeding rounds that didn't produce a successful block.
+        failed_authors: Vec<(Round, Author)>,
     },
     /// NIL blocks don't have authors or signatures: they're generated upon timeouts to fill in the
     /// gaps in the rounds.
-    NilBlock,
+    NilBlock {
+        /// Failed authors from the parent's block to this block (including this block)
+        /// I.e. the list of consecutive proposers from the
+        /// immediately preceeding rounds that didn't produce a successful block.
+        failed_authors: Vec<(Round, Author)>,
+    },
     /// A genesis block is the first committed block in any epoch that is identically constructed on
     /// all validators by any (potentially different) LedgerInfo that justifies the epoch change
-    /// from the previous epoch.  The genesis block is used as the the first root block of the
+    /// from the previous epoch.  The genesis block is used as the first root block of the
     /// BlockTree for all epochs.
     Genesis,
 }
@@ -113,7 +123,19 @@ impl BlockData {
     }
 
     pub fn is_nil_block(&self) -> bool {
-        matches!(self.block_type, BlockType::NilBlock)
+        matches!(self.block_type, BlockType::NilBlock { .. })
+    }
+
+    /// the list of consecutive proposers from the immediately preceeding
+    /// rounds that didn't produce a successful block
+    pub fn failed_authors(&self) -> Option<&Vec<(Round, Author)>> {
+        match self.block_type {
+            BlockType::Proposal {
+                ref failed_authors, ..
+            } => Some(failed_authors),
+            BlockType::NilBlock { ref failed_authors } => Some(failed_authors),
+            BlockType::Genesis => None,
+        }
     }
 
     pub fn new_genesis_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
@@ -134,7 +156,7 @@ impl BlockData {
             VoteData::new(ancestor.clone(), ancestor.clone()),
             LedgerInfoWithSignatures::new(
                 LedgerInfo::new(ancestor, HashValue::zero()),
-                BTreeMap::new(),
+                AggregateSignature::empty(),
             ),
         );
 
@@ -170,7 +192,11 @@ impl BlockData {
         }
     }
 
-    pub fn new_nil(round: Round, quorum_cert: QuorumCert) -> Self {
+    pub fn new_nil(
+        round: Round,
+        quorum_cert: QuorumCert,
+        failed_authors: Vec<(Round, Author)>,
+    ) -> Self {
         // We want all the NIL blocks to agree on the timestamps even though they're generated
         // independently by different validators, hence we're using the timestamp of a parent + 1.
         assume!(quorum_cert.certified_block().timestamp_usecs() < u64::max_value()); // unlikely to be false in this universe
@@ -181,13 +207,14 @@ impl BlockData {
             round,
             timestamp_usecs,
             quorum_cert,
-            block_type: BlockType::NilBlock,
+            block_type: BlockType::NilBlock { failed_authors },
         }
     }
 
     pub fn new_proposal(
         payload: Payload,
         author: Author,
+        failed_authors: Vec<(Round, Author)>,
         round: Round,
         timestamp_usecs: u64,
         quorum_cert: QuorumCert,
@@ -197,7 +224,11 @@ impl BlockData {
             round,
             timestamp_usecs,
             quorum_cert,
-            block_type: BlockType::Proposal { payload, author },
+            block_type: BlockType::Proposal {
+                payload,
+                author,
+                failed_authors,
+            },
         }
     }
 
@@ -229,10 +260,16 @@ fn test_reconfiguration_suffix() {
                 BlockInfo::genesis(HashValue::random(), ValidatorSet::empty()),
                 HashValue::zero(),
             ),
-            BTreeMap::new(),
+            AggregateSignature::empty(),
         ),
     );
-    let reconfig_suffix_block =
-        BlockData::new_proposal(vec![], AccountAddress::random(), 2, 2, quorum_cert);
+    let reconfig_suffix_block = BlockData::new_proposal(
+        Payload::empty(false),
+        AccountAddress::random(),
+        Vec::new(),
+        2,
+        2,
+        quorum_cert,
+    );
     assert!(reconfig_suffix_block.is_reconfiguration_suffix());
 }

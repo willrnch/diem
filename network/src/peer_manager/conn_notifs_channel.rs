@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! `conn_notifs_channel` is a channel which delivers to the receiver only the last of N
@@ -9,7 +10,7 @@
 //! and `conn_notifs_channel::Sender` which behave similarly to existing mpsc data structures.
 
 use crate::peer_manager::ConnectionNotification;
-use channel::{diem_channel, message_queues::QueueStyle};
+use diem_channels::{diem_channel, message_queues::QueueStyle};
 use diem_types::PeerId;
 
 pub type Sender = diem_channel::Sender<PeerId, ConnectionNotification>;

@@ -1,37 +1,65 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    smoke_test_environment::new_local_swarm,
+    smoke_test_environment::SwarmBuilder,
     storage::{db_backup, db_restore},
     test_utils::{
-        assert_balance, create_and_fund_account,
-        diem_swarm_utils::{create_root_storage, insert_waypoint},
-        transfer_coins,
+        check_create_mint_transfer_node, swarm_utils::insert_waypoint, MAX_CATCH_UP_WAIT_SECS,
+        MAX_CONNECTIVITY_WAIT_SECS, MAX_HEALTHY_WAIT_SECS,
     },
     workspace_builder,
     workspace_builder::workspace_root,
 };
 use anyhow::anyhow;
-use diem_operational_tool::test_helper::OperationalTool;
+use diem_config::config::{InitialSafetyRulesConfig, NodeConfig};
+use diem_forge::{get_highest_synced_version, LocalNode, Node, NodeExt, SwarmExt, Validator};
+use diem_logger::prelude::*;
 use diem_temppath::TempPath;
-use diem_transaction_builder::stdlib::encode_remove_validator_and_reconfigure_script;
-use diem_types::{
-    account_config::diem_root_address,
-    transaction::{Transaction, WriteSetPayload},
-    waypoint::Waypoint,
-};
-use forge::{Node, NodeExt, Swarm, SwarmExt};
+use diem_types::{transaction::Transaction, waypoint::Waypoint};
+use move_core_types::language_storage::CORE_CODE_ADDRESS;
 use regex::Regex;
 use std::{
     fs,
-    fs::File,
-    io::Write,
     path::PathBuf,
     process::Command,
     str::FromStr,
     time::{Duration, Instant},
 };
+
+fn update_node_config_restart(validator: &mut LocalNode, mut config: NodeConfig) {
+    validator.stop();
+    let node_path = validator.config_path();
+    config.save_to_path(node_path).unwrap();
+    validator.start().unwrap();
+}
+
+async fn wait_for_node(validator: &mut dyn Validator, expected_to_connect: usize) {
+    let healthy_deadline = Instant::now()
+        .checked_add(Duration::from_secs(MAX_HEALTHY_WAIT_SECS))
+        .unwrap();
+    validator
+        .wait_until_healthy(healthy_deadline)
+        .await
+        .unwrap_or_else(|err| {
+            let lsof_output = Command::new("lsof").arg("-i").output().unwrap();
+            panic!(
+                "wait_until_healthy failed. lsof -i: {:?}: {}",
+                lsof_output, err
+            );
+        });
+    info!("Validator restart health check passed");
+
+    let connectivity_deadline = Instant::now()
+        .checked_add(Duration::from_secs(MAX_CONNECTIVITY_WAIT_SECS))
+        .unwrap();
+    validator
+        .wait_for_connectivity(expected_to_connect, connectivity_deadline)
+        .await
+        .unwrap();
+    info!("Validator restart connectivity check passed");
+}
 
 #[tokio::test]
 /// This test verifies the flow of a genesis transaction after the chain starts.
@@ -40,202 +68,174 @@ use std::{
 /// 3. Test the nodes and clients resume working after updating waypoint
 /// 4. Test a node lagging behind can sync to the waypoint
 async fn test_genesis_transaction_flow() {
+    let db_bootstrapper = workspace_builder::get_bin("diem-db-bootstrapper");
+    let diem_cli = workspace_builder::get_bin("diem");
+
     // prebuild tools.
-    let db_bootstrapper = workspace_builder::get_bin("db-bootstrapper");
-    workspace_builder::get_bin("db-backup");
-    workspace_builder::get_bin("db-restore");
-    workspace_builder::get_bin("db-backup-verify");
+    workspace_builder::get_bin("diem-db-tool");
 
-    let mut swarm = new_local_swarm(4).await;
-    let chain_id = swarm.chain_id();
-    let transaction_factory = swarm.chain_info().transaction_factory();
-    let validator_peer_ids = swarm.validators().map(|v| v.peer_id()).collect::<Vec<_>>();
+    println!("0. pre-building finished.");
 
-    println!("1. Set sync_only = true for the first node and check it can sync to others");
-    let node_to_kill = validator_peer_ids[3];
-    let node_config_path = swarm.validator(node_to_kill).unwrap().config_path();
-    let mut node_config = swarm.validator(node_to_kill).unwrap().config().clone();
-    node_config.consensus.sync_only = true;
-    node_config.save(&node_config_path).unwrap();
+    let num_nodes = 5;
+    let (mut env, cli, _) = SwarmBuilder::new_local(num_nodes)
+        .with_diem()
+        .build_with_cli(0)
+        .await;
 
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .restart()
+    println!("1. Set sync_only = true for the last node and check it can sync to others");
+    let node = env.validators_mut().nth(4).unwrap();
+    let mut new_config = node.config().clone();
+    new_config.consensus.sync_only = true;
+    update_node_config_restart(node, new_config.clone());
+    wait_for_node(node, num_nodes - 1).await;
+    // wait for some versions
+    env.wait_for_all_nodes_to_catchup_to_version(10, Duration::from_secs(MAX_CATCH_UP_WAIT_SECS))
         .await
         .unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-        .await
-        .unwrap();
-
-    let mut account_0 = create_and_fund_account(&mut swarm, 10).await;
-    let account_1 = create_and_fund_account(&mut swarm, 10).await;
 
     println!("2. Set sync_only = true for all nodes and restart");
-    for validator in swarm.validators_mut() {
-        let mut node_config = validator.config().clone();
+    for node in env.validators_mut() {
+        let mut node_config = node.config().clone();
         node_config.consensus.sync_only = true;
-        node_config.save(validator.config_path()).unwrap();
-        validator.restart().await.unwrap();
-        validator
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-            .await
-            .unwrap();
+        update_node_config_restart(node, node_config);
+        wait_for_node(node, num_nodes - 1).await;
     }
 
     println!("3. delete one node's db and test they can still sync when sync_only is true for every nodes");
-    swarm.validator_mut(node_to_kill).unwrap().stop();
-    fs::remove_dir_all(node_config.storage.dir()).unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .restart()
-        .await
-        .unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .wait_until_healthy(Instant::now() + Duration::from_secs(10))
+    let node = env.validators_mut().nth(3).unwrap();
+    node.stop();
+    node.clear_storage().await.unwrap();
+    node.start().unwrap();
+
+    println!("4. verify all nodes are at the same round and no progress being made");
+    env.wait_for_all_nodes_to_catchup(Duration::from_secs(MAX_CATCH_UP_WAIT_SECS))
         .await
         .unwrap();
 
-    println!("4. verify all nodes are at the same round and no progress being made in 5 sec");
-    swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(60))
-        .await
-        .unwrap();
-
-    let mut known_round = None;
-    for i in 0..5 {
-        for validator in swarm.validators() {
-            let round = validator
-                .get_metric("diem_consensus_current_round{}")
-                .await
-                .unwrap()
-                .unwrap();
-            match known_round {
-                Some(r) if r != round => panic!(
-                    "round not equal, last known: {}, node {} is {}",
-                    r,
-                    validator.name(),
-                    round,
-                ),
-                None => known_round = Some(round),
-                _ => continue,
-            }
-        }
-        println!(
-            "The last know round after {} sec is {}",
-            i,
-            known_round.unwrap()
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    println!("5. kill nodes and prepare a genesis txn to remove the last validator");
+    for node in env.validators_mut().take(3) {
+        node.stop();
     }
 
-    println!("5. kill all nodes and prepare a genesis txn to remove validator 0");
-    let validator_address = node_config.validator_network.as_ref().unwrap().peer_id();
-    let op_tool = OperationalTool::new(
-        swarm
-            .validator(node_to_kill)
-            .unwrap()
-            .json_rpc_endpoint()
-            .to_string(),
-        chain_id,
+    let first_validator_address = env
+        .validators()
+        .nth(4)
+        .unwrap()
+        .config()
+        .get_peer_id()
+        .unwrap();
+
+    let script = format!(
+        r#"
+        script {{
+            use diem_framework::stake;
+            use diem_framework::diem_governance;
+            use diem_framework::block;
+
+            fun main(vm_signer: &signer, framework_signer: &signer) {{
+                stake::remove_validators(framework_signer, &vector[@0x{:?}]);
+                block::emit_writeset_block_event(vm_signer, @0x1);
+                diem_governance::reconfigure(framework_signer);
+            }}
+    }}
+    "#,
+        first_validator_address
     );
-    let diem_root = create_root_storage(&mut swarm);
-    let config = op_tool
-        .validator_config(validator_address, Some(&diem_root))
-        .unwrap();
-    let name = config.name.as_bytes().to_vec();
 
-    for validator in swarm.validators_mut() {
-        validator.stop()
-    }
-    let genesis_transaction = Transaction::GenesisTransaction(WriteSetPayload::Script {
-        execute_as: diem_root_address(),
-        script: encode_remove_validator_and_reconfigure_script(0, name, validator_address),
-    });
-    let genesis_path = TempPath::new();
-    genesis_path.create_as_file().unwrap();
-    let mut file = File::create(genesis_path.path()).unwrap();
-    file.write_all(&bcs::to_bytes(&genesis_transaction).unwrap())
+    let temp_script_path = TempPath::new();
+    let mut move_script_path = temp_script_path.path().to_path_buf();
+    move_script_path.set_extension("move");
+
+    fs::write(move_script_path.as_path(), script).unwrap();
+
+    let genesis_blob_path = TempPath::new();
+    genesis_blob_path.create_as_file().unwrap();
+
+    let framework_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("diem-move")
+        .join("framework")
+        .join("diem-framework");
+
+    Command::new(diem_cli.as_path())
+        .current_dir(workspace_root())
+        .args(&vec![
+            "genesis",
+            "generate-admin-write-set",
+            "--output-file",
+            genesis_blob_path.path().to_str().unwrap(),
+            "--execute-as",
+            CORE_CODE_ADDRESS.clone().to_hex().as_str(),
+            "--script-path",
+            move_script_path.as_path().to_str().unwrap(),
+            "--framework-local-dir",
+            framework_path.as_os_str().to_str().unwrap(),
+            "--assume-yes",
+        ])
+        .output()
         .unwrap();
+
+    let genesis_transaction = {
+        let buf = fs::read(genesis_blob_path.as_ref()).unwrap();
+        bcs::from_bytes::<Transaction>(&buf).unwrap()
+    };
 
     println!("6. prepare the waypoint with the transaction");
     let waypoint_command = Command::new(db_bootstrapper.as_path())
         .current_dir(workspace_root())
         .args(&vec![
-            node_config.storage.dir().to_str().unwrap(),
+            env.validators()
+                .next()
+                .unwrap()
+                .config()
+                .storage
+                .dir()
+                .to_str()
+                .unwrap(),
             "--genesis-txn-file",
-            genesis_path.path().to_str().unwrap(),
+            genesis_blob_path.path().to_str().unwrap(),
         ])
         .output()
         .unwrap();
+    println!("Db bootstrapper output: {:?}", waypoint_command);
     let output = std::str::from_utf8(&waypoint_command.stdout).unwrap();
     let waypoint = parse_waypoint(output);
 
-    println!("7. apply genesis transaction for nodes 1, 2, 3");
-    for validator in swarm
-        .validators_mut()
-        .filter(|v| v.peer_id() != node_to_kill)
-    {
-        let mut node_config = validator.config().clone();
+    println!("7. apply genesis transaction for nodes 0, 1, 2");
+    for (expected_to_connect, node) in env.validators_mut().take(3).enumerate() {
+        let mut node_config = node.config().clone();
         insert_waypoint(&mut node_config, waypoint);
+        node_config
+            .consensus
+            .safety_rules
+            .initial_safety_rules_config = InitialSafetyRulesConfig::None;
         node_config.execution.genesis = Some(genesis_transaction.clone());
         // reset the sync_only flag to false
         node_config.consensus.sync_only = false;
-        node_config.save(validator.config_path()).unwrap();
-        validator.start().unwrap();
-        validator
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-            .await
-            .unwrap();
+        update_node_config_restart(node, node_config);
+        wait_for_node(node, expected_to_connect).await;
     }
 
     println!("8. verify it's able to mint after the waypoint");
-    let client_0 = swarm
-        .validator(validator_peer_ids[0])
-        .unwrap()
-        .rest_client();
+    env.wait_for_startup().await.unwrap();
+    check_create_mint_transfer_node(&mut env, 0).await;
 
-    transfer_coins(
-        &client_0,
-        &transaction_factory,
-        &mut account_0,
-        &account_1,
-        1,
-    )
-    .await;
-    assert_balance(&client_0, &account_0, 9).await;
-    assert_balance(&client_0, &account_1, 11).await;
+    let (epoch, version) = {
+        let response = env
+            .validators()
+            .next()
+            .unwrap()
+            .rest_client()
+            .get_ledger_information()
+            .await
+            .unwrap();
+        (response.inner().epoch, response.inner().version)
+    };
 
-    // Create a new epoch to make things more complicated
-    let txn = swarm
-        .chain_info()
-        .root_account
-        .sign_with_transaction_builder(transaction_factory.update_diem_version(0, 12345));
-    client_0.submit_and_wait(&txn).await.unwrap();
-
-    // Make full DB backup for later use. The backup crosses the new genesis.
-    let version = client_0
-        .get_ledger_information()
-        .await
-        .unwrap()
-        .into_inner()
-        .version;
-    let epoch = client_0
-        .get_epoch_configuration()
-        .await
-        .unwrap()
-        .into_inner()
-        .next_block_epoch
-        .0;
-    let backup_path = db_backup(
-        swarm
-            .validator(validator_peer_ids[0])
+    let (backup_path, _) = db_backup(
+        env.validators()
+            .next()
             .unwrap()
             .config()
             .storage
@@ -244,84 +244,63 @@ async fn test_genesis_transaction_flow() {
         epoch.checked_sub(1).unwrap(), // target epoch: most recently closed epoch
         version,                       // target version
         version as usize,              // txn batch size (version 0 is in its own batch)
-        version as usize,              // state snapshot interval
+        epoch.checked_sub(1).unwrap() as usize, // state snapshot interval
         &[waypoint],
     );
 
-    println!("9. add node 0 back and test if it can sync to the waypoint via state synchronizer");
-    let op_tool = OperationalTool::new(
-        swarm
-            .validator(validator_peer_ids[0])
+    println!("9. verify node 4 is out from the validator set");
+    assert_eq!(
+        cli.show_validator_set()
+            .await
             .unwrap()
-            .json_rpc_endpoint()
-            .to_string(),
-        chain_id,
+            .active_validators
+            .len(),
+        4
     );
-    let _ = op_tool
-        .add_validator(validator_address, &diem_root, false)
-        .unwrap();
 
-    // setup the waypoint for node 0
-    node_config.execution.genesis = None;
-    node_config.execution.genesis_file_location = PathBuf::from("");
-    insert_waypoint(&mut node_config, waypoint);
-    node_config.save(node_config_path).unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .restart()
-        .await
-        .unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-        .await
-        .unwrap();
-    swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(60))
-        .await
-        .unwrap();
+    println!("10. nuke DB on node 3, and run db restore, test if it rejoins the network okay.");
+    let node = env.validators_mut().nth(3).unwrap();
+    node.stop();
+    let mut node_config = node.config().clone();
+    node_config.consensus.sync_only = false;
+    node_config.save_to_path(node.config_path()).unwrap();
 
-    let client = swarm.validator(node_to_kill).unwrap().rest_client();
-
-    transfer_coins(&client, &transaction_factory, &mut account_0, &account_1, 1).await;
-    assert_balance(&client_0, &account_0, 8).await;
-    assert_balance(&client_0, &account_1, 12).await;
-
-    println!("10. nuke DB on node 0, and run db-restore, test if it rejoins the network okay.");
-    swarm.validator_mut(node_to_kill).unwrap().stop();
-
-    let db_dir = node_config.storage.dir();
+    let db_dir = node.config().storage.dir();
     fs::remove_dir_all(&db_dir).unwrap();
-    db_restore(backup_path.path(), db_dir.as_path(), &[waypoint]);
+    db_restore(
+        backup_path.path(),
+        db_dir.as_path(),
+        &[waypoint],
+        node.config().storage.rocksdb_configs.split_ledger_db,
+        None,
+    );
 
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .restart()
-        .await
-        .unwrap();
-    swarm
-        .validator_mut(node_to_kill)
-        .unwrap()
-        .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-        .await
-        .unwrap();
-    swarm
-        .wait_for_all_nodes_to_catchup(Instant::now() + Duration::from_secs(60))
-        .await
-        .unwrap();
+    node.start().unwrap();
+    wait_for_node(node, num_nodes - 2).await;
+    let client = node.rest_client();
+    // wait for it to catch up
+    {
+        let version = get_highest_synced_version(&env.get_all_nodes_clients_with_names())
+            .await
+            .unwrap();
+        loop {
+            if let Ok(resp) = client.get_ledger_information().await {
+                if resp.into_inner().version > version {
+                    println!("Node 3 catches up on {}", version);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
 
-    transfer_coins(&client, &transaction_factory, &mut account_0, &account_1, 1).await;
-    assert_balance(&client_0, &account_0, 7).await;
-    assert_balance(&client_0, &account_1, 13).await;
+    check_create_mint_transfer_node(&mut env, 3).await;
 }
 
 fn parse_waypoint(db_bootstrapper_output: &str) -> Waypoint {
     let waypoint = Regex::new(r"Got waypoint: (\d+:\w+)")
         .unwrap()
         .captures(db_bootstrapper_output)
-        .ok_or_else(|| anyhow!("Failed to parse db-bootstrapper output."));
+        .ok_or_else(|| anyhow!("Failed to parse diem-db-bootstrapper output."));
     Waypoint::from_str(waypoint.unwrap()[1].into()).unwrap()
 }

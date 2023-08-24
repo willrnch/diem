@@ -1,8 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_infallible::RwLock;
-use diem_logger::{DiemLogger, Writer};
+use diem_logger::{diem_logger::DiemData, Writer};
 use std::sync::Arc;
 use tracing::Level;
 
@@ -28,15 +29,20 @@ impl Writer for VecWriter {
         }
         self.logs.write().push(log);
     }
+
+    fn write_buferred(&mut self, log: String) {
+        self.write(log);
+    }
 }
 
 #[test]
 fn verify_tracing_kvs() {
-    // set up the diem logger
+    // set up the logger
     let writer = VecWriter::default();
     let logs = writer.logs.clone();
-    DiemLogger::builder()
+    DiemData::builder()
         .is_async(false)
+        .tokio_console_port(None)
         .printer(Box::new(writer.write_to_stderr(false)))
         .build();
 

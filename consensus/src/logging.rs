@@ -1,7 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use consensus_types::common::Author;
+use diem_consensus_types::common::Author;
 use diem_logger::Schema;
 use diem_types::block_info::Round;
 use serde::Serialize;
@@ -18,20 +19,20 @@ pub struct LogSchema {
 pub enum LogEvent {
     CommitViaBlock,
     CommitViaSync,
-    HelpPeerSync,
     NewEpoch,
     NewRound,
     Propose,
+    ReceiveBatchRetrieval,
     ReceiveBlockRetrieval,
     ReceiveEpochChangeProof,
     ReceiveEpochRetrieval,
     ReceiveMessageFromDifferentEpoch,
+    ReceiveNewCertificate,
     ReceiveProposal,
     ReceiveSyncInfo,
     ReceiveVote,
     RetrieveBlock,
     StateSync,
-    SyncToPeer,
     Timeout,
     Vote,
     VoteNIL,

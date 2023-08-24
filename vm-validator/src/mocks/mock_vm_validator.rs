@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::vm_validator::TransactionValidation;
@@ -7,7 +8,7 @@ use diem_state_view::StateView;
 use diem_types::{
     account_address::AccountAddress,
     on_chain_config::OnChainConfigPayload,
-    transaction::{GovernanceRole, SignedTransaction, VMValidatorResult},
+    transaction::{SignedTransaction, VMValidatorResult},
     vm_status::StatusCode,
 };
 use diem_vm::VMValidator;
@@ -36,12 +37,13 @@ impl VMValidator for MockVMValidator {
         _transaction: SignedTransaction,
         _state_view: &impl StateView,
     ) -> VMValidatorResult {
-        VMValidatorResult::new(None, 0, GovernanceRole::NonGovernanceRole)
+        VMValidatorResult::new(None, 0)
     }
 }
 
 impl TransactionValidation for MockVMValidator {
     type ValidationInstance = MockVMValidator;
+
     fn validate_transaction(&self, txn: SignedTransaction) -> Result<VMValidatorResult> {
         let txn = match txn.check_signature() {
             Ok(txn) => txn,
@@ -49,9 +51,8 @@ impl TransactionValidation for MockVMValidator {
                 return Ok(VMValidatorResult::new(
                     Some(StatusCode::INVALID_SIGNATURE),
                     0,
-                    GovernanceRole::NonGovernanceRole,
                 ))
-            }
+            },
         };
 
         let sender = txn.sender();
@@ -72,15 +73,11 @@ impl TransactionValidation for MockVMValidator {
         } else {
             None
         };
-        Ok(VMValidatorResult::new(
-            ret,
-            0,
-            GovernanceRole::NonGovernanceRole,
-        ))
+        Ok(VMValidatorResult::new(ret, 0))
     }
 
     fn restart(&mut self, _config: OnChainConfigPayload) -> Result<()> {
-        unimplemented!();
+        Ok(())
     }
 
     fn notify_commit(&mut self) {}

@@ -1,42 +1,15 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod account;
-pub mod balance;
-pub mod chain_account_info;
 pub mod chain_id;
+pub mod coin_info;
+pub mod coin_store;
 pub mod core_account;
-pub mod crsn;
-pub mod currency_info;
-pub mod designated_dealer;
-pub mod dual_attestation;
-pub mod freezing_bit;
-pub mod key_rotation_capability;
-pub mod preburn_balance;
-pub mod preburn_queue;
-pub mod preburn_with_metadata;
-pub mod role;
-pub mod role_id;
-pub mod vasp;
-pub mod vasp_domain;
-pub mod withdraw_capability;
+pub mod object;
 
-pub use account::*;
-pub use balance::*;
-pub use chain_account_info::*;
 pub use chain_id::*;
+pub use coin_info::*;
+pub use coin_store::*;
 pub use core_account::*;
-pub use crsn::*;
-pub use currency_info::*;
-pub use designated_dealer::*;
-pub use dual_attestation::*;
-pub use freezing_bit::*;
-pub use key_rotation_capability::*;
-pub use preburn_balance::*;
-pub use preburn_queue::*;
-pub use preburn_with_metadata::*;
-pub use role::*;
-pub use role_id::*;
-pub use vasp::*;
-pub use vasp_domain::*;
-pub use withdraw_capability::*;
+pub use object::*;

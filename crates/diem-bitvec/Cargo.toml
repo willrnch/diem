@@ -1,25 +1,28 @@
 [package]
 name = "diem-bitvec"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
 description = "Diem safe bitvec implementation"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
-proptest = { version = "1.0.0", default-features = true, optional = true }
-proptest-derive = { version = "0.3.0", optional = true }
-serde = { version = "1.0.124", features = ["derive"] }
-serde_bytes = "0.11.5"
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
 
 [dev-dependencies]
-bcs = "0.1.2"
-proptest = { version = "1.0.0", default-features = true }
-proptest-derive = { version = "0.3.0" }
+bcs = { workspace = true }
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 fuzzing = ["proptest-derive", "proptest"]

@@ -1,71 +1,125 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    adapter_common,
     adapter_common::{
-        discard_error_output, discard_error_vm_status, validate_signature_checked_transaction,
-        validate_signed_transaction, PreprocessedTransaction, VMAdapter,
+        discard_error_output, discard_error_vm_status, PreprocessedTransaction, VMAdapter,
     },
+    diem_vm_impl::{get_transaction_output, DiemVMImpl, DiemVMInternals},
+    block_executor::{DiemTransactionOutput, BlockDiemVM},
     counters::*,
-    data_cache::{RemoteStorage, StateViewCache},
-    diem_vm_impl::{
-        charge_global_write_gas_usage, convert_changeset_and_events, get_currency_info,
-        get_gas_currency_code, get_transaction_output, DiemVMImpl, DiemVMInternals,
-    },
+    data_cache::StorageAdapter,
     errors::expect_only_successful_execution,
-    logging::AdapterLogSchema,
-    script_to_script_function,
+    move_vm_ext::{MoveResolverExt, RespawnedSession, SessionExt, SessionId},
+    sharded_block_executor::ShardedBlockExecutor,
     system_module_names::*,
     transaction_metadata::TransactionMetadata,
-    VMExecutor, VMValidator,
+    verifier, VMExecutor, VMValidator,
 };
-use anyhow::Result;
-use diem_logger::prelude::*;
+use anyhow::{anyhow, Result};
+use diem_aggregator::delta_change_set::DeltaChangeSet;
+use diem_block_executor::txn_commit_hook::NoOpTransactionCommitHook;
+use diem_crypto::HashValue;
+use diem_framework::natives::code::PublishRequest;
+use diem_gas::{
+    DiemGasMeter, DiemGasParameters, ChangeSetConfigs, Gas, StandardGasMeter,
+    StorageGasParameters,
+};
+use diem_logger::{enabled, prelude::*, Level};
 use diem_state_view::StateView;
 use diem_types::{
     account_config,
+    account_config::new_block_event_key,
+    block_executor::partitioner::{BlockExecutorTransactions, SubBlocksForShard},
     block_metadata::BlockMetadata,
-    on_chain_config::{
-        DiemVersion, OnChainConfig, ParallelExecutionConfig, VMConfig, VMPublishingOption,
-        DIEM_VERSION_2, DIEM_VERSION_3,
-    },
+    fee_statement::FeeStatement,
+    on_chain_config::{new_epoch_event_key, FeatureFlag, TimedFeatureOverride},
     transaction::{
-        ChangeSet, ModuleBundle, SignatureCheckedTransaction, SignedTransaction, Transaction,
+        EntryFunction, ExecutionError, ExecutionStatus, ModuleBundle, Multisig,
+        MultisigTransactionPayload, SignatureCheckedTransaction, SignedTransaction, Transaction,
         TransactionOutput, TransactionPayload, TransactionStatus, VMValidatorResult,
         WriteSetPayload,
     },
-    vm_status::{KeptVMStatus, StatusCode, VMStatus},
-    write_set::{WriteSet, WriteSetMut},
+    vm_status::{AbortLocation, StatusCode, VMStatus},
+    write_set::WriteSet,
 };
+use diem_utils::{diem_try, return_on_failure};
+use diem_vm_logging::{log_schema::AdapterLogSchema, speculative_error, speculative_log};
+use diem_vm_types::{change_set::VMChangeSet, output::VMOutput};
 use fail::fail_point;
-use move_binary_format::errors::VMResult;
+use move_binary_format::{
+    access::ModuleAccess,
+    compatibility::Compatibility,
+    errors::{verification_error, Location, PartialVMError, VMError, VMResult},
+    CompiledModule, IndexKind,
+};
 use move_core_types::{
     account_address::AccountAddress,
-    gas_schedule::GasAlgebra,
-    identifier::IdentStr,
-    language_storage::ModuleId,
-    resolver::MoveResolver,
+    ident_str,
+    identifier::Identifier,
+    language_storage::{ModuleId, TypeTag},
     transaction_argument::convert_txn_args,
     value::{serialize_values, MoveValue},
+    vm_status::StatusType,
 };
-use move_vm_runtime::session::Session;
-use move_vm_types::gas_schedule::GasStatus;
-use read_write_set_dynamic::NormalizedReadWriteSetAnalysis;
+use move_vm_runtime::session::SerializedReturnValues;
+use move_vm_types::gas::UnmeteredGasMeter;
+use num_cpus;
+use once_cell::sync::{Lazy, OnceCell};
 use std::{
-    collections::HashSet,
+    cmp::{max, min},
+    collections::{BTreeMap, BTreeSet},
     convert::{AsMut, AsRef},
+    marker::Sync,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
-#[derive(Clone)]
+static EXECUTION_CONCURRENCY_LEVEL: OnceCell<usize> = OnceCell::new();
+static NUM_EXECUTION_SHARD: OnceCell<usize> = OnceCell::new();
+static NUM_PROOF_READING_THREADS: OnceCell<usize> = OnceCell::new();
+static PARANOID_TYPE_CHECKS: OnceCell<bool> = OnceCell::new();
+static PROCESSED_TRANSACTIONS_DETAILED_COUNTERS: OnceCell<bool> = OnceCell::new();
+static TIMED_FEATURE_OVERRIDE: OnceCell<TimedFeatureOverride> = OnceCell::new();
+
+pub static RAYON_EXEC_POOL: Lazy<Arc<rayon::ThreadPool>> = Lazy::new(|| {
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus::get())
+            .thread_name(|index| format!("par_exec_{}", index))
+            .build()
+            .unwrap(),
+    )
+});
+
+/// Remove this once the bundle is removed from the code.
+static MODULE_BUNDLE_DISALLOWED: AtomicBool = AtomicBool::new(true);
+pub fn allow_module_bundle_for_test() {
+    MODULE_BUNDLE_DISALLOWED.store(false, Ordering::Relaxed);
+}
+
 pub struct DiemVM(pub(crate) DiemVMImpl);
 
+struct DiemSimulationVM(DiemVM);
+
+macro_rules! unwrap_or_discard {
+    ($res:expr) => {
+        match $res {
+            Ok(s) => s,
+            Err(e) => return discard_error_vm_status(e),
+        }
+    };
+}
+
 impl DiemVM {
-    pub fn new<S: StateView>(state: &S) -> Self {
+    pub fn new(state: &impl StateView) -> Self {
         Self(DiemVMImpl::new(state))
     }
 
-    pub fn new_for_validation<S: StateView>(state: &S) -> Self {
+    pub fn new_for_validation(state: &impl StateView) -> Self {
         info!(
             AdapterLogSchema::new(state.id(), 0),
             "Adapter created for Validation"
@@ -73,62 +127,187 @@ impl DiemVM {
         Self::new(state)
     }
 
-    pub fn init_with_config(
-        version: DiemVersion,
-        on_chain_config: VMConfig,
-        publishing_option: VMPublishingOption,
-    ) -> Self {
-        info!("Adapter restarted for Validation");
-        DiemVM(DiemVMImpl::init_with_config(
-            version,
-            on_chain_config,
-            publishing_option,
-        ))
+    /// Sets execution concurrency level when invoked the first time.
+    pub fn set_concurrency_level_once(mut concurrency_level: usize) {
+        concurrency_level = min(concurrency_level, num_cpus::get());
+        // Only the first call succeeds, due to OnceCell semantics.
+        EXECUTION_CONCURRENCY_LEVEL.set(concurrency_level).ok();
     }
+
+    /// Get the concurrency level if already set, otherwise return default 1
+    /// (sequential execution).
+    ///
+    /// The concurrency level is fixed to 1 if gas profiling is enabled.
+    pub fn get_concurrency_level() -> usize {
+        match EXECUTION_CONCURRENCY_LEVEL.get() {
+            Some(concurrency_level) => *concurrency_level,
+            None => 1,
+        }
+    }
+
+    pub fn set_num_shards_once(mut num_shards: usize) {
+        num_shards = max(num_shards, 1);
+        // Only the first call succeeds, due to OnceCell semantics.
+        NUM_EXECUTION_SHARD.set(num_shards).ok();
+    }
+
+    pub fn get_num_shards() -> usize {
+        match NUM_EXECUTION_SHARD.get() {
+            Some(num_shards) => *num_shards,
+            None => 1,
+        }
+    }
+
+    /// Sets runtime config when invoked the first time.
+    pub fn set_paranoid_type_checks(enable: bool) {
+        // Only the first call succeeds, due to OnceCell semantics.
+        PARANOID_TYPE_CHECKS.set(enable).ok();
+    }
+
+    /// Get the paranoid type check flag if already set, otherwise return default true
+    pub fn get_paranoid_checks() -> bool {
+        match PARANOID_TYPE_CHECKS.get() {
+            Some(enable) => *enable,
+            None => true,
+        }
+    }
+
+    // Set the override profile for timed features.
+    pub fn set_timed_feature_override(profile: TimedFeatureOverride) {
+        TIMED_FEATURE_OVERRIDE.set(profile).ok();
+    }
+
+    pub fn get_timed_feature_override() -> Option<TimedFeatureOverride> {
+        TIMED_FEATURE_OVERRIDE.get().cloned()
+    }
+
+    /// Sets the # of async proof reading threads.
+    pub fn set_num_proof_reading_threads_once(mut num_threads: usize) {
+        // TODO(grao): Do more analysis to tune this magic number.
+        num_threads = min(num_threads, 256);
+        // Only the first call succeeds, due to OnceCell semantics.
+        NUM_PROOF_READING_THREADS.set(num_threads).ok();
+    }
+
+    /// Returns the # of async proof reading threads if already set, otherwise return default value
+    /// (32).
+    pub fn get_num_proof_reading_threads() -> usize {
+        match NUM_PROOF_READING_THREADS.get() {
+            Some(num_threads) => *num_threads,
+            None => 32,
+        }
+    }
+
+    /// Sets addigional details in counters when invoked the first time.
+    pub fn set_processed_transactions_detailed_counters() {
+        // Only the first call succeeds, due to OnceCell semantics.
+        PROCESSED_TRANSACTIONS_DETAILED_COUNTERS.set(true).ok();
+    }
+
+    /// Get whether we should capture additional details in counters
+    pub fn get_processed_transactions_detailed_counters() -> bool {
+        match PROCESSED_TRANSACTIONS_DETAILED_COUNTERS.get() {
+            Some(value) => *value,
+            None => false,
+        }
+    }
+
     pub fn internals(&self) -> DiemVMInternals {
         DiemVMInternals::new(&self.0)
     }
 
     /// Load a module into its internal MoveVM's code cache.
-    pub fn load_module<S: MoveResolver>(&self, module_id: &ModuleId, state: &S) -> VMResult<()> {
-        self.0.load_module(module_id, state)
+    pub fn load_module(
+        &self,
+        module_id: &ModuleId,
+        resolver: &impl MoveResolverExt,
+    ) -> VMResult<Arc<CompiledModule>> {
+        self.0.load_module(module_id, resolver)
     }
 
     /// Generates a transaction output for a transaction that encountered errors during the
     /// execution process. This is public for now only for tests.
-    pub fn failed_transaction_cleanup<S: MoveResolver>(
+    pub fn failed_transaction_cleanup(
         &self,
         error_code: VMStatus,
-        gas_status: &mut GasStatus,
+        gas_meter: &mut impl DiemGasMeter,
         txn_data: &TransactionMetadata,
-        storage: &S,
-        account_currency_symbol: &IdentStr,
+        resolver: &impl MoveResolverExt,
         log_context: &AdapterLogSchema,
-    ) -> TransactionOutput {
+        change_set_configs: &ChangeSetConfigs,
+    ) -> VMOutput {
         self.failed_transaction_cleanup_and_keep_vm_status(
             error_code,
-            gas_status,
+            gas_meter,
             txn_data,
-            storage,
-            account_currency_symbol,
+            resolver,
             log_context,
+            change_set_configs,
         )
         .1
     }
 
-    fn failed_transaction_cleanup_and_keep_vm_status<S: MoveResolver>(
+    pub fn as_move_resolver<'a, S: StateView>(&self, state_view: &'a S) -> StorageAdapter<'a, S> {
+        StorageAdapter::new_with_cached_config(
+            state_view,
+            self.0.get_gas_feature_version(),
+            self.0.get_features(),
+        )
+    }
+
+    fn fee_statement_from_gas_meter(
+        txn_data: &TransactionMetadata,
+        gas_meter: &impl DiemGasMeter,
+    ) -> FeeStatement {
+        let gas_used = txn_data
+            .max_gas_amount()
+            .checked_sub(gas_meter.balance())
+            .expect("Balance should always be less than or equal to max gas amount");
+        FeeStatement::new(
+            gas_used.into(),
+            u64::from(gas_meter.execution_gas_used()),
+            u64::from(gas_meter.io_gas_used()),
+            u64::from(gas_meter.storage_fee_used_in_gas_units()),
+            u64::from(gas_meter.storage_fee_used()),
+        )
+    }
+
+    fn failed_transaction_cleanup_and_keep_vm_status(
         &self,
         error_code: VMStatus,
-        gas_status: &mut GasStatus,
+        gas_meter: &mut impl DiemGasMeter,
         txn_data: &TransactionMetadata,
-        storage: &S,
-        account_currency_symbol: &IdentStr,
+        resolver: &impl MoveResolverExt,
         log_context: &AdapterLogSchema,
-    ) -> (VMStatus, TransactionOutput) {
-        gas_status.set_metering(false);
-        let mut session = self.0.new_session(storage);
-        match TransactionStatus::from(error_code.clone()) {
+        change_set_configs: &ChangeSetConfigs,
+    ) -> (VMStatus, VMOutput) {
+        let mut session = self
+            .0
+            .new_session(resolver, SessionId::epilogue_meta(txn_data), true);
+
+        match TransactionStatus::from_vm_status(
+            error_code.clone(),
+            self.0
+                .get_features()
+                .is_enabled(FeatureFlag::CHARGE_INVARIANT_VIOLATION),
+        ) {
             TransactionStatus::Keep(status) => {
+                // Inject abort info if available.
+                let status = match status {
+                    ExecutionStatus::MoveAbort {
+                        location: AbortLocation::Module(module),
+                        code,
+                        ..
+                    } => {
+                        let info = self.0.extract_abort_info(&module, code);
+                        ExecutionStatus::MoveAbort {
+                            location: AbortLocation::Module(module),
+                            code,
+                            info,
+                        }
+                    },
+                    _ => status,
+                };
                 // The transaction should be charged for gas, so run the epilogue to do that.
                 // This is running in a new session that drops any side effects from the
                 // attempted transaction (e.g., spending funds that were needed to pay for gas),
@@ -137,220 +316,716 @@ impl DiemVM {
                 // discard the transaction.
                 if let Err(e) = self.0.run_failure_epilogue(
                     &mut session,
-                    gas_status,
+                    gas_meter.balance(),
                     txn_data,
-                    account_currency_symbol,
                     log_context,
                 ) {
                     return discard_error_vm_status(e);
                 }
+                let fee_statement = DiemVM::fee_statement_from_gas_meter(txn_data, gas_meter);
                 let txn_output = get_transaction_output(
                     &mut (),
                     session,
-                    gas_status.remaining_gas(),
-                    txn_data,
+                    fee_statement,
                     status,
+                    change_set_configs,
                 )
                 .unwrap_or_else(|e| discard_error_vm_status(e).1);
                 (error_code, txn_output)
-            }
+            },
             TransactionStatus::Discard(status) => {
-                (VMStatus::Error(status), discard_error_output(status))
-            }
+                (VMStatus::error(status, None), discard_error_output(status))
+            },
             TransactionStatus::Retry => unreachable!(),
         }
     }
 
-    fn success_transaction_cleanup<S: MoveResolver>(
+    fn success_transaction_cleanup(
         &self,
-        mut session: Session<S>,
-        gas_status: &mut GasStatus,
+        mut respawned_session: RespawnedSession,
+        gas_meter: &mut impl DiemGasMeter,
         txn_data: &TransactionMetadata,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        gas_status.set_metering(false);
-        self.0.run_success_epilogue(
-            &mut session,
-            gas_status,
-            txn_data,
-            account_currency_symbol,
-            log_context,
-        )?;
+        change_set_configs: &ChangeSetConfigs,
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
+        respawned_session.execute(|session| {
+            self.0
+                .run_success_epilogue(session, gas_meter.balance(), txn_data, log_context)
+        })?;
+        let change_set = respawned_session.finish(change_set_configs)?;
+        let fee_statement = DiemVM::fee_statement_from_gas_meter(txn_data, gas_meter);
+        let output = VMOutput::new(
+            change_set,
+            fee_statement,
+            TransactionStatus::Keep(ExecutionStatus::Success),
+        );
 
-        Ok((
-            VMStatus::Executed,
-            get_transaction_output(
-                &mut (),
-                session,
-                gas_status.remaining_gas(),
-                txn_data,
-                KeptVMStatus::Executed,
-            )?,
-        ))
+        Ok((VMStatus::Executed, output))
     }
 
-    fn execute_script_or_script_function<S: MoveResolver>(
+    fn validate_and_execute_entry_function(
         &self,
-        mut session: Session<S>,
-        gas_status: &mut GasStatus,
+        session: &mut SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        senders: Vec<AccountAddress>,
+        script_fn: &EntryFunction,
+    ) -> Result<SerializedReturnValues, VMStatus> {
+        let function = session.load_function(
+            script_fn.module(),
+            script_fn.function(),
+            script_fn.ty_args(),
+        )?;
+        let struct_constructors = self
+            .0
+            .get_features()
+            .is_enabled(FeatureFlag::STRUCT_CONSTRUCTORS);
+        let args = verifier::transaction_arg_validation::validate_combine_signer_and_txn_args(
+            session,
+            senders,
+            script_fn.args().to_vec(),
+            &function,
+            struct_constructors,
+        )?;
+        Ok(session.execute_entry_function(
+            script_fn.module(),
+            script_fn.function(),
+            script_fn.ty_args().to_vec(),
+            args,
+            gas_meter,
+        )?)
+    }
+
+    fn execute_script_or_entry_function(
+        &self,
+        resolver: &impl MoveResolverExt,
+        mut session: SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
         txn_data: &TransactionMetadata,
         payload: &TransactionPayload,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        fail_point!("move_adapter::execute_script_or_script_function", |_| {
-            Err(VMStatus::Error(
-                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-            ))
+        new_published_modules_loaded: &mut bool,
+        change_set_configs: &ChangeSetConfigs,
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
+        fail_point!("move_adapter::execute_script_or_entry_function", |_| {
+            Err(VMStatus::Error {
+                status_code: StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                sub_status: Some(move_core_types::vm_status::sub_status::unknown_invariant_violation::EPARANOID_FAILURE),
+                message: None,
+            })
         });
 
         // Run the execution logic
         {
-            gas_status
-                .charge_intrinsic_gas(txn_data.transaction_size())
-                .map_err(|e| e.into_vm_status())?;
+            gas_meter.charge_intrinsic_gas_for_transaction(txn_data.transaction_size())?;
 
             match payload {
                 TransactionPayload::Script(script) => {
-                    let diem_version = self.0.get_diem_version()?;
-                    let remapped_script =
-                        if diem_version < diem_types::on_chain_config::DIEM_VERSION_2 {
-                            None
-                        } else {
-                            script_to_script_function::remapping(script.code())
-                        };
-                    let mut senders = vec![txn_data.sender()];
-                    if diem_version >= DIEM_VERSION_3 {
-                        senders.extend(txn_data.secondary_signers());
-                    }
-                    match remapped_script {
-                        // We are in this case before VERSION_2
-                        // or if there is no remapping for the script
-                        None => session.execute_script(
-                            script.code().to_vec(),
-                            script.ty_args().to_vec(),
+                    let loaded_func =
+                        session.load_script(script.code(), script.ty_args().to_vec())?;
+                    let args =
+                        verifier::transaction_arg_validation::validate_combine_signer_and_txn_args(
+                            &mut session,
+                            txn_data.senders(),
                             convert_txn_args(script.args()),
-                            senders,
-                            gas_status,
-                        ),
-                        Some((module, function)) => session.execute_script_function(
-                            module,
-                            function,
-                            script.ty_args().to_vec(),
-                            convert_txn_args(script.args()),
-                            senders,
-                            gas_status,
-                        ),
-                    }
-                }
-                TransactionPayload::ScriptFunction(script_fn) => {
-                    let diem_version = self.0.get_diem_version()?;
-                    let mut senders = vec![txn_data.sender()];
-                    if diem_version >= DIEM_VERSION_3 {
-                        senders.extend(txn_data.secondary_signers());
-                    }
-                    session.execute_script_function(
-                        script_fn.module(),
-                        script_fn.function(),
-                        script_fn.ty_args().to_vec(),
-                        script_fn.args().to_vec(),
-                        senders,
-                        gas_status,
-                    )
-                }
-                TransactionPayload::ModuleBundle(_) | TransactionPayload::WriteSet(_) => {
-                    return Err(VMStatus::Error(StatusCode::UNREACHABLE));
-                }
-            }
-            .map_err(|e| e.into_vm_status())?;
+                            &loaded_func,
+                            self.0
+                                .get_features()
+                                .is_enabled(FeatureFlag::STRUCT_CONSTRUCTORS),
+                        )?;
+                    session.execute_script(
+                        script.code(),
+                        script.ty_args().to_vec(),
+                        args,
+                        gas_meter,
+                    )?;
+                },
+                TransactionPayload::EntryFunction(script_fn) => {
+                    self.validate_and_execute_entry_function(
+                        &mut session,
+                        gas_meter,
+                        txn_data.senders(),
+                        script_fn,
+                    )?;
+                },
 
-            charge_global_write_gas_usage(gas_status, &session, &txn_data.sender())?;
+                // Not reachable as this function should only be invoked for entry or script
+                // transaction payload.
+                _ => {
+                    return Err(VMStatus::error(StatusCode::UNREACHABLE, None));
+                },
+            };
+
+            self.resolve_pending_code_publish(
+                &mut session,
+                gas_meter,
+                new_published_modules_loaded,
+            )?;
+
+            let respawned_session = self.charge_change_set_and_respawn_session(
+                session,
+                resolver,
+                gas_meter,
+                change_set_configs,
+                txn_data,
+            )?;
 
             self.success_transaction_cleanup(
-                session,
-                gas_status,
+                respawned_session,
+                gas_meter,
                 txn_data,
-                account_currency_symbol,
                 log_context,
+                change_set_configs,
             )
         }
     }
 
-    fn execute_modules<S: MoveResolver>(
-        &self,
-        mut session: Session<S>,
-        gas_status: &mut GasStatus,
+    fn charge_change_set_and_respawn_session<'r, 'l>(
+        &'l self,
+        session: SessionExt,
+        resolver: &'r impl MoveResolverExt,
+        gas_meter: &mut impl DiemGasMeter,
+        change_set_configs: &ChangeSetConfigs,
         txn_data: &TransactionMetadata,
-        modules: &ModuleBundle,
-        account_currency_symbol: &IdentStr,
+    ) -> Result<RespawnedSession<'r, 'l>, VMStatus> {
+        let change_set = session.finish(&mut (), change_set_configs)?;
+        gas_meter.charge_io_gas_for_write_set(change_set.write_set().iter())?;
+        gas_meter.charge_storage_fee_for_all(
+            change_set.write_set().iter(),
+            change_set.events(),
+            txn_data.transaction_size,
+            txn_data.gas_unit_price,
+        )?;
+
+        // TODO(Gas): Charge for aggregator writes
+        let session_id = SessionId::epilogue_meta(txn_data);
+        RespawnedSession::spawn(&self.0, session_id, resolver, change_set)
+    }
+
+    // Execute a multisig transaction:
+    // 1. Obtain the payload of the transaction to execute. This could have been stored on chain
+    // when the multisig transaction was created.
+    // 2. Execute the target payload. If this fails, discard the session and keep the gas meter and
+    // failure object. In case of success, keep the session and also do any necessary module publish
+    // cleanup.
+    // 3. Call post transaction cleanup function in multisig account module with the result from (2)
+    fn execute_multisig_transaction(
+        &self,
+        resolver: &impl MoveResolverExt,
+        mut session: SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        txn_data: &TransactionMetadata,
+        txn_payload: &Multisig,
         log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        fail_point!("move_adapter::execute_module", |_| {
-            Err(VMStatus::Error(
+        new_published_modules_loaded: &mut bool,
+        change_set_configs: &ChangeSetConfigs,
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
+        fail_point!("move_adapter::execute_multisig_transaction", |_| {
+            Err(VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                None,
             ))
         });
 
-        // Publish the module
-        let module_address = if self.0.publishing_option(log_context)?.is_open_module() {
-            txn_data.sender()
+        gas_meter.charge_intrinsic_gas_for_transaction(txn_data.transaction_size())?;
+
+        // Step 1: Obtain the payload. If any errors happen here, the entire transaction should fail
+        let invariant_violation_error =
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message("MultiSig transaction error".to_string())
+                .finish(Location::Undefined);
+        let provided_payload = if let Some(payload) = &txn_payload.transaction_payload {
+            bcs::to_bytes(&payload).map_err(|_| invariant_violation_error.clone())?
         } else {
-            account_config::CORE_CODE_ADDRESS
+            // Default to empty bytes if payload is not provided.
+            bcs::to_bytes::<Vec<u8>>(&vec![]).map_err(|_| invariant_violation_error.clone())?
+        };
+        // Failures here will be propagated back.
+        let payload_bytes: Vec<Vec<u8>> = session
+            .execute_function_bypass_visibility(
+                &MULTISIG_ACCOUNT_MODULE,
+                GET_NEXT_TRANSACTION_PAYLOAD,
+                vec![],
+                serialize_values(&vec![
+                    MoveValue::Address(txn_payload.multisig_address),
+                    MoveValue::vector_u8(provided_payload),
+                ]),
+                gas_meter,
+            )?
+            .return_values
+            .into_iter()
+            .map(|(bytes, _ty)| bytes)
+            .collect::<Vec<_>>();
+        let payload_bytes = payload_bytes
+            .first()
+            // We expect the payload to either exists on chain or be passed along with the
+            // transaction.
+            .ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Multisig payload bytes return error".to_string())
+                    .finish(Location::Undefined)
+            })?;
+        // We have to deserialize twice as the first time returns the actual return type of the
+        // function, which is vec<u8>. The second time deserializes it into the correct
+        // EntryFunction payload type.
+        // If either deserialization fails for some reason, that means the user provided incorrect
+        // payload data either during transaction creation or execution.
+        let deserialization_error = PartialVMError::new(StatusCode::FAILED_TO_DESERIALIZE_ARGUMENT)
+            .finish(Location::Undefined);
+        let payload_bytes =
+            bcs::from_bytes::<Vec<u8>>(payload_bytes).map_err(|_| deserialization_error.clone())?;
+        let payload = bcs::from_bytes::<MultisigTransactionPayload>(&payload_bytes)
+            .map_err(|_| deserialization_error)?;
+
+        // Step 2: Execute the target payload. Transaction failure here is tolerated. In case of any
+        // failures, we'll discard the session and start a new one. This ensures that any data
+        // changes are not persisted.
+        // The multisig transaction would still be considered executed even if execution fails.
+        let execution_result = match payload {
+            MultisigTransactionPayload::EntryFunction(entry_function) => self
+                .execute_multisig_entry_function(
+                    &mut session,
+                    gas_meter,
+                    txn_payload.multisig_address,
+                    &entry_function,
+                    new_published_modules_loaded,
+                ),
         };
 
-        gas_status
-            .charge_intrinsic_gas(txn_data.transaction_size())
-            .map_err(|e| e.into_vm_status())?;
+        // Step 3: Call post transaction cleanup function in multisig account module with the result
+        // from Step 2.
+        // Note that we don't charge execution or writeset gas for cleanup routines. This is
+        // consistent with the high-level success/failure cleanup routines for user transactions.
+        let cleanup_args = serialize_values(&vec![
+            MoveValue::Address(txn_data.sender),
+            MoveValue::Address(txn_payload.multisig_address),
+            MoveValue::vector_u8(payload_bytes),
+        ]);
+        let respawned_session = if let Err(execution_error) = execution_result {
+            // Invalidate the loader cache in case there was a new module loaded from a module
+            // publish request that failed.
+            // This is redundant with the logic in execute_user_transaction but unfortunately is
+            // necessary here as executing the underlying call can fail without this function
+            // returning an error to execute_user_transaction.
+            if *new_published_modules_loaded {
+                self.0.mark_loader_cache_as_invalid();
+            };
+            self.failure_multisig_payload_cleanup(
+                resolver,
+                execution_error,
+                txn_data,
+                cleanup_args,
+            )?
+        } else {
+            self.success_multisig_payload_cleanup(
+                resolver,
+                session,
+                gas_meter,
+                txn_data,
+                cleanup_args,
+                change_set_configs,
+            )?
+        };
 
-        session
-            .publish_module_bundle(modules.clone().into_inner(), module_address, gas_status)
-            .map_err(|e| e.into_vm_status())?;
-
-        charge_global_write_gas_usage(gas_status, &session, &txn_data.sender())?;
-
+        // TODO(Gas): Charge for aggregator writes
         self.success_transaction_cleanup(
-            session,
-            gas_status,
+            respawned_session,
+            gas_meter,
             txn_data,
-            account_currency_symbol,
             log_context,
+            change_set_configs,
         )
     }
 
-    pub(crate) fn execute_user_transaction<S: MoveResolver>(
+    fn execute_multisig_entry_function(
         &self,
-        storage: &S,
+        session: &mut SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        multisig_address: AccountAddress,
+        payload: &EntryFunction,
+        new_published_modules_loaded: &mut bool,
+    ) -> Result<(), VMStatus> {
+        // If txn args are not valid, we'd still consider the transaction as executed but
+        // failed. This is primarily because it's unrecoverable at this point.
+        self.validate_and_execute_entry_function(
+            session,
+            gas_meter,
+            vec![multisig_address],
+            payload,
+        )?;
+
+        // Resolve any pending module publishes in case the multisig transaction is deploying
+        // modules.
+        self.resolve_pending_code_publish(session, gas_meter, new_published_modules_loaded)?;
+        Ok(())
+    }
+
+    fn success_multisig_payload_cleanup<'r, 'l>(
+        &'l self,
+        resolver: &'r impl MoveResolverExt,
+        session: SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        txn_data: &TransactionMetadata,
+        cleanup_args: Vec<Vec<u8>>,
+        change_set_configs: &ChangeSetConfigs,
+    ) -> Result<RespawnedSession<'r, 'l>, VMStatus> {
+        // Charge gas for writeset before we do cleanup. This ensures we don't charge gas for
+        // cleanup writeset changes, which is consistent with outer-level success cleanup
+        // flow. We also wouldn't need to worry that we run out of gas when doing cleanup.
+        let mut respawned_session = self.charge_change_set_and_respawn_session(
+            session,
+            resolver,
+            gas_meter,
+            change_set_configs,
+            txn_data,
+        )?;
+        respawned_session.execute(|session| {
+            session.execute_function_bypass_visibility(
+                &MULTISIG_ACCOUNT_MODULE,
+                SUCCESSFUL_TRANSACTION_EXECUTION_CLEANUP,
+                vec![],
+                cleanup_args,
+                &mut UnmeteredGasMeter,
+            )
+        })?;
+        Ok(respawned_session)
+    }
+
+    fn failure_multisig_payload_cleanup<'r, 'l>(
+        &'l self,
+        resolver: &'r impl MoveResolverExt,
+        execution_error: VMStatus,
+        txn_data: &TransactionMetadata,
+        mut cleanup_args: Vec<Vec<u8>>,
+    ) -> Result<RespawnedSession<'r, 'l>, VMStatus> {
+        // Start a fresh session for running cleanup that does not contain any changes from
+        // the inner function call earlier (since it failed).
+        let mut respawned_session = RespawnedSession::spawn(
+            &self.0,
+            SessionId::epilogue_meta(txn_data),
+            resolver,
+            VMChangeSet::empty(),
+        )?;
+
+        let execution_error = ExecutionError::try_from(execution_error)
+            .map_err(|_| VMStatus::error(StatusCode::UNREACHABLE, None))?;
+        // Serialization is not expected to fail so we're using invariant_violation error here.
+        cleanup_args.push(bcs::to_bytes(&execution_error).map_err(|_| {
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message("MultiSig payload cleanup error.".to_string())
+                .finish(Location::Undefined)
+        })?);
+        respawned_session.execute(|session| {
+            session.execute_function_bypass_visibility(
+                &MULTISIG_ACCOUNT_MODULE,
+                FAILED_TRANSACTION_EXECUTION_CLEANUP,
+                vec![],
+                cleanup_args,
+                &mut UnmeteredGasMeter,
+            )
+        })?;
+        Ok(respawned_session)
+    }
+
+    fn verify_module_bundle(
+        session: &mut SessionExt,
+        module_bundle: &ModuleBundle,
+    ) -> VMResult<()> {
+        for module_blob in module_bundle.iter() {
+            match CompiledModule::deserialize(module_blob.code()) {
+                Ok(module) => {
+                    // verify the module doesn't exist
+                    if session.load_module(&module.self_id()).is_ok() {
+                        return Err(verification_error(
+                            StatusCode::DUPLICATE_MODULE_NAME,
+                            IndexKind::AddressIdentifier,
+                            module.self_handle_idx().0,
+                        )
+                        .finish(Location::Undefined));
+                    }
+                },
+                Err(err) => return Err(err.finish(Location::Undefined)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute all module initializers.
+    fn execute_module_initialization(
+        &self,
+        session: &mut SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        modules: &[CompiledModule],
+        exists: BTreeSet<ModuleId>,
+        senders: &[AccountAddress],
+        new_published_modules_loaded: &mut bool,
+    ) -> VMResult<()> {
+        let init_func_name = ident_str!("init_module");
+        for module in modules {
+            if exists.contains(&module.self_id()) {
+                // Call initializer only on first publish.
+                continue;
+            }
+            *new_published_modules_loaded = true;
+            let init_function = session.load_function(&module.self_id(), init_func_name, &[]);
+            // it is ok to not have init_module function
+            // init_module function should be (1) private and (2) has no return value
+            // Note that for historic reasons, verification here is treated
+            // as StatusCode::CONSTRAINT_NOT_SATISFIED, there this cannot be unified
+            // with the general verify_module above.
+            if init_function.is_ok() {
+                if verifier::module_init::verify_module_init_function(module).is_ok() {
+                    let args: Vec<Vec<u8>> = senders
+                        .iter()
+                        .map(|s| MoveValue::Signer(*s).simple_serialize().unwrap())
+                        .collect();
+                    session.execute_function_bypass_visibility(
+                        &module.self_id(),
+                        init_func_name,
+                        vec![],
+                        args,
+                        gas_meter,
+                    )?;
+                } else {
+                    return Err(PartialVMError::new(StatusCode::CONSTRAINT_NOT_SATISFIED)
+                        .finish(Location::Undefined));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deserialize a module bundle.
+    fn deserialize_module_bundle(&self, modules: &ModuleBundle) -> VMResult<Vec<CompiledModule>> {
+        let max_version = if self
+            .0
+            .get_features()
+            .is_enabled(FeatureFlag::VM_BINARY_FORMAT_V6)
+        {
+            6
+        } else {
+            5
+        };
+        let mut result = vec![];
+        for module_blob in modules.iter() {
+            match CompiledModule::deserialize_with_max_version(module_blob.code(), max_version) {
+                Ok(module) => {
+                    result.push(module);
+                },
+                Err(_err) => {
+                    return Err(PartialVMError::new(StatusCode::CODE_DESERIALIZATION_ERROR)
+                        .finish(Location::Undefined))
+                },
+            }
+        }
+        Ok(result)
+    }
+
+    /// Execute a module bundle load request.
+    /// TODO: this is going to be deprecated and removed in favor of code publishing via
+    /// NativeCodeContext
+    fn execute_modules(
+        &self,
+        resolver: &impl MoveResolverExt,
+        mut session: SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        txn_data: &TransactionMetadata,
+        modules: &ModuleBundle,
+        log_context: &AdapterLogSchema,
+        new_published_modules_loaded: &mut bool,
+        change_set_configs: &ChangeSetConfigs,
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
+        if MODULE_BUNDLE_DISALLOWED.load(Ordering::Relaxed) {
+            return Err(VMStatus::error(StatusCode::FEATURE_UNDER_GATING, None));
+        }
+        fail_point!("move_adapter::execute_module", |_| {
+            Err(VMStatus::error(
+                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                None,
+            ))
+        });
+
+        gas_meter.charge_intrinsic_gas_for_transaction(txn_data.transaction_size())?;
+
+        Self::verify_module_bundle(&mut session, modules)?;
+        session.publish_module_bundle_with_compat_config(
+            modules.clone().into_inner(),
+            txn_data.sender(),
+            gas_meter,
+            Compatibility::new(
+                true,
+                true,
+                !self
+                    .0
+                    .get_features()
+                    .is_enabled(FeatureFlag::TREAT_FRIEND_AS_PRIVATE),
+            ),
+        )?;
+
+        // call init function of the each module
+        self.execute_module_initialization(
+            &mut session,
+            gas_meter,
+            &self.deserialize_module_bundle(modules)?,
+            BTreeSet::new(),
+            &[txn_data.sender()],
+            new_published_modules_loaded,
+        )?;
+
+        let respawned_session = self.charge_change_set_and_respawn_session(
+            session,
+            resolver,
+            gas_meter,
+            change_set_configs,
+            txn_data,
+        )?;
+
+        self.success_transaction_cleanup(
+            respawned_session,
+            gas_meter,
+            txn_data,
+            log_context,
+            change_set_configs,
+        )
+    }
+
+    /// Resolve a pending code publish request registered via the NativeCodeContext.
+    fn resolve_pending_code_publish(
+        &self,
+        session: &mut SessionExt,
+        gas_meter: &mut impl DiemGasMeter,
+        new_published_modules_loaded: &mut bool,
+    ) -> VMResult<()> {
+        if let Some(PublishRequest {
+            destination,
+            bundle,
+            expected_modules,
+            allowed_deps,
+            check_compat: _,
+        }) = session.extract_publish_request()
+        {
+            // TODO: unfortunately we need to deserialize the entire bundle here to handle
+            // `init_module` and verify some deployment conditions, while the VM need to do
+            // the deserialization again. Consider adding an API to MoveVM which allows to
+            // directly pass CompiledModule.
+            let modules = self.deserialize_module_bundle(&bundle)?;
+
+            // Validate the module bundle
+            self.validate_publish_request(session, &modules, expected_modules, allowed_deps)?;
+
+            // Check what modules exist before publishing.
+            let mut exists = BTreeSet::new();
+            for m in &modules {
+                let id = m.self_id();
+                if session.exists_module(&id)? {
+                    exists.insert(id);
+                }
+            }
+
+            // Publish the bundle and execute initializers
+            // publish_module_bundle doesn't actually load the published module into
+            // the loader cache. It only puts the module data in the data cache.
+            return_on_failure!(session.publish_module_bundle_with_compat_config(
+                bundle.into_inner(),
+                destination,
+                gas_meter,
+                Compatibility::new(
+                    true,
+                    true,
+                    !self
+                        .0
+                        .get_features()
+                        .is_enabled(FeatureFlag::TREAT_FRIEND_AS_PRIVATE),
+                ),
+            ));
+
+            self.execute_module_initialization(
+                session,
+                gas_meter,
+                &modules,
+                exists,
+                &[destination],
+                new_published_modules_loaded,
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Validate a publish request.
+    fn validate_publish_request(
+        &self,
+        session: &mut SessionExt,
+        modules: &[CompiledModule],
+        mut expected_modules: BTreeSet<String>,
+        allowed_deps: Option<BTreeMap<AccountAddress, BTreeSet<String>>>,
+    ) -> VMResult<()> {
+        for m in modules {
+            if !expected_modules.remove(m.self_id().name().as_str()) {
+                return Err(Self::metadata_validation_error(&format!(
+                    "unregistered module: '{}'",
+                    m.self_id().name()
+                )));
+            }
+            if let Some(allowed) = &allowed_deps {
+                for dep in m.immediate_dependencies() {
+                    if !allowed
+                        .get(dep.address())
+                        .map(|modules| {
+                            modules.contains("") || modules.contains(dep.name().as_str())
+                        })
+                        .unwrap_or(false)
+                    {
+                        return Err(Self::metadata_validation_error(&format!(
+                            "unregistered dependency: '{}'",
+                            dep
+                        )));
+                    }
+                }
+            }
+            diem_framework::verify_module_metadata(m, self.0.get_features())
+                .map_err(|err| Self::metadata_validation_error(&err.to_string()))?;
+        }
+        verifier::resource_groups::validate_resource_groups(session, modules)?;
+
+        if !expected_modules.is_empty() {
+            return Err(Self::metadata_validation_error(
+                "not all registered modules published",
+            ));
+        }
+        Ok(())
+    }
+
+    fn metadata_validation_error(msg: &str) -> VMError {
+        PartialVMError::new(StatusCode::CONSTRAINT_NOT_SATISFIED)
+            .with_message(format!("metadata and code bundle mismatch: {}", msg))
+            .finish(Location::Undefined)
+    }
+
+    fn make_standard_gas_meter(
+        &self,
+        balance: Gas,
+        log_context: &AdapterLogSchema,
+    ) -> Result<StandardGasMeter, VMStatus> {
+        Ok(StandardGasMeter::new(
+            self.0.get_gas_feature_version(),
+            self.0.get_gas_parameters(log_context)?.clone(),
+            self.0.get_storage_gas_parameters(log_context)?.clone(),
+            balance,
+        ))
+    }
+
+    fn execute_user_transaction_impl(
+        &self,
+        resolver: &impl MoveResolverExt,
         txn: &SignatureCheckedTransaction,
         log_context: &AdapterLogSchema,
-    ) -> (VMStatus, TransactionOutput) {
-        macro_rules! unwrap_or_discard {
-            ($res: expr) => {
-                match $res {
-                    Ok(s) => s,
-                    Err(e) => return discard_error_vm_status(e),
-                }
-            };
-        }
-
-        let account_currency_symbol = match get_gas_currency_code(txn) {
-            Ok(symbol) => symbol,
-            Err(err) => {
-                return discard_error_vm_status(err);
-            }
-        };
-
-        if self.0.chain_info().currency_code_required {
-            if let Err(err) = get_currency_info(&account_currency_symbol, storage) {
-                return discard_error_vm_status(err);
-            }
-        }
-
+        gas_meter: &mut impl DiemGasMeter,
+    ) -> (VMStatus, VMOutput) {
         // Revalidate the transaction.
-        let mut session = self.0.new_session(storage);
-        if let Err(err) = validate_signature_checked_transaction::<S, Self>(
-            self,
+        let mut session = self.0.new_session(resolver, SessionId::prologue(txn), true);
+        if let Err(err) = self.validate_signature_checked_transaction(
             &mut session,
+            resolver,
             txn,
             false,
             log_context,
@@ -358,116 +1033,199 @@ impl DiemVM {
             return discard_error_vm_status(err);
         };
 
-        let gas_schedule = unwrap_or_discard!(self.0.get_gas_schedule(log_context));
-        let txn_data = TransactionMetadata::new(txn);
-        let mut gas_status = GasStatus::new(gas_schedule, txn_data.max_gas_amount());
+        if self.0.get_gas_feature_version() >= 1 {
+            // Create a new session so that the data cache is flushed.
+            // This is to ensure we correctly charge for loading certain resources, even if they
+            // have been previously cached in the prologue.
+            //
+            // TODO(Gas): Do this in a better way in the future, perhaps without forcing the data cache to be flushed.
+            // By releasing resource group cache, we start with a fresh slate for resource group
+            // cost accounting.
+            resolver.release_resource_group_cache();
+            session = self.0.new_session(resolver, SessionId::txn(txn), true);
+        }
 
+        let storage_gas_params = unwrap_or_discard!(self.0.get_storage_gas_parameters(log_context));
+        let txn_data = TransactionMetadata::new(txn);
+
+        // We keep track of whether any newly published modules are loaded into the Vm's loader
+        // cache as part of executing transactions. This would allow us to decide whether the cache
+        // should be flushed later.
+        let mut new_published_modules_loaded = false;
         let result = match txn.payload() {
             payload @ TransactionPayload::Script(_)
-            | payload @ TransactionPayload::ScriptFunction(_) => self
-                .execute_script_or_script_function(
+            | payload @ TransactionPayload::EntryFunction(_) => self
+                .execute_script_or_entry_function(
+                    resolver,
                     session,
-                    &mut gas_status,
+                    gas_meter,
                     &txn_data,
                     payload,
-                    &account_currency_symbol,
                     log_context,
+                    &mut new_published_modules_loaded,
+                    &storage_gas_params.change_set_configs,
                 ),
-            TransactionPayload::ModuleBundle(m) => self.execute_modules(
+            TransactionPayload::Multisig(payload) => self.execute_multisig_transaction(
+                resolver,
                 session,
-                &mut gas_status,
+                gas_meter,
+                &txn_data,
+                payload,
+                log_context,
+                &mut new_published_modules_loaded,
+                &storage_gas_params.change_set_configs,
+            ),
+
+            // Deprecated. Will be removed in the future.
+            TransactionPayload::ModuleBundle(m) => self.execute_modules(
+                resolver,
+                session,
+                gas_meter,
                 &txn_data,
                 m,
-                &account_currency_symbol,
                 log_context,
+                &mut new_published_modules_loaded,
+                &storage_gas_params.change_set_configs,
             ),
-            TransactionPayload::WriteSet(_) => {
-                return discard_error_vm_status(VMStatus::Error(StatusCode::UNREACHABLE))
-            }
         };
 
         let gas_usage = txn_data
             .max_gas_amount()
-            .sub(gas_status.remaining_gas())
-            .get();
-        TXN_GAS_USAGE.observe(gas_usage as f64);
+            .checked_sub(gas_meter.balance())
+            .expect("Balance should always be less than or equal to max gas amount set");
+        TXN_GAS_USAGE.observe(u64::from(gas_usage) as f64);
 
         match result {
             Ok(output) => output,
             Err(err) => {
-                let txn_status = TransactionStatus::from(err.clone());
+                // Invalidate the loader cache in case there was a new module loaded from a module
+                // publish request that failed.
+                // This ensures the loader cache is flushed later to align storage with the cache.
+                // None of the modules in the bundle will be committed to storage,
+                // but some of them may have ended up in the cache.
+                if new_published_modules_loaded {
+                    self.0.mark_loader_cache_as_invalid();
+                };
+
+                let txn_status = TransactionStatus::from_vm_status(
+                    err.clone(),
+                    self.0
+                        .get_features()
+                        .is_enabled(FeatureFlag::CHARGE_INVARIANT_VIOLATION),
+                );
                 if txn_status.is_discarded() {
                     discard_error_vm_status(err)
                 } else {
                     self.failed_transaction_cleanup_and_keep_vm_status(
                         err,
-                        &mut gas_status,
+                        gas_meter,
                         &txn_data,
-                        storage,
-                        &account_currency_symbol,
+                        resolver,
                         log_context,
+                        &storage_gas_params.change_set_configs,
                     )
                 }
-            }
+            },
         }
     }
 
-    fn execute_writeset<S: MoveResolver>(
+    fn execute_user_transaction(
         &self,
-        storage: &S,
+        resolver: &impl MoveResolverExt,
+        txn: &SignatureCheckedTransaction,
+        log_context: &AdapterLogSchema,
+    ) -> (VMStatus, VMOutput) {
+        let balance = TransactionMetadata::new(txn).max_gas_amount();
+        // TODO: would we end up having a diverging behavior by creating the gas meter at an earlier time?
+        let mut gas_meter = unwrap_or_discard!(self.make_standard_gas_meter(balance, log_context));
+
+        self.execute_user_transaction_impl(resolver, txn, log_context, &mut gas_meter)
+    }
+
+    pub fn execute_user_transaction_with_custom_gas_meter<G, F>(
+        state_view: &impl StateView,
+        txn: &SignatureCheckedTransaction,
+        log_context: &AdapterLogSchema,
+        make_gas_meter: F,
+    ) -> Result<(VMStatus, VMOutput, G), VMStatus>
+    where
+        G: DiemGasMeter,
+        F: FnOnce(u64, DiemGasParameters, StorageGasParameters, Gas) -> Result<G, VMStatus>,
+    {
+        // TODO(Gas): revisit this.
+        let vm = DiemVM::new(state_view);
+
+        // TODO(Gas): avoid creating txn metadata twice.
+        let balance = TransactionMetadata::new(txn).max_gas_amount();
+        let mut gas_meter = make_gas_meter(
+            vm.0.get_gas_feature_version(),
+            vm.0.get_gas_parameters(log_context)?.clone(),
+            vm.0.get_storage_gas_parameters(log_context)?.clone(),
+            balance,
+        )?;
+
+        let resolver = StorageAdapter::new_with_cached_config(
+            state_view,
+            vm.0.get_gas_feature_version(),
+            vm.0.get_features(),
+        );
+        let (status, output) =
+            vm.execute_user_transaction_impl(&resolver, txn, log_context, &mut gas_meter);
+
+        Ok((status, output, gas_meter))
+    }
+
+    fn execute_writeset(
+        &self,
+        resolver: &impl MoveResolverExt,
         writeset_payload: &WriteSetPayload,
         txn_sender: Option<AccountAddress>,
-    ) -> Result<ChangeSet, Result<(VMStatus, TransactionOutput), VMStatus>> {
-        let mut gas_status = GasStatus::new_unmetered();
+        session_id: SessionId,
+    ) -> Result<VMChangeSet, VMStatus> {
+        let mut gas_meter = UnmeteredGasMeter;
+        let change_set_configs =
+            ChangeSetConfigs::unlimited_at_gas_feature_version(self.0.get_gas_feature_version());
 
-        Ok(match writeset_payload {
-            WriteSetPayload::Direct(change_set) => change_set.clone(),
+        match writeset_payload {
+            WriteSetPayload::Direct(change_set) => {
+                let write_set = change_set.write_set().clone();
+                let events = change_set.events().to_vec();
+                VMChangeSet::new(
+                    write_set,
+                    DeltaChangeSet::empty(),
+                    events,
+                    &change_set_configs,
+                )
+            },
             WriteSetPayload::Script { script, execute_as } => {
-                let mut tmp_session = self.0.new_session(storage);
-                let diem_version = self.0.get_diem_version().map_err(Err)?;
+                let mut tmp_session = self.0.new_session(resolver, session_id, true);
                 let senders = match txn_sender {
                     None => vec![*execute_as],
                     Some(sender) => vec![sender, *execute_as],
                 };
-                let remapped_script = if diem_version < diem_types::on_chain_config::DIEM_VERSION_2
-                {
-                    None
-                } else {
-                    script_to_script_function::remapping(script.code())
-                };
-                let execution_result = match remapped_script {
-                    // We are in this case before VERSION_2
-                    // or if there is no remapping for the script
-                    None => tmp_session.execute_script(
-                        script.code().to_vec(),
-                        script.ty_args().to_vec(),
-                        convert_txn_args(script.args()),
+
+                let loaded_func =
+                    tmp_session.load_script(script.code(), script.ty_args().to_vec())?;
+                let args =
+                    verifier::transaction_arg_validation::validate_combine_signer_and_txn_args(
+                        &mut tmp_session,
                         senders,
-                        &mut gas_status,
-                    ),
-                    Some((module, function)) => tmp_session.execute_script_function(
-                        module,
-                        function,
-                        script.ty_args().to_vec(),
                         convert_txn_args(script.args()),
-                        senders,
-                        &mut gas_status,
-                    ),
-                }
-                .and_then(|_| tmp_session.finish())
-                .map_err(|e| e.into_vm_status());
-                match execution_result {
-                    Ok((changeset, events)) => {
-                        let (cs, events) =
-                            convert_changeset_and_events(changeset, events).map_err(Err)?;
-                        ChangeSet::new(cs, events)
-                    }
-                    Err(e) => {
-                        return Err(Ok((e, discard_error_output(StatusCode::INVALID_WRITE_SET))))
-                    }
-                }
-            }
-        })
+                        &loaded_func,
+                        self.0
+                            .get_features()
+                            .is_enabled(FeatureFlag::STRUCT_CONSTRUCTORS),
+                    )?;
+
+                return_on_failure!(tmp_session.execute_script(
+                    script.code(),
+                    script.ty_args().to_vec(),
+                    args,
+                    &mut gas_meter,
+                ));
+                Ok(tmp_session.finish(&mut (), &change_set_configs)?)
+            },
+        }
     }
 
     fn read_writeset(
@@ -477,66 +1235,91 @@ impl DiemVM {
     ) -> Result<(), VMStatus> {
         // All Move executions satisfy the read-before-write property. Thus we need to read each
         // access path that the write set is going to update.
-        for (ap, _) in write_set.iter() {
+        for (state_key, _) in write_set.iter() {
             state_view
-                .get(ap)
-                .map_err(|_| VMStatus::Error(StatusCode::STORAGE_ERROR))?;
+                .get_state_value_bytes(state_key)
+                .map_err(|_| VMStatus::error(StatusCode::STORAGE_ERROR, None))?;
         }
         Ok(())
     }
 
-    pub(crate) fn process_waypoint_change_set<S: MoveResolver + StateView>(
-        &self,
-        storage: &S,
-        writeset_payload: WriteSetPayload,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        let change_set = match self.execute_writeset(storage, &writeset_payload, None) {
-            Ok(cs) => cs,
-            Err(e) => return e,
-        };
-        let (write_set, events) = change_set.into_inner();
-        self.read_writeset(storage, &write_set)?;
-        SYSTEM_TRANSACTIONS_EXECUTED.inc();
-        Ok((
-            VMStatus::Executed,
-            TransactionOutput::new(write_set, events, 0, VMStatus::Executed.into()),
-        ))
+    fn validate_waypoint_change_set(
+        change_set: &VMChangeSet,
+        log_context: &AdapterLogSchema,
+    ) -> Result<(), VMStatus> {
+        let has_new_block_event = change_set
+            .events()
+            .iter()
+            .any(|e| *e.key() == new_block_event_key());
+        let has_new_epoch_event = change_set
+            .events()
+            .iter()
+            .any(|e| *e.key() == new_epoch_event_key());
+        if has_new_block_event && has_new_epoch_event {
+            Ok(())
+        } else {
+            error!(
+                *log_context,
+                "[diem_vm] waypoint txn needs to emit new epoch and block"
+            );
+            Err(VMStatus::error(StatusCode::INVALID_WRITE_SET, None))
+        }
     }
 
-    pub(crate) fn process_block_prologue<S: MoveResolver>(
+    pub(crate) fn process_waypoint_change_set(
         &self,
-        storage: &S,
+        resolver: &impl MoveResolverExt,
+        writeset_payload: WriteSetPayload,
+        log_context: &AdapterLogSchema,
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
+        // TODO: user specified genesis id to distinguish different genesis write sets
+        let genesis_id = HashValue::zero();
+        let change_set = self.execute_writeset(
+            resolver,
+            &writeset_payload,
+            Some(diem_types::account_config::reserved_vm_address()),
+            SessionId::genesis(genesis_id),
+        )?;
+
+        Self::validate_waypoint_change_set(&change_set, log_context)?;
+        self.read_writeset(resolver, change_set.write_set())?;
+        SYSTEM_TRANSACTIONS_EXECUTED.inc();
+
+        let output = VMOutput::new(change_set, FeeStatement::zero(), VMStatus::Executed.into());
+        Ok((VMStatus::Executed, output))
+    }
+
+    pub(crate) fn process_block_prologue(
+        &self,
+        resolver: &impl MoveResolverExt,
         block_metadata: BlockMetadata,
         log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
+    ) -> Result<(VMStatus, VMOutput), VMStatus> {
         fail_point!("move_adapter::process_block_prologue", |_| {
-            Err(VMStatus::Error(
+            Err(VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                None,
             ))
         });
 
         let txn_data = TransactionMetadata {
             sender: account_config::reserved_vm_address(),
+            max_gas_amount: 0.into(),
             ..Default::default()
         };
-        let mut gas_status = GasStatus::new_unmetered();
-        let mut session = self.0.new_session(storage);
+        let mut gas_meter = UnmeteredGasMeter;
+        let mut session =
+            self.0
+                .new_session(resolver, SessionId::block_meta(&block_metadata), true);
 
-        let (round, timestamp, previous_vote, proposer) = block_metadata.into_inner();
-        let args = serialize_values(&vec![
-            MoveValue::Signer(txn_data.sender),
-            MoveValue::U64(round),
-            MoveValue::U64(timestamp),
-            MoveValue::Vector(previous_vote.into_iter().map(MoveValue::Address).collect()),
-            MoveValue::Address(proposer),
-        ]);
+        let args = serialize_values(&block_metadata.get_prologue_move_args(txn_data.sender));
         session
-            .execute_function(
-                &DIEM_BLOCK_MODULE,
+            .execute_function_bypass_visibility(
+                &BLOCK_MODULE,
                 BLOCK_PROLOGUE,
                 vec![],
                 args,
-                &mut gas_status,
+                &mut gas_meter,
             )
             .map(|_return_vals| ())
             .or_else(|e| {
@@ -547,171 +1330,154 @@ impl DiemVM {
         let output = get_transaction_output(
             &mut (),
             session,
-            gas_status.remaining_gas(),
-            &txn_data,
-            KeptVMStatus::Executed,
+            FeeStatement::zero(),
+            ExecutionStatus::Success,
+            &self
+                .0
+                .get_storage_gas_parameters(log_context)?
+                .change_set_configs,
         )?;
         Ok((VMStatus::Executed, output))
     }
 
-    pub(crate) fn process_writeset_transaction<S: MoveResolver + StateView>(
-        &self,
-        storage: &S,
-        txn: &SignatureCheckedTransaction,
-        log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        fail_point!("move_adapter::process_writeset_transaction", |_| {
-            Err(VMStatus::Error(
-                StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-            ))
-        });
+    /// Executes a SignedTransaction without performing signature verification.
+    pub fn simulate_signed_transaction(
+        txn: &SignedTransaction,
+        state_view: &impl StateView,
+    ) -> (VMStatus, TransactionOutput) {
+        let vm = DiemVM::new(state_view);
+        let simulation_vm = DiemSimulationVM(vm);
+        let log_context = AdapterLogSchema::new(state_view.id(), 0);
 
-        let account_currency_symbol = match get_gas_currency_code(txn) {
-            Ok(symbol) => symbol,
-            Err(err) => {
-                return Ok(discard_error_vm_status(err));
-            }
-        };
-
-        if self.0.chain_info().currency_code_required {
-            if let Err(err) = get_currency_info(&account_currency_symbol, storage) {
-                return Ok(discard_error_vm_status(err));
-            }
-        }
-
-        // Revalidate the transaction.
-        let mut session = self.0.new_session(storage);
-        if let Err(e) = validate_signature_checked_transaction::<S, Self>(
-            self,
-            &mut session,
+        // Try to simulate with aggregator enabled.
+        let (vm_status, vm_output) = simulation_vm.simulate_signed_transaction(
+            &simulation_vm.0.as_move_resolver(state_view),
             txn,
-            false,
-            log_context,
-        ) {
-            return Ok(discard_error_vm_status(e));
-        };
-        self.execute_writeset_transaction(
-            storage,
-            match txn.payload() {
-                TransactionPayload::WriteSet(writeset_payload) => writeset_payload,
-                TransactionPayload::ModuleBundle(_)
-                | TransactionPayload::Script(_)
-                | TransactionPayload::ScriptFunction(_) => {
-                    log_context.alert();
-                    error!(*log_context, "[diem_vm] UNREACHABLE");
-                    return Ok(discard_error_vm_status(VMStatus::Error(
-                        StatusCode::UNREACHABLE,
-                    )));
-                }
+            &log_context,
+            true,
+        );
+
+        // Because simulation returns a VMOutput, it has both writes and deltas
+        // produced by the transaction. Conversion to TransactionOutput materializes
+        // deltas and merges them with the write set, and can fail (e.g. applying
+        // a delta led to integer overflow). It is important to catch the failing
+        // case and re-simulate the transaction without an aggregator, in order to
+        // obtain the precise location of abort and gas used.
+        match vm_output.into_transaction_output(state_view) {
+            Ok(output) => (vm_status, output),
+            Err(_) => {
+                // Conversion to TransactionOutput failed, re-simulate without aggregators.
+                let (vm_status, vm_output) = simulation_vm.simulate_signed_transaction(
+                    &simulation_vm.0.as_move_resolver(state_view),
+                    txn,
+                    &log_context,
+                    false,
+                );
+
+                // Make sure to return the right types. Note that here conversion
+                // never fails because delta change set is empty.
+                (
+                    vm_status,
+                    vm_output.into_transaction_output(state_view).expect(
+                        "Conversion to TransactionOutput without aggregator always succeeds.",
+                    ),
+                )
             },
-            TransactionMetadata::new(txn),
-            log_context,
-        )
+        }
     }
 
-    pub fn execute_writeset_transaction<S: MoveResolver + StateView>(
-        &self,
-        storage: &S,
-        writeset_payload: &WriteSetPayload,
-        txn_data: TransactionMetadata,
-        log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
-        let change_set =
-            match self.execute_writeset(storage, writeset_payload, Some(txn_data.sender())) {
-                Ok(change_set) => change_set,
-                Err(e) => return e,
-            };
+    pub fn execute_view_function(
+        state_view: &impl StateView,
+        module_id: ModuleId,
+        func_name: Identifier,
+        type_args: Vec<TypeTag>,
+        arguments: Vec<Vec<u8>>,
+        gas_budget: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        let vm = DiemVM::new(state_view);
+        let log_context = AdapterLogSchema::new(state_view.id(), 0);
+        let mut gas_meter = StandardGasMeter::new(
+            vm.0.get_gas_feature_version(),
+            vm.0.get_gas_parameters(&log_context)?.clone(),
+            vm.0.get_storage_gas_parameters(&log_context)?.clone(),
+            gas_budget,
+        );
+        let resolver = vm.as_move_resolver(state_view);
+        let mut session = vm.new_session(&resolver, SessionId::Void, true);
 
-        // Run the epilogue function.
-        let mut session = self.0.new_session(storage);
-        self.0.run_writeset_epilogue(
+        let func_inst = session.load_function(&module_id, &func_name, &type_args)?;
+        let metadata = vm.0.extract_module_metadata(&module_id);
+        let arguments = verifier::view_function::validate_view_function(
             &mut session,
-            &txn_data,
-            writeset_payload.should_trigger_reconfiguration_by_default(),
-            log_context,
+            arguments,
+            func_name.as_ident_str(),
+            &func_inst,
+            metadata.as_ref(),
+            vm.0.get_features()
+                .is_enabled(FeatureFlag::STRUCT_CONSTRUCTORS),
         )?;
 
-        if let Err(e) = self.read_writeset(storage, change_set.write_set()) {
-            // Any error at this point would be an invalid writeset
-            return Ok((e, discard_error_output(StatusCode::INVALID_WRITE_SET)));
-        };
-
-        let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
-        let (epilogue_writeset, epilogue_events) = convert_changeset_and_events(changeset, events)?;
-
-        // Make sure epilogue WriteSet doesn't intersect with the writeset in TransactionPayload.
-        if !epilogue_writeset
-            .iter()
-            .map(|(ap, _)| ap)
-            .collect::<HashSet<_>>()
-            .is_disjoint(
-                &change_set
-                    .write_set()
-                    .iter()
-                    .map(|(ap, _)| ap)
-                    .collect::<HashSet<_>>(),
+        Ok(session
+            .execute_function_bypass_visibility(
+                &module_id,
+                func_name.as_ident_str(),
+                type_args,
+                arguments,
+                &mut gas_meter,
             )
-        {
-            let vm_status = VMStatus::Error(StatusCode::INVALID_WRITE_SET);
-            return Ok(discard_error_vm_status(vm_status));
-        }
-        if !epilogue_events
-            .iter()
-            .map(|event| event.key())
-            .collect::<HashSet<_>>()
-            .is_disjoint(
-                &change_set
-                    .events()
-                    .iter()
-                    .map(|event| event.key())
-                    .collect::<HashSet<_>>(),
-            )
-        {
-            let vm_status = VMStatus::Error(StatusCode::INVALID_WRITE_SET);
-            return Ok(discard_error_vm_status(vm_status));
-        }
-
-        let write_set = WriteSetMut::new(
-            epilogue_writeset
-                .iter()
-                .chain(change_set.write_set().iter())
-                .cloned()
-                .collect(),
-        )
-        .freeze()
-        .map_err(|_| VMStatus::Error(StatusCode::INVALID_WRITE_SET))?;
-        let events = change_set
-            .events()
-            .iter()
-            .chain(epilogue_events.iter())
-            .cloned()
-            .collect();
-        SYSTEM_TRANSACTIONS_EXECUTED.inc();
-
-        Ok((
-            VMStatus::Executed,
-            TransactionOutput::new(
-                write_set,
-                events,
-                0,
-                TransactionStatus::Keep(KeptVMStatus::Executed),
-            ),
-        ))
+            .map_err(|err| anyhow!("Failed to execute function: {:?}", err))?
+            .return_values
+            .into_iter()
+            .map(|(bytes, _ty)| bytes)
+            .collect::<Vec<_>>())
     }
 
-    /// Alternate form of 'execute_block' that keeps the vm_status before it goes into the
-    /// `TransactionOutput`
-    pub fn execute_block_and_keep_vm_status(
-        transactions: Vec<Transaction>,
-        state_view: &impl StateView,
-    ) -> Result<Vec<(VMStatus, TransactionOutput)>, VMStatus> {
-        let mut state_view_cache = StateViewCache::new(state_view);
-        let count = transactions.len();
-        let vm = DiemVM::new(&state_view_cache);
-        let res = adapter_common::execute_block_impl(&vm, transactions, &mut state_view_cache)?;
-        // Record the histogram count for transactions per block.
-        BLOCK_TRANSACTION_COUNT.observe(count as f64);
-        Ok(res)
+    fn run_prologue_with_payload(
+        &self,
+        session: &mut SessionExt,
+        resolver: &impl MoveResolverExt,
+        payload: &TransactionPayload,
+        txn_data: &TransactionMetadata,
+        log_context: &AdapterLogSchema,
+        // Whether the prologue is run as part of tx simulation.
+        is_simulation: bool,
+    ) -> Result<(), VMStatus> {
+        match payload {
+            TransactionPayload::Script(_) => {
+                self.0.check_gas(resolver, txn_data, log_context)?;
+                self.0.run_script_prologue(session, txn_data, log_context)
+            },
+            TransactionPayload::EntryFunction(_) => {
+                // NOTE: Script and EntryFunction shares the same prologue
+                self.0.check_gas(resolver, txn_data, log_context)?;
+                self.0.run_script_prologue(session, txn_data, log_context)
+            },
+            TransactionPayload::Multisig(multisig_payload) => {
+                self.0.check_gas(resolver, txn_data, log_context)?;
+                // Still run script prologue for multisig transaction to ensure the same tx
+                // validations are still run for this multisig execution tx, which is submitted by
+                // one of the owners.
+                self.0.run_script_prologue(session, txn_data, log_context)?;
+                // Skip validation if this is part of tx simulation.
+                // This allows simulating multisig txs without having to first create the multisig
+                // tx.
+                if !is_simulation {
+                    self.0
+                        .run_multisig_prologue(session, txn_data, multisig_payload, log_context)
+                } else {
+                    Ok(())
+                }
+            },
+
+            // Deprecated. Will be removed in the future.
+            TransactionPayload::ModuleBundle(_module) => {
+                if MODULE_BUNDLE_DISALLOWED.load(Ordering::Relaxed) {
+                    return Err(VMStatus::error(StatusCode::FEATURE_UNDER_GATING, None));
+                }
+                self.0.check_gas(resolver, txn_data, log_context)?;
+                self.0.run_module_prologue(session, txn_data, log_context)
+            },
+        }
     }
 }
 
@@ -724,37 +1490,66 @@ impl VMExecutor for DiemVM {
     /// transaction output.
     fn execute_block(
         transactions: Vec<Transaction>,
-        state_view: &impl StateView,
+        state_view: &(impl StateView + Sync),
+        maybe_block_gas_limit: Option<u64>,
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
         fail_point!("move_adapter::execute_block", |_| {
-            Err(VMStatus::Error(
+            Err(VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                None,
             ))
         });
+        let log_context = AdapterLogSchema::new(state_view.id(), 0);
+        info!(
+            log_context,
+            "Executing block, transaction count: {}",
+            transactions.len()
+        );
 
-        // Execute transactions in parallel if on chain config is set and loaded.
-        if let Some(read_write_set_analysis) =
-            ParallelExecutionConfig::fetch_config(&RemoteStorage::new(state_view))
-                .and_then(|config| config.read_write_analysis_result)
-                .map(|config| config.into_inner())
-        {
-            let analysis_reuslt = NormalizedReadWriteSetAnalysis::new(read_write_set_analysis);
-
-            // Note that writeset transactions will be executed sequentially as it won't be inferred
-            // by the read write set analysis and thus fall into the sequential path.
-            let (result, _) = crate::parallel_executor::ParallelDiemVM::execute_block(
-                &analysis_reuslt,
-                transactions,
-                state_view,
-            )?;
-            Ok(result)
-        } else {
-            let output = Self::execute_block_and_keep_vm_status(transactions, state_view)?;
-            Ok(output
-                .into_iter()
-                .map(|(_vm_status, txn_output)| txn_output)
-                .collect())
+        let count = transactions.len();
+        let ret = BlockDiemVM::execute_block::<
+            _,
+            NoOpTransactionCommitHook<DiemTransactionOutput, VMStatus>,
+        >(
+            Arc::clone(&RAYON_EXEC_POOL),
+            BlockExecutorTransactions::Unsharded(transactions),
+            state_view,
+            Self::get_concurrency_level(),
+            maybe_block_gas_limit,
+            None,
+        );
+        if ret.is_ok() {
+            // Record the histogram count for transactions per block.
+            BLOCK_TRANSACTION_COUNT.observe(count as f64);
         }
+        ret
+    }
+
+    fn execute_block_sharded<S: StateView + Sync + Send + 'static>(
+        sharded_block_executor: &ShardedBlockExecutor<S>,
+        transactions: Vec<SubBlocksForShard<Transaction>>,
+        state_view: Arc<S>,
+        maybe_block_gas_limit: Option<u64>,
+    ) -> Result<Vec<TransactionOutput>, VMStatus> {
+        let log_context = AdapterLogSchema::new(state_view.id(), 0);
+        info!(
+            log_context,
+            "Executing block, transaction count: {}",
+            transactions.iter().map(|s| s.num_txns()).sum::<usize>()
+        );
+
+        let count = transactions.len();
+        let ret = sharded_block_executor.execute_block(
+            state_view,
+            transactions,
+            DiemVM::get_concurrency_level(),
+            maybe_block_gas_limit,
+        );
+        if ret.is_ok() {
+            // Record the histogram count for transactions per block.
+            BLOCK_TRANSACTION_COUNT.observe(count as f64);
+        }
+        ret
     }
 }
 
@@ -766,7 +1561,7 @@ impl VMValidator for DiemVM {
     /// 1. The signature on the `SignedTransaction` matches the public key included in the
     ///    transaction
     /// 2. The script to be executed is under given specific configuration.
-    /// 3. Invokes `DiemAccount.prologue`, which checks properties such as the transaction has the
+    /// 3. Invokes `Account.prologue`, which checks properties such as the transaction has the
     /// right sequence number and the sender has enough balance to pay for the gas.
     /// TBD:
     /// 1. Transaction arguments matches the main function's type signature.
@@ -776,13 +1571,55 @@ impl VMValidator for DiemVM {
         transaction: SignedTransaction,
         state_view: &impl StateView,
     ) -> VMValidatorResult {
-        validate_signed_transaction(self, transaction, state_view)
+        let _timer = TXN_VALIDATION_SECONDS.start_timer();
+        let log_context = AdapterLogSchema::new(state_view.id(), 0);
+        let txn = match Self::check_signature(transaction) {
+            Ok(t) => t,
+            _ => {
+                return VMValidatorResult::error(StatusCode::INVALID_SIGNATURE);
+            },
+        };
+
+        let resolver = self.as_move_resolver(state_view);
+        let mut session = self
+            .0
+            .new_session(&resolver, SessionId::prologue(&txn), true);
+        let validation_result = self.validate_signature_checked_transaction(
+            &mut session,
+            &resolver,
+            &txn,
+            true,
+            &log_context,
+        );
+
+        // Increment the counter for transactions verified.
+        let (counter_label, result) = match validation_result {
+            Ok(_) => (
+                "success",
+                VMValidatorResult::new(None, txn.gas_unit_price()),
+            ),
+            Err(err) => (
+                "failure",
+                VMValidatorResult::new(Some(err.status_code()), 0),
+            ),
+        };
+
+        TRANSACTIONS_VALIDATED
+            .with_label_values(&[counter_label])
+            .inc();
+
+        result
     }
 }
 
 impl VMAdapter for DiemVM {
-    fn new_session<'r, R: MoveResolver>(&self, remote: &'r R) -> Session<'r, '_, R> {
-        self.0.new_session(remote)
+    fn new_session<'r>(
+        &self,
+        resolver: &'r impl MoveResolverExt,
+        session_id: SessionId,
+        aggregator_enabled: bool,
+    ) -> SessionExt<'r, '_> {
+        self.0.new_session(resolver, session_id, aggregator_enabled)
     }
 
     fn check_signature(txn: SignedTransaction) -> Result<SignatureCheckedTransaction> {
@@ -790,77 +1627,35 @@ impl VMAdapter for DiemVM {
     }
 
     fn check_transaction_format(&self, txn: &SignedTransaction) -> Result<(), VMStatus> {
-        if txn.is_multi_agent() && self.0.get_diem_version()? < DIEM_VERSION_3 {
-            // Multi agent is not allowed
-            return Err(VMStatus::Error(StatusCode::FEATURE_UNDER_GATING));
-        }
         if txn.contains_duplicate_signers() {
-            return Err(VMStatus::Error(StatusCode::SIGNERS_CONTAIN_DUPLICATES));
+            return Err(VMStatus::error(
+                StatusCode::SIGNERS_CONTAIN_DUPLICATES,
+                None,
+            ));
         }
 
         Ok(())
     }
 
-    fn get_gas_price<S: MoveResolver>(
+    fn run_prologue(
         &self,
-        txn: &SignedTransaction,
-        remote_cache: &S,
-    ) -> Result<u64, VMStatus> {
-        let gas_price = txn.gas_unit_price();
-        let currency_code = get_gas_currency_code(txn)?;
-
-        let normalized_gas_price = if self.0.chain_info().currency_code_required {
-            match get_currency_info(&currency_code, remote_cache) {
-                Ok(info) => info.convert_to_xdx(gas_price),
-                Err(err) => {
-                    return Err(err);
-                }
-            }
-        } else {
-            gas_price
-        };
-
-        Ok(normalized_gas_price)
-    }
-
-    fn run_prologue<S: MoveResolver>(
-        &self,
-        session: &mut Session<S>,
+        session: &mut SessionExt,
+        resolver: &impl MoveResolverExt,
         transaction: &SignatureCheckedTransaction,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
-        let currency_code = get_gas_currency_code(transaction)?;
         let txn_data = TransactionMetadata::new(transaction);
-        //let account_blob = session.data_cache.get_resource
-        match transaction.payload() {
-            TransactionPayload::Script(_) => {
-                self.0.check_gas(&txn_data, log_context)?;
-                self.0
-                    .run_script_prologue(session, &txn_data, &currency_code, log_context)
-            }
-            TransactionPayload::ScriptFunction(_) => {
-                // gate the behavior until the Diem version is ready
-                if self.0.get_diem_version()? < DIEM_VERSION_2 {
-                    return Err(VMStatus::Error(StatusCode::FEATURE_UNDER_GATING));
-                }
-                // NOTE: Script and ScriptFunction shares the same prologue
-                self.0.check_gas(&txn_data, log_context)?;
-                self.0
-                    .run_script_prologue(session, &txn_data, &currency_code, log_context)
-            }
-            TransactionPayload::ModuleBundle(_module) => {
-                self.0.check_gas(&txn_data, log_context)?;
-                self.0
-                    .run_module_prologue(session, &txn_data, &currency_code, log_context)
-            }
-            TransactionPayload::WriteSet(_cs) => {
-                self.0
-                    .run_writeset_prologue(session, &txn_data, log_context)
-            }
-        }
+        self.run_prologue_with_payload(
+            session,
+            resolver,
+            transaction.payload(),
+            &txn_data,
+            log_context,
+            false,
+        )
     }
 
-    fn should_restart_execution(vm_output: &TransactionOutput) -> bool {
+    fn should_restart_execution(vm_output: &VMOutput) -> bool {
         let new_epoch_event_key = diem_types::on_chain_config::new_epoch_event_key();
         vm_output
             .events()
@@ -868,28 +1663,90 @@ impl VMAdapter for DiemVM {
             .any(|event| *event.key() == new_epoch_event_key)
     }
 
-    fn execute_single_transaction<S: MoveResolver + StateView>(
+    fn execute_single_transaction(
         &self,
         txn: &PreprocessedTransaction,
-        data_cache: &S,
+        resolver: &impl MoveResolverExt,
         log_context: &AdapterLogSchema,
-    ) -> Result<(VMStatus, TransactionOutput, Option<String>), VMStatus> {
+    ) -> Result<(VMStatus, VMOutput, Option<String>), VMStatus> {
         Ok(match txn {
             PreprocessedTransaction::BlockMetadata(block_metadata) => {
+                fail_point!("diem_vm::execution::block_metadata");
                 let (vm_status, output) =
-                    self.process_block_prologue(data_cache, block_metadata.clone(), log_context)?;
+                    self.process_block_prologue(resolver, block_metadata.clone(), log_context)?;
                 (vm_status, output, Some("block_prologue".to_string()))
-            }
+            },
             PreprocessedTransaction::WaypointWriteSet(write_set_payload) => {
-                let (vm_status, output) =
-                    self.process_waypoint_change_set(data_cache, write_set_payload.clone())?;
+                let (vm_status, output) = self.process_waypoint_change_set(
+                    resolver,
+                    write_set_payload.clone(),
+                    log_context,
+                )?;
                 (vm_status, output, Some("waypoint_write_set".to_string()))
-            }
+            },
             PreprocessedTransaction::UserTransaction(txn) => {
+                fail_point!("diem_vm::execution::user_transaction");
                 let sender = txn.sender().to_string();
                 let _timer = TXN_TOTAL_SECONDS.start_timer();
-                let (vm_status, output) =
-                    self.execute_user_transaction(data_cache, txn, log_context);
+                let (vm_status, output) = self.execute_user_transaction(resolver, txn, log_context);
+
+                if let StatusType::InvariantViolation = vm_status.status_type() {
+                    match vm_status.status_code() {
+                        // Type resolution failure can be triggered by user input when providing a bad type argument, skip this case.
+                        StatusCode::TYPE_RESOLUTION_FAILURE
+                            if vm_status.sub_status()
+                                == Some(move_core_types::vm_status::sub_status::type_resolution_failure::EUSER_TYPE_LOADING_FAILURE) => {},
+                        // The known Move function failure and type resolution failure could be a result of speculative execution. Use speculative logger.
+                        StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION
+                        | StatusCode::TYPE_RESOLUTION_FAILURE => {
+                            speculative_error!(
+                                log_context,
+                                format!(
+                                    "[diem_vm] Transaction breaking invariant violation. txn: {:?}, status: {:?}",
+                                    bcs::to_bytes::<SignedTransaction>(&**txn),
+                                    vm_status
+                                ),
+                            );
+                        },
+                        // Paranoid mode failure. We need to be alerted about this ASAP.
+                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR
+                            if vm_status.sub_status()
+                                == Some(move_core_types::vm_status::sub_status::unknown_invariant_violation::EPARANOID_FAILURE) =>
+                        {
+                            error!(
+                                *log_context,
+                                "[diem_vm] Transaction breaking paranoid mode. txn: {:?}, status: {:?}",
+                                bcs::to_bytes::<SignedTransaction>(&**txn),
+                                vm_status,
+                            );
+                        },
+                        // Paranoid mode failure but with reference counting
+                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR
+                            if vm_status.sub_status()
+                                == Some(move_core_types::vm_status::sub_status::unknown_invariant_violation::EREFERENCE_COUNTING_FAILURE) =>
+                        {
+                            error!(
+                                *log_context,
+                                "[diem_vm] Transaction breaking paranoid mode. txn: {:?}, status: {:?}",
+                                bcs::to_bytes::<SignedTransaction>(&**txn),
+                                vm_status,
+                            );
+                        },
+                        // Ignore Storage Error as it can be intentionally triggered by parallel execution.
+                        StatusCode::STORAGE_ERROR => (),
+                        // We will log the rest of invariant violation directly with regular logger as they shouldn't happen.
+                        //
+                        // TODO: Add different counters for the error categories here.
+                        _ => {
+                            error!(
+                                *log_context,
+                                "[diem_vm] Transaction breaking invariant violation. txn: {:?}, status: {:?}",
+                                bcs::to_bytes::<SignedTransaction>(&**txn),
+                                vm_status,
+                            );
+                        },
+                    }
+                }
 
                 // Increment the counter for user transactions executed.
                 let counter_label = match output.status() {
@@ -901,26 +1758,17 @@ impl VMAdapter for DiemVM {
                     USER_TRANSACTIONS_EXECUTED.with_label_values(&[label]).inc();
                 }
                 (vm_status, output, Some(sender))
-            }
-            PreprocessedTransaction::WriteSet(txn) => {
-                let (vm_status, output) =
-                    self.process_writeset_transaction(data_cache, txn, log_context)?;
-                (vm_status, output, Some("write_set".to_string()))
-            }
+            },
             PreprocessedTransaction::InvalidSignature => {
                 let (vm_status, output) =
-                    discard_error_vm_status(VMStatus::Error(StatusCode::INVALID_SIGNATURE));
+                    discard_error_vm_status(VMStatus::error(StatusCode::INVALID_SIGNATURE, None));
                 (vm_status, output, None)
-            }
+            },
             PreprocessedTransaction::StateCheckpoint => {
-                let output = TransactionOutput::new(
-                    WriteSet::default(),
-                    Vec::new(),
-                    0,
-                    TransactionStatus::Keep(KeptVMStatus::Executed),
-                );
+                let status = TransactionStatus::Keep(ExecutionStatus::Success);
+                let output = VMOutput::empty_with_status(status);
                 (VMStatus::Executed, output, Some("state_checkpoint".into()))
-            }
+            },
         })
     }
 }
@@ -934,5 +1782,169 @@ impl AsRef<DiemVMImpl> for DiemVM {
 impl AsMut<DiemVMImpl> for DiemVM {
     fn as_mut(&mut self) -> &mut DiemVMImpl {
         &mut self.0
+    }
+}
+
+impl DiemSimulationVM {
+    fn validate_simulated_transaction(
+        &self,
+        session: &mut SessionExt,
+        resolver: &impl MoveResolverExt,
+        transaction: &SignedTransaction,
+        txn_data: &TransactionMetadata,
+        log_context: &AdapterLogSchema,
+    ) -> Result<(), VMStatus> {
+        self.0.check_transaction_format(transaction)?;
+        self.0.run_prologue_with_payload(
+            session,
+            resolver,
+            transaction.payload(),
+            txn_data,
+            log_context,
+            true,
+        )
+    }
+
+    fn simulate_signed_transaction(
+        &self,
+        resolver: &impl MoveResolverExt,
+        txn: &SignedTransaction,
+        log_context: &AdapterLogSchema,
+        aggregator_enabled: bool,
+    ) -> (VMStatus, VMOutput) {
+        // simulation transactions should not carry valid signatures, otherwise malicious fullnodes
+        // may execute them without user's explicit permission.
+        if txn.signature_is_valid() {
+            return discard_error_vm_status(VMStatus::error(StatusCode::INVALID_SIGNATURE, None));
+        }
+
+        // Revalidate the transaction.
+        let txn_data = TransactionMetadata::new(txn);
+        let mut session =
+            self.0
+                .new_session(resolver, SessionId::txn_meta(&txn_data), aggregator_enabled);
+        if let Err(err) =
+            self.validate_simulated_transaction(&mut session, resolver, txn, &txn_data, log_context)
+        {
+            return discard_error_vm_status(err);
+        };
+
+        let gas_params = match self.0 .0.get_gas_parameters(log_context) {
+            Err(err) => return discard_error_vm_status(err),
+            Ok(s) => s,
+        };
+        let storage_gas_params = match self.0 .0.get_storage_gas_parameters(log_context) {
+            Err(err) => return discard_error_vm_status(err),
+            Ok(s) => s,
+        };
+
+        let mut gas_meter = StandardGasMeter::new(
+            self.0 .0.get_gas_feature_version(),
+            gas_params.clone(),
+            storage_gas_params.clone(),
+            txn_data.max_gas_amount(),
+        );
+
+        let mut new_published_modules_loaded = false;
+        let result = match txn.payload() {
+            payload @ TransactionPayload::Script(_)
+            | payload @ TransactionPayload::EntryFunction(_) => {
+                self.0.execute_script_or_entry_function(
+                    resolver,
+                    session,
+                    &mut gas_meter,
+                    &txn_data,
+                    payload,
+                    log_context,
+                    &mut new_published_modules_loaded,
+                    &storage_gas_params.change_set_configs,
+                )
+            },
+            TransactionPayload::Multisig(multisig) => {
+                if let Some(payload) = multisig.transaction_payload.clone() {
+                    match payload {
+                        MultisigTransactionPayload::EntryFunction(entry_function) => {
+                            diem_try!({
+                                return_on_failure!(self.0.execute_multisig_entry_function(
+                                    &mut session,
+                                    &mut gas_meter,
+                                    multisig.multisig_address,
+                                    &entry_function,
+                                    &mut new_published_modules_loaded,
+                                ));
+                                // TODO: Deduplicate this against execute_multisig_transaction
+                                // A bit tricky since we need to skip success/failure cleanups,
+                                // which is in the middle. Introducing a boolean would make the code
+                                // messier.
+                                let respawned_session =
+                                    self.0.charge_change_set_and_respawn_session(
+                                        session,
+                                        resolver,
+                                        &mut gas_meter,
+                                        &storage_gas_params.change_set_configs,
+                                        &txn_data,
+                                    )?;
+
+                                self.0.success_transaction_cleanup(
+                                    respawned_session,
+                                    &mut gas_meter,
+                                    &txn_data,
+                                    log_context,
+                                    &storage_gas_params.change_set_configs,
+                                )
+                            })
+                        },
+                    }
+                } else {
+                    Err(VMStatus::error(StatusCode::MISSING_DATA, None))
+                }
+            },
+
+            // Deprecated. Will be removed in the future.
+            TransactionPayload::ModuleBundle(m) => self.0.execute_modules(
+                resolver,
+                session,
+                &mut gas_meter,
+                &txn_data,
+                m,
+                log_context,
+                &mut new_published_modules_loaded,
+                &storage_gas_params.change_set_configs,
+            ),
+        };
+
+        match result {
+            Ok(output) => output,
+            Err(err) => {
+                // Invalidate the loader cache in case there was a new module loaded from a module
+                // publish request that failed.
+                // This ensures the loader cache is flushed later to align storage with the cache.
+                // None of the modules in the bundle will be committed to storage,
+                // but some of them may have ended up in the cache.
+                if new_published_modules_loaded {
+                    self.0 .0.mark_loader_cache_as_invalid();
+                };
+                let txn_status = TransactionStatus::from_vm_status(
+                    err.clone(),
+                    self.0
+                         .0
+                        .get_features()
+                        .is_enabled(FeatureFlag::CHARGE_INVARIANT_VIOLATION),
+                );
+                if txn_status.is_discarded() {
+                    discard_error_vm_status(err)
+                } else {
+                    let (vm_status, output) = self.0.failed_transaction_cleanup_and_keep_vm_status(
+                        err,
+                        &mut gas_meter,
+                        &txn_data,
+                        resolver,
+                        log_context,
+                        &storage_gas_params.change_set_configs,
+                    );
+                    (vm_status, output)
+                }
+            },
+        }
     }
 }

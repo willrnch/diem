@@ -1,38 +1,56 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use diem_state_view::StateView;
-use diem_types::access_path::AccessPath;
+use diem_state_view::TStateView;
+use diem_types::{
+    access_path::AccessPath,
+    state_store::{
+        state_key::StateKey, state_storage_usage::StateStorageUsage, state_value::StateValue,
+    },
+};
 use move_core_types::language_storage::ModuleId;
 use std::collections::HashMap;
 
 // `StateView` has no data given we are creating the genesis
 pub(crate) struct GenesisStateView {
-    data: HashMap<AccessPath, Vec<u8>>,
+    state_data: HashMap<StateKey, Vec<u8>>,
 }
 
 impl GenesisStateView {
     pub(crate) fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            state_data: HashMap::new(),
         }
     }
 
     pub(crate) fn add_module(&mut self, module_id: &ModuleId, blob: &[u8]) {
-        let access_path = AccessPath::from(module_id);
-        self.data.insert(access_path, blob.to_vec());
+        self.state_data.insert(
+            StateKey::access_path(AccessPath::from(module_id)),
+            blob.to_vec(),
+        );
     }
 }
 
-impl StateView for GenesisStateView {
-    fn get(&self, access_path: &AccessPath) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.get(access_path).cloned())
+impl TStateView for GenesisStateView {
+    type Key = StateKey;
+
+    fn get_state_value(&self, state_key: &StateKey) -> Result<Option<StateValue>> {
+        Ok(self
+            .state_data
+            .get(state_key)
+            .cloned()
+            .map(StateValue::new_legacy))
     }
 
     fn is_genesis(&self) -> bool {
         true
+    }
+
+    fn get_usage(&self) -> Result<StateStorageUsage> {
+        Ok(StateStorageUsage::zero())
     }
 }

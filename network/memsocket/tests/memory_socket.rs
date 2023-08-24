@@ -1,11 +1,12 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use diem_memsocket::MemorySocket;
 use futures::{
     executor::block_on,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use memsocket::MemorySocket;
 use std::io::Result;
 
 #[test]

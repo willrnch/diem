@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::integer_arithmetic)]
 
@@ -10,18 +11,19 @@ use crate::{
     vote_data::VoteData,
 };
 use diem_crypto::{
+    bls12381,
     ed25519::Ed25519PrivateKey,
     hash::{CryptoHash, HashValue},
+    PrivateKey, Uniform,
 };
 use diem_types::{
     account_address::AccountAddress,
     block_info::BlockInfo,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    ledger_info::{generate_ledger_info_with_sig, LedgerInfo},
     test_helpers::transaction_test_helpers::get_test_signed_txn,
     validator_signer::{proptests, ValidatorSigner},
 };
 use proptest::prelude::*;
-use std::collections::BTreeMap;
 
 type LinearizedBlockForest = Vec<Block>;
 
@@ -41,12 +43,13 @@ prop_compose! {
         parent_qc in Just(parent_qc)
     ) -> Block {
         Block::new_proposal(
-            vec![],
+            Payload::empty(false),
             round,
             diem_infallible::duration_since_epoch().as_micros() as u64,
             parent_qc,
             &signer,
-        )
+            Vec::new(),
+        ).unwrap()
     }
 }
 
@@ -87,6 +90,7 @@ prop_compose! {
                 block_data: BlockData::new_proposal(
                     block.payload().unwrap().clone(),
                     block.author().unwrap(),
+                    (*block.block_data().failed_authors().unwrap()).clone(),
                     block.round(),
                     diem_infallible::duration_since_epoch().as_micros() as u64,
                     block.quorum_cert().clone(),
@@ -151,14 +155,14 @@ prop_compose! {
 /// vector
 fn block_forest_from_keys(
     depth: u32,
-    keypairs: Vec<Ed25519PrivateKey>,
+    key_pairs: Vec<bls12381::PrivateKey>,
 ) -> impl Strategy<Value = LinearizedBlockForest> {
     let leaf = leaf_strategy().prop_map(|block| vec![block]);
     // Note that having `expected_branch_size` of 1 seems to generate significantly larger trees
     // than desired (this is my understanding after reading the documentation:
     // https://docs.rs/proptest/0.3.0/proptest/strategy/trait.Strategy.html#method.prop_recursive)
     leaf.prop_recursive(depth, depth, 2, move |inner| {
-        child(proptests::mostly_in_keypair_pool(keypairs.clone()), inner)
+        child(proptests::mostly_in_keypair_pool(key_pairs.clone()), inner)
     })
 }
 
@@ -166,7 +170,7 @@ fn block_forest_from_keys(
 pub fn block_forest_and_its_keys(
     quorum_size: usize,
     depth: u32,
-) -> impl Strategy<Value = (Vec<Ed25519PrivateKey>, LinearizedBlockForest)> {
+) -> impl Strategy<Value = (Vec<bls12381::PrivateKey>, LinearizedBlockForest)> {
     proptest::collection::vec(proptests::arb_signing_key(), quorum_size).prop_flat_map(
         move |private_key| {
             (
@@ -182,7 +186,7 @@ pub fn placeholder_ledger_info() -> LedgerInfo {
 }
 
 pub fn gen_test_certificate(
-    signers: Vec<&ValidatorSigner>,
+    signers: &[ValidatorSigner],
     block: BlockInfo,
     parent_block: BlockInfo,
     committed_block: Option<BlockInfo>,
@@ -194,23 +198,17 @@ pub fn gen_test_certificate(
             let mut placeholder = placeholder_ledger_info();
             placeholder.set_consensus_data_hash(vote_data.hash());
             placeholder
-        }
+        },
     };
-
-    let mut signatures = BTreeMap::new();
-    for signer in signers {
-        let li_sig = signer.sign(&ledger_info);
-        signatures.insert(signer.author(), li_sig);
-    }
 
     QuorumCert::new(
         vote_data,
-        LedgerInfoWithSignatures::new(ledger_info, signatures),
+        generate_ledger_info_with_sig(signers, ledger_info),
     )
 }
 
 pub fn placeholder_certificate_for_block(
-    signers: Vec<&ValidatorSigner>,
+    signers: &[ValidatorSigner],
     certified_block_id: HashValue,
     certified_block_round: u64,
     certified_parent_block_id: HashValue,
@@ -245,15 +243,9 @@ pub fn placeholder_certificate_for_block(
 
     ledger_info_placeholder.set_consensus_data_hash(vote_data.hash());
 
-    let mut signatures = BTreeMap::new();
-    for signer in signers {
-        let li_sig = signer.sign(&ledger_info_placeholder);
-        signatures.insert(signer.author(), li_sig);
-    }
-
     QuorumCert::new(
         vote_data,
-        LedgerInfoWithSignatures::new(ledger_info_placeholder, signatures),
+        generate_ledger_info_with_sig(signers, ledger_info_placeholder.clone()),
     )
 }
 
@@ -267,16 +259,11 @@ pub fn certificate_for_genesis() -> QuorumCert {
 
 pub fn random_payload(count: usize) -> Payload {
     let address = AccountAddress::random();
-    let signer = ValidatorSigner::random(None);
-    (0..count)
-        .map(|i| {
-            get_test_signed_txn(
-                address,
-                i as u64,
-                signer.private_key(),
-                signer.public_key(),
-                None,
-            )
-        })
-        .collect()
+    let private_key = Ed25519PrivateKey::generate_for_testing();
+    let public_key = private_key.public_key();
+    Payload::DirectMempool(
+        (0..count)
+            .map(|i| get_test_signed_txn(address, i as u64, &private_key, public_key.clone(), None))
+            .collect(),
+    )
 }

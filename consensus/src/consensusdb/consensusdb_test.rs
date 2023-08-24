@@ -1,9 +1,14 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use consensus_types::block::block_test_utils::certificate_for_genesis;
+use diem_consensus_types::{
+    block::block_test_utils::certificate_for_genesis,
+    common::{Author, Payload},
+};
 use diem_temppath::TempPath;
+use diem_types::aggregate_signature::AggregateSignature;
 
 #[test]
 fn test_put_get() {
@@ -24,24 +29,20 @@ fn test_put_get() {
     assert_eq!(db.get_quorum_certificates().unwrap().len(), 1);
 
     let tc = vec![0u8, 1, 2];
-    db.save_highest_timeout_certificate(tc.clone()).unwrap();
     db.save_highest_2chain_timeout_certificate(tc.clone())
         .unwrap();
 
     let vote = vec![2u8, 1, 0];
     db.save_vote(vote.clone()).unwrap();
 
-    let (vote_1, tc_1, tc_2, blocks_1, qc_1) = db.get_data().unwrap();
+    let (vote_1, tc_1, blocks_1, qc_1) = db.get_data().unwrap();
     assert_eq!(blocks, blocks_1);
     assert_eq!(qcs, qc_1);
-    assert_eq!(Some(tc.clone()), tc_1);
-    assert_eq!(Some(tc), tc_2);
+    assert_eq!(Some(tc), tc_1);
     assert_eq!(Some(vote), vote_1);
 
-    db.delete_highest_timeout_certificate().unwrap();
     db.delete_highest_2chain_timeout_certificate().unwrap();
     db.delete_last_vote_msg().unwrap();
-    assert!(db.get_highest_timeout_certificate().unwrap().is_none());
     assert!(db
         .get_highest_2chain_timeout_certificate()
         .unwrap()
@@ -72,4 +73,27 @@ fn test_delete_block_and_qc() {
         .unwrap();
     assert_eq!(db.get_blocks().unwrap().len(), 0);
     assert_eq!(db.get_quorum_certificates().unwrap().len(), 0);
+}
+
+#[test]
+fn test_dag() {
+    let tmp_dir = TempPath::new();
+    let db = ConsensusDB::new(&tmp_dir);
+    assert_eq!(db.get_certified_nodes().unwrap().len(), 0);
+
+    let node = Node::new(1, 1, Author::random(), 123, Payload::empty(false), vec![]);
+
+    db.save_node(&node).unwrap();
+
+    let certified_node = CertifiedNode::new(node, AggregateSignature::empty());
+
+    db.save_certified_node(&certified_node).unwrap();
+
+    let mut from_db = db.get_certified_nodes().unwrap();
+
+    assert_eq!(from_db.len(), 1);
+
+    let certified_node_from_db = from_db.remove(certified_node.metadata().digest()).unwrap();
+
+    assert_eq!(certified_node, certified_node_from_db);
 }

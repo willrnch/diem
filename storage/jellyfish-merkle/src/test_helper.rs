@@ -1,12 +1,14 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{mock_tree_store::MockTreeStore, node_type::LeafNode, JellyfishMerkleTree};
+use crate::{mock_tree_store::MockTreeStore, node_type::LeafNode, JellyfishMerkleTree, TestKey};
 use diem_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
 use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
+use diem_storage_interface::jmt_update_refs;
 use diem_types::{
     proof::{SparseMerkleInternalNode, SparseMerkleRangeProof},
     transaction::Version,
@@ -28,13 +30,16 @@ use std::{
     Clone,
     Debug,
     Default,
+    PartialOrd,
+    Ord,
     Eq,
+    Hash,
     PartialEq,
     Serialize,
     Deserialize,
     CryptoHasher,
 )]
-pub(crate) struct ValueBlob(Vec<u8>);
+pub struct ValueBlob(Vec<u8>);
 
 impl From<Vec<u8>> for ValueBlob {
     fn from(blob: Vec<u8>) -> Self {
@@ -42,12 +47,29 @@ impl From<Vec<u8>> for ValueBlob {
     }
 }
 
-impl crate::Value for ValueBlob {}
+impl crate::Key for ValueBlob {
+    fn key_size(&self) -> usize {
+        self.0.len()
+    }
+}
+impl crate::Value for ValueBlob {
+    fn value_size(&self) -> usize {
+        self.0.len()
+    }
+}
+impl crate::TestKey for ValueBlob {}
 impl crate::TestValue for ValueBlob {}
+
+pub(crate) fn gen_value() -> (HashValue, ValueBlob) {
+    (
+        HashValue::random(),
+        ValueBlob::from(HashValue::random().to_vec()),
+    )
+}
 
 /// Computes the key immediately after `key`.
 pub fn plus_one(key: HashValue) -> HashValue {
-    assert_ne!(key, HashValue::new([0xff; HashValue::LENGTH]));
+    assert_ne!(key, HashValue::new([0xFF; HashValue::LENGTH]));
 
     let mut buf = key.to_vec();
     for i in (0..HashValue::LENGTH).rev() {
@@ -62,9 +84,9 @@ pub fn plus_one(key: HashValue) -> HashValue {
 }
 
 /// Initializes a DB with a set of key-value pairs by inserting one key at each version.
-pub fn init_mock_db<V>(kvs: &HashMap<HashValue, V>) -> (MockTreeStore<V>, Version)
+pub fn init_mock_db<V>(kvs: &HashMap<HashValue, (HashValue, V)>) -> (MockTreeStore<V>, Version)
 where
-    V: crate::TestValue,
+    V: TestKey,
 {
     assert!(!kvs.is_empty());
 
@@ -73,7 +95,7 @@ where
 
     for (i, (key, value)) in kvs.iter().enumerate() {
         let (_root_hash, write_batch) = tree
-            .put_value_set(vec![(*key, value.clone())], i as Version)
+            .put_value_set_test(vec![(*key, Some(value))], i as Version)
             .unwrap();
         db.write_tree_update_batch(write_batch).unwrap();
     }
@@ -81,11 +103,16 @@ where
     (db, (kvs.len() - 1) as Version)
 }
 
-pub fn arb_existent_kvs_and_nonexistent_keys<V: crate::TestValue>(
+pub fn arb_existent_kvs_and_nonexistent_keys<V: TestKey>(
     num_kvs: usize,
     num_non_existing_keys: usize,
-) -> impl Strategy<Value = (HashMap<HashValue, V>, Vec<HashValue>)> {
-    hash_map(any::<HashValue>(), any::<V>(), 1..num_kvs).prop_flat_map(move |kvs| {
+) -> impl Strategy<Value = (HashMap<HashValue, (HashValue, V)>, Vec<HashValue>)> {
+    hash_map(
+        any::<HashValue>(),
+        (any::<HashValue>(), any::<V>()),
+        1..num_kvs,
+    )
+    .prop_flat_map(move |kvs| {
         let kvs_clone = kvs.clone();
         (
             Just(kvs),
@@ -100,8 +127,8 @@ pub fn arb_existent_kvs_and_nonexistent_keys<V: crate::TestValue>(
     })
 }
 
-pub fn test_get_with_proof<V: crate::TestValue>(
-    (existent_kvs, nonexistent_keys): (HashMap<HashValue, V>, Vec<HashValue>),
+pub fn test_get_with_proof<V: TestKey>(
+    (existent_kvs, nonexistent_keys): (HashMap<HashValue, (HashValue, V)>, Vec<HashValue>),
 ) {
     let (db, version) = init_mock_db(&existent_kvs);
     let tree = JellyfishMerkleTree::new(&db);
@@ -110,13 +137,13 @@ pub fn test_get_with_proof<V: crate::TestValue>(
     test_nonexistent_keys_impl(&tree, version, &nonexistent_keys);
 }
 
-pub fn arb_kv_pair_with_distinct_last_nibble<V: crate::TestValue>(
-) -> impl Strategy<Value = ((HashValue, V), (HashValue, V))> {
+pub fn arb_kv_pair_with_distinct_last_nibble<V: TestKey>(
+) -> impl Strategy<Value = ((HashValue, (HashValue, V)), (HashValue, (HashValue, V)))> {
     (
         any::<HashValue>().prop_filter("Can't be 0xffffff...", |key| {
-            *key != HashValue::new([0xff; HashValue::LENGTH])
+            *key != HashValue::new([0xFF; HashValue::LENGTH])
         }),
-        vec(any::<V>(), 2),
+        vec((any::<HashValue>(), any::<V>()), 2),
     )
         .prop_map(|(key1, accounts)| {
             let key2 = plus_one(key1);
@@ -124,8 +151,8 @@ pub fn arb_kv_pair_with_distinct_last_nibble<V: crate::TestValue>(
         })
 }
 
-pub fn test_get_with_proof_with_distinct_last_nibble<V: crate::TestValue>(
-    (kv1, kv2): ((HashValue, V), (HashValue, V)),
+pub fn test_get_with_proof_with_distinct_last_nibble<V: TestKey>(
+    (kv1, kv2): ((HashValue, (HashValue, V)), (HashValue, (HashValue, V))),
 ) {
     let mut kvs = HashMap::new();
     kvs.insert(kv1.0, kv1.1);
@@ -137,16 +164,21 @@ pub fn test_get_with_proof_with_distinct_last_nibble<V: crate::TestValue>(
     test_existent_keys_impl(&tree, version, &kvs);
 }
 
-pub fn arb_tree_with_index<V: crate::TestValue>(
+pub fn arb_tree_with_index<V: TestKey>(
     tree_size: usize,
-) -> impl Strategy<Value = (BTreeMap<HashValue, V>, usize)> {
-    btree_map(any::<HashValue>(), any::<V>(), 1..tree_size).prop_flat_map(|btree| {
+) -> impl Strategy<Value = (BTreeMap<HashValue, (HashValue, V)>, usize)> {
+    btree_map(
+        any::<HashValue>(),
+        (any::<HashValue>(), any::<V>()),
+        1..tree_size,
+    )
+    .prop_flat_map(|btree| {
         let len = btree.len();
         (Just(btree), 0..len)
     })
 }
 
-pub fn test_get_range_proof<V: crate::TestValue>((btree, n): (BTreeMap<HashValue, V>, usize)) {
+pub fn test_get_range_proof<V: TestKey>((btree, n): (BTreeMap<HashValue, (HashValue, V)>, usize)) {
     let (db, version) = init_mock_db(&btree.clone().into_iter().collect());
     let tree = JellyfishMerkleTree::new(&db);
 
@@ -159,22 +191,24 @@ pub fn test_get_range_proof<V: crate::TestValue>((btree, n): (BTreeMap<HashValue
     );
 }
 
-fn test_existent_keys_impl<'a, V: crate::TestValue>(
-    tree: &JellyfishMerkleTree<'a, MockTreeStore<V>, V>,
+fn test_existent_keys_impl<V: TestKey>(
+    tree: &JellyfishMerkleTree<'_, MockTreeStore<V>, V>,
     version: Version,
-    existent_kvs: &HashMap<HashValue, V>,
+    existent_kvs: &HashMap<HashValue, (HashValue, V)>,
 ) {
     let root_hash = tree.get_root_hash(version).unwrap();
 
     for (key, value) in existent_kvs {
         let (account, proof) = tree.get_with_proof(*key, version).unwrap();
-        assert!(proof.verify(root_hash, *key, account.as_ref()).is_ok());
-        assert_eq!(account.unwrap(), *value);
+        assert!(proof
+            .verify_by_hash(root_hash, *key, account.as_ref().map(|v| v.0))
+            .is_ok());
+        assert_eq!((account.as_ref().unwrap().0, account.unwrap().1 .0), *value);
     }
 }
 
-fn test_nonexistent_keys_impl<'a, V: crate::TestValue>(
-    tree: &JellyfishMerkleTree<'a, MockTreeStore<V>, V>,
+fn test_nonexistent_keys_impl<V: TestKey>(
+    tree: &JellyfishMerkleTree<'_, MockTreeStore<V>, V>,
     version: Version,
     nonexistent_keys: &[HashValue],
 ) {
@@ -182,15 +216,15 @@ fn test_nonexistent_keys_impl<'a, V: crate::TestValue>(
 
     for key in nonexistent_keys {
         let (account, proof) = tree.get_with_proof(*key, version).unwrap();
-        assert!(proof.verify(root_hash, *key, account.as_ref()).is_ok());
+        assert!(proof.verify_by_hash(root_hash, *key, None).is_ok());
         assert!(account.is_none());
     }
 }
 
 /// Checks if we can construct the expected root hash using the entries in the btree and the proof.
-fn verify_range_proof<V: crate::TestValue>(
+fn verify_range_proof<V: TestKey>(
     expected_root_hash: HashValue,
-    btree: BTreeMap<HashValue, V>,
+    btree: BTreeMap<HashValue, (HashValue, V)>,
     proof: SparseMerkleRangeProof,
 ) {
     // For example, given the following sparse Merkle tree:
@@ -227,7 +261,7 @@ fn verify_range_proof<V: crate::TestValue>(
     // that would cause `X` to end up in the above position.
     let mut btree1 = BTreeMap::new();
     for (key, value) in &btree {
-        let leaf = LeafNode::new(*key, value.clone());
+        let leaf = LeafNode::new(*key, value.0, (value.1.clone(), 0 /* version */));
         btree1.insert(*key, leaf.hash());
     }
     // Using the above example, `last_proven_key` is `e`. We look at the path from root to `e`.
@@ -333,25 +367,40 @@ fn compute_root_hash_impl(kvs: Vec<(&[bool], HashValue)>) -> HashValue {
             // Every key starts with a 1-bit, i.e., they are all in the right subtree.
             left_hash = *SPARSE_MERKLE_PLACEHOLDER_HASH;
             right_hash = compute_root_hash_impl(reduce(&kvs));
-        }
+        },
         Some(index) => {
             // Both left subtree and right subtree have some keys.
             left_hash = compute_root_hash_impl(reduce(&kvs[..index]));
             right_hash = compute_root_hash_impl(reduce(&kvs[index..]));
-        }
+        },
         None => {
             // Every key starts with a 0-bit, i.e., they are all in the left subtree.
             left_hash = compute_root_hash_impl(reduce(&kvs));
             right_hash = *SPARSE_MERKLE_PLACEHOLDER_HASH;
-        }
+        },
     }
 
     SparseMerkleInternalNode::new(left_hash, right_hash).hash()
 }
 
 pub fn test_get_leaf_count(keys: HashSet<HashValue>) {
-    let kvs = keys.into_iter().map(|k| (k, ValueBlob(vec![]))).collect();
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let idx1 = keys.len() / 3;
+    let idx2 = keys.len() / 3 * 2;
+    let kvs = keys[0..idx2].iter().map(|k| (*k, gen_value())).collect();
     let (db, version) = init_mock_db(&kvs);
+    let updates = keys[idx1..idx2]
+        .iter()
+        .map(|k| (*k, None))
+        .chain(keys[idx2..].iter().map(|k| (*k, Some(gen_value()))))
+        .collect::<Vec<_>>();
     let tree = JellyfishMerkleTree::new(&db);
-    assert_eq!(tree.get_leaf_count(version).unwrap().unwrap(), kvs.len())
+    let (_, batch) = tree
+        .put_value_set_test(jmt_update_refs(updates.as_slice()), version + 1)
+        .unwrap();
+    db.write_tree_update_batch(batch).unwrap();
+    assert_eq!(
+        tree.get_leaf_count(version + 1).unwrap(),
+        keys.len() - (idx2 - idx1)
+    )
 }

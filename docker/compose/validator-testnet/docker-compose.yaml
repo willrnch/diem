@@ -9,8 +9,8 @@
 # * If you use this compose for different Diem Networks, you will need remove the db volume first.
 # * If you would like to use the current Diem version within this repository, execute the
 #     `build.sh` in `docker/validator` and change the image tag below to diem_e2e:latest
-# * Validator images can be found at https://hub.docker.com/r/devnet/validator/tags
-# * Faucet images can be found at https://hub.docker.com/r/devnet/faucet/tags
+# * Validator images can be found at https://hub.docker.com/repository/docker/diemlabs/validator/tags
+# * Faucet images can be found at https://hub.docker.com/repository/docker/diemlabs/faucet/tags
 
 # Monitoring:
 # If you want to install the monitoring components for your validator-testnet
@@ -26,54 +26,55 @@ services:
   validator:
     # Note this image currently does not support this, will update to the appropriate minimum
     # version shortly
-    image: "diem/validator:${IMAGE_TAG:-devnet}"
+    image: "${VALIDATOR_IMAGE_REPO:-diemlabs/validator}:${IMAGE_TAG:-devnet}"
     networks:
       shared:
+        ipv4_address:  172.16.1.10
     volumes:
       - type: volume
         source: diem-shared
         target: /opt/diem/var
       - type: bind
         source: ./validator_node_template.yaml
-        target: /opt/diem/var/validator_node_template.yaml
-    command: ["/opt/diem/bin/diem-node", "--test", "--config", "/opt/diem/var"]
+        target: /opt/diem/config.yaml
+    command: ["/usr/local/bin/diem-node", "--test", "--test-dir", "/opt/diem/var/", "--test-config-override", "/opt/diem/config.yaml"]
     ports:
-      - "8080:8080"
+      - "8080:8080" # REST API
+      - "50051:50051" # Indexer GRPC, if enabled
     expose:
       - 9101
 
   faucet:
-    image: "diem/faucet:${IMAGE_TAG:-devnet}"
+    image: "${FAUCET_IMAGE_REPO:-diemlabs/faucet}:${IMAGE_TAG:-devnet}"
     depends_on:
       - validator
     networks:
       shared:
+        ipv4_address:  172.16.1.11
     volumes:
       - type: volume
         source: diem-shared
         target: /opt/diem/var
     command: >
       /bin/bash -c "
-        for i in {1..10}
-        do
-          if [[ -s /opt/diem/var/mint.key ]]
-          then
-            /opt/diem/bin/diem-faucet \
-              --address 0.0.0.0 \
-              --port 8000 \
-              --chain-id TESTING \
-              --mint-key-file-path /opt/diem/var/mint.key \
-              --server-url http://validator:8080/v1
-            exit $$?
-          else
+        for i in {1..10}; do
+          if [[ ! -s /opt/diem/var/mint.key ]]; then
             echo 'Validator has not populated mint.key yet. Is it running?'
             sleep 1
+          else
+            sleep 1
+            /usr/local/bin/diem-faucet-service \\
+              run-simple \\
+              --key-file-path /opt/diem/var/mint.key \\
+              --chain-id TESTING \\
+              --node-url http://172.16.1.10:8080
+            echo 'Faucet failed to run likely due to the Validator still starting. Will try again.'
           fi
         done
         exit 1
       "
     ports:
-      - "8000:8000"
+      - "8081:8081"
 
 networks:
   shared:

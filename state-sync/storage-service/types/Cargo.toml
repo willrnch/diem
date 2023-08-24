@@ -1,24 +1,27 @@
 [package]
-name = "storage-service-types"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-storage-service-types"
 description = "Common types offered by the Diem storage service"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-num-traits = { version = "0.2.14", default-features = false }
-serde = { version = "1.0.124", default-features = false }
-thiserror = "1.0.24"
-
-diem-config = { path = "../../../config" }
-diem-crypto = { path = "../../../crates/diem-crypto" }
-diem-types = { path = "../../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../../crates/diem-workspace-hack" }
+diem-compression = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+num-traits = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-claim = "0.5.0"
-proptest = "1.0.0"
+claims = { workspace = true }
+proptest = { workspace = true }

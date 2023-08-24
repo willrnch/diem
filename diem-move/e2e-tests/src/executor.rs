@@ -1,71 +1,74 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Support for running the VM to execute and verify transactions.
 
+use crate::{
+    account::{Account, AccountData},
+    data_store::{
+        FakeDataStore, GENESIS_CHANGE_SET_HEAD, GENESIS_CHANGE_SET_MAINNET,
+        GENESIS_CHANGE_SET_TESTNET,
+    },
+    golden_outputs::GoldenOutputs,
+};
+use anyhow::Error;
+use diem_bitvec::BitVec;
+use diem_block_executor::txn_commit_hook::NoOpTransactionCommitHook;
+use diem_crypto::HashValue;
+use diem_framework::ReleaseBundle;
+use diem_gas::{
+    AbstractValueSizeGasParameters, ChangeSetConfigs, NativeGasParameters, StandardGasMeter,
+    LATEST_GAS_FEATURE_VERSION,
+};
+use diem_gas_profiling::{GasProfiler, TransactionGasLog};
+use diem_keygen::KeyGen;
+use diem_state_view::TStateView;
+use diem_types::{
+    access_path::AccessPath,
+    account_config::{
+        new_block_event_key, AccountResource, CoinInfoResource, CoinStoreResource, NewBlockEvent,
+        CORE_CODE_ADDRESS,
+    },
+    block_executor::partitioner::BlockExecutorTransactions,
+    block_metadata::BlockMetadata,
+    chain_id::ChainId,
+    on_chain_config::{
+        Features, OnChainConfig, TimedFeatureOverride, TimedFeatures, ValidatorSet, Version,
+    },
+    state_store::{state_key::StateKey, state_value::StateValue},
+    transaction::{
+        ExecutionStatus, SignedTransaction, Transaction, TransactionOutput, TransactionPayload,
+        TransactionStatus, VMValidatorResult,
+    },
+    vm_status::VMStatus,
+    write_set::WriteSet,
+};
+use diem_vm::{
+    block_executor::{DiemTransactionOutput, BlockDiemVM},
+    data_cache::{AsMoveResolver, StorageAdapter},
+    move_vm_ext::{MoveVmExt, SessionId},
+    DiemVM, VMExecutor, VMValidator,
+};
+use diem_vm_genesis::{generate_genesis_change_set_for_testing_with_count, GenesisOptions};
+use diem_vm_logging::log_schema::AdapterLogSchema;
+use move_core_types::{
+    account_address::AccountAddress,
+    identifier::Identifier,
+    language_storage::{ModuleId, TypeTag},
+    move_resource::MoveResource,
+};
+use move_vm_types::gas::UnmeteredGasMeter;
 use serde::Serialize;
 use std::{
     env,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
-
-use crate::{
-    account::{Account, AccountData},
-    data_store::{
-        FakeDataStore, GENESIS_CHANGE_SET, GENESIS_CHANGE_SET_EXPERIMENTAL,
-        GENESIS_CHANGE_SET_FRESH,
-    },
-    golden_outputs::GoldenOutputs,
-};
-use diem_crypto::HashValue;
-use diem_framework_releases::{
-    current_module_blobs, current_modules, legacy::transaction_scripts::LegacyStdlibScript,
-};
-use diem_keygen::KeyGen;
-use diem_state_view::StateView;
-use diem_types::{
-    access_path::AccessPath,
-    account_config::{
-        type_tag_for_currency_code, BalanceResource, DiemAccountResource, CORE_CODE_ADDRESS,
-    },
-    block_metadata::{new_block_event_key, BlockMetadata, NewBlockEvent},
-    on_chain_config::{
-        DiemVersion, OnChainConfig, ParallelExecutionConfig, VMPublishingOption, ValidatorSet,
-    },
-    transaction::{
-        ChangeSet, SignedTransaction, Transaction, TransactionOutput, TransactionStatus,
-        VMValidatorResult,
-    },
-    vm_status::{KeptVMStatus, VMStatus},
-    write_set::WriteSet,
-};
-use diem_vm::{
-    convert_changeset_and_events, data_cache::RemoteStorage, parallel_executor::ParallelDiemVM,
-    read_write_set_analysis::add_on_functions_list, DiemVM, VMExecutor, VMValidator,
-};
-use diem_writeset_generator::{
-    encode_disable_parallel_execution, encode_enable_parallel_execution_with_config,
-};
-use move_core_types::{
-    account_address::AccountAddress,
-    identifier::Identifier,
-    language_storage::{ModuleId, ResourceKey, TypeTag},
-    move_resource::MoveStructType,
-};
-use move_vm_runtime::move_vm::MoveVM;
-use move_vm_types::gas_schedule::GasStatus;
-use read_write_set::analyze;
 
 static RNG_SEED: [u8; 32] = [9u8; 32];
-
-pub const RELEASE_1_1_GENESIS: &[u8] =
-    include_bytes!("../genesis-release-1-1/release-1-1-genesis.blob");
-pub const RELEASE_1_1_GENESIS_PRIVKEY: &[u8] =
-    include_bytes!("../genesis-release-1-1/release-1-1-privkey.blob");
-pub const RELEASE_1_1_GENESIS_PUBKEY: &[u8] =
-    include_bytes!("../genesis-release-1-1/release-1-1-pubkey.blob");
 
 const ENV_TRACE_DIR: &str = "TRACE";
 
@@ -83,77 +86,109 @@ pub type TraceSeqMapping = (usize, Vec<usize>, Vec<usize>);
 /// Provides an environment to run a VM instance.
 ///
 /// This struct is a mock in-memory implementation of the Diem executor.
-#[derive(Debug)]
 pub struct FakeExecutor {
     data_store: FakeDataStore,
+    executor_thread_pool: Arc<rayon::ThreadPool>,
     block_time: u64,
     executed_output: Option<GoldenOutputs>,
     trace_dir: Option<PathBuf>,
     rng: KeyGen,
+    no_parallel_exec: bool,
+    features: Features,
+    chain_id: u8,
+    aggregator_enabled: bool,
 }
 
 impl FakeExecutor {
     /// Creates an executor from a genesis [`WriteSet`].
-    pub fn from_genesis(write_set: &WriteSet) -> Self {
+    pub fn from_genesis(write_set: &WriteSet, chain_id: ChainId) -> Self {
+        let executor_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_cpus::get())
+                .build()
+                .unwrap(),
+        );
         let mut executor = FakeExecutor {
             data_store: FakeDataStore::default(),
+            executor_thread_pool,
             block_time: 0,
             executed_output: None,
             trace_dir: None,
             rng: KeyGen::from_seed(RNG_SEED),
+            no_parallel_exec: false,
+            features: Features::default(),
+            chain_id: chain_id.id(),
+            aggregator_enabled: true,
         };
         executor.apply_write_set(write_set);
+        // As a set effect, also allow module bundle txns. TODO: Remove
+        diem_vm::diem_vm::allow_module_bundle_for_test();
         executor
     }
 
-    /// Create an executor from a saved genesis blob
-    pub fn from_saved_genesis(saved_genesis_blob: &[u8]) -> Self {
-        let change_set = bcs::from_bytes::<ChangeSet>(saved_genesis_blob).unwrap();
-        Self::from_genesis(change_set.write_set())
+    pub fn set_aggregator_enabled(&mut self, aggregator_enabled: bool) {
+        self.aggregator_enabled = aggregator_enabled;
+    }
+
+    /// Configure this executor to not use parallel execution.
+    pub fn set_not_parallel(mut self) -> Self {
+        self.no_parallel_exec = true;
+        self
     }
 
     /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
-    pub fn from_genesis_file() -> Self {
-        Self::from_genesis(GENESIS_CHANGE_SET.clone().write_set())
+    pub fn from_head_genesis() -> Self {
+        Self::from_genesis(GENESIS_CHANGE_SET_HEAD.clone().write_set(), ChainId::test())
     }
 
-    /// Creates an executor using the standard genesis.
-    pub fn from_fresh_genesis() -> Self {
-        Self::from_genesis(GENESIS_CHANGE_SET_FRESH.clone().write_set())
-    }
-
-    /// Creates an executor using the experimental genesis.
-    pub fn from_experimental_genesis() -> Self {
-        Self::from_genesis(GENESIS_CHANGE_SET_EXPERIMENTAL.clone().write_set())
-    }
-
-    pub fn allowlist_genesis() -> Self {
-        Self::custom_genesis(
-            current_module_blobs(),
-            None,
-            VMPublishingOption::locked(LegacyStdlibScript::allowlist()),
+    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
+    pub fn from_head_genesis_with_count(count: u64) -> Self {
+        Self::from_genesis(
+            generate_genesis_change_set_for_testing_with_count(GenesisOptions::Head, count)
+                .write_set(),
+            ChainId::test(),
         )
     }
 
-    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION with script/module
-    /// publishing options given by `publishing_options`. These can only be either `Open` or
-    /// `CustomScript`.
-    pub fn from_genesis_with_options(publishing_options: VMPublishingOption) -> Self {
-        if !publishing_options.is_open_script() {
-            panic!("Allowlisted transactions are not supported as a publishing option")
-        }
+    /// Creates an executor using the standard genesis.
+    pub fn from_testnet_genesis() -> Self {
+        Self::from_genesis(
+            GENESIS_CHANGE_SET_TESTNET.clone().write_set(),
+            ChainId::testnet(),
+        )
+    }
 
-        Self::custom_genesis(current_module_blobs(), None, publishing_options)
+    /// Creates an executor using the mainnet genesis.
+    pub fn from_mainnet_genesis() -> Self {
+        Self::from_genesis(
+            GENESIS_CHANGE_SET_MAINNET.clone().write_set(),
+            ChainId::mainnet(),
+        )
+    }
+
+    pub fn data_store(&self) -> &FakeDataStore {
+        &self.data_store
     }
 
     /// Creates an executor in which no genesis state has been applied yet.
     pub fn no_genesis() -> Self {
+        let executor_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_cpus::get())
+                .build()
+                .unwrap(),
+        );
         FakeExecutor {
             data_store: FakeDataStore::default(),
+            executor_thread_pool,
             block_time: 0,
             executed_output: None,
             trace_dir: None,
             rng: KeyGen::from_seed(RNG_SEED),
+            no_parallel_exec: false,
+            features: Features::default(),
+            chain_id: ChainId::test().id(),
+            aggregator_enabled: true,
         }
     }
 
@@ -162,12 +197,24 @@ impl FakeExecutor {
         // files can persist on windows machines.
         let file_name = test_name.replace(':', "_");
         self.executed_output = Some(GoldenOutputs::new(&file_name));
+        self.set_tracing(test_name, file_name)
+    }
 
+    pub fn set_golden_file_at(&mut self, path: &str, test_name: &str) {
+        // 'test_name' includes ':' in the names, lets re-write these to be '_'s so that these
+        // files can persist on windows machines.
+        let file_name = test_name.replace(':', "_");
+        self.executed_output = Some(GoldenOutputs::new_at_path(PathBuf::from(path), &file_name));
+        self.set_tracing(test_name, file_name)
+    }
+
+    fn set_tracing(&mut self, test_name: &str, file_name: String) {
         // NOTE: tracing is only available when
         //  - the e2e test outputs a golden file, and
         //  - the environment variable is properly set
         if let Some(env_trace_dir) = env::var_os(ENV_TRACE_DIR) {
-            let diem_version = DiemVersion::fetch_config(&self.data_store).map_or(0, |v| v.major);
+            let diem_version =
+                Version::fetch_config(&self.data_store.as_move_resolver()).map_or(0, |v| v.major);
 
             let trace_dir = Path::new(&env_trace_dir).join(file_name);
             if trace_dir.exists() {
@@ -198,40 +245,19 @@ impl FakeExecutor {
     /// initialization done.
     pub fn stdlib_only_genesis() -> Self {
         let mut genesis = Self::no_genesis();
-        let blobs = current_module_blobs();
-        let modules = current_modules();
-        assert!(blobs.len() == modules.len());
-        for (module, bytes) in modules.iter().zip(blobs) {
+        for (bytes, module) in
+            diem_cached_packages::head_release_bundle().code_and_compiled_modules()
+        {
             let id = module.self_id();
             genesis.add_module(&id, bytes.to_vec());
         }
         genesis
     }
 
-    /// Creates fresh genesis from the stdlib modules passed in.
-    pub fn custom_genesis(
-        genesis_modules: &[Vec<u8>],
-        validator_accounts: Option<usize>,
-        publishing_options: VMPublishingOption,
-    ) -> Self {
-        let genesis = vm_genesis::generate_test_genesis(
-            genesis_modules,
-            publishing_options,
-            validator_accounts,
-            false,
-        );
-        Self::from_genesis(genesis.0.write_set())
-    }
-
-    pub fn parallel_genesis() -> Self {
-        let geneisis = vm_genesis::generate_test_genesis(
-            current_module_blobs(),
-            VMPublishingOption::open(),
-            None,
-            true,
-        )
-        .0;
-        FakeExecutor::from_genesis(geneisis.write_set())
+    /// Creates fresh genesis from the framework passed in.
+    pub fn custom_genesis(framework: &ReleaseBundle, validator_accounts: Option<usize>) -> Self {
+        let genesis = diem_vm_genesis::generate_test_genesis(framework, validator_accounts);
+        Self::from_genesis(genesis.0.write_set(), ChainId::test())
     }
 
     /// Create one instance of [`AccountData`] without saving it to data store.
@@ -242,11 +268,6 @@ impl FakeExecutor {
     /// Create one instance of [`AccountData`] without saving it to data store.
     pub fn create_raw_account_data(&mut self, balance: u64, seq_num: u64) -> AccountData {
         AccountData::new_from_seed(&mut self.rng, balance, seq_num)
-    }
-
-    /// Create one instance of [`AccountData`] with XDX balance without saving it to data store.
-    pub fn create_xdx_raw_account_data(&mut self, balance: u64, seq_num: u64) -> AccountData {
-        AccountData::new_xdx_from_seed(&mut self.rng, balance, seq_num)
     }
 
     /// Creates a number of [`Account`] instances all with the same balance and sequence number,
@@ -261,6 +282,22 @@ impl FakeExecutor {
         accounts
     }
 
+    /// Creates an account for the given static address. This address needs to be static so
+    /// we can load regular Move code to there without need to rewrite code addresses.
+    pub fn new_account_at(&mut self, addr: AccountAddress) -> Account {
+        let data = self.new_account_data_at(addr);
+        data.account().clone()
+    }
+
+    pub fn new_account_data_at(&mut self, addr: AccountAddress) -> AccountData {
+        // The below will use the genesis keypair but that should be fine.
+        let acc = Account::new_genesis_account(addr);
+        // Mint the account 10M Diem coins (with 8 decimals).
+        let data = AccountData::with_account(acc, 1_000_000_000_000_000, 0);
+        self.add_account_data(&data);
+        data
+    }
+
     /// Applies a [`WriteSet`] to this executor's data store.
     pub fn apply_write_set(&mut self, write_set: &WriteSet) {
         self.data_store.add_write_set(write_set);
@@ -271,6 +308,11 @@ impl FakeExecutor {
         self.data_store.add_account_data(account_data)
     }
 
+    /// Adds coin info to this executor's data store.
+    pub fn add_coin_info(&mut self) {
+        self.data_store.add_coin_info()
+    }
+
     /// Adds a module to this executor's data store.
     ///
     /// Does not do any sort of verification on the module.
@@ -278,52 +320,65 @@ impl FakeExecutor {
         self.data_store.add_module(module_id, module_blob)
     }
 
-    /// Reads the resource [`Value`] for an account from this executor's data store.
-    pub fn read_account_resource(&self, account: &Account) -> Option<DiemAccountResource> {
+    /// Reads the resource `Value` for an account from this executor's data store.
+    pub fn read_account_resource(&self, account: &Account) -> Option<AccountResource> {
         self.read_account_resource_at_address(account.address())
     }
 
-    /// Reads the resource [`Value`] for an account under the given address from
+    pub fn read_resource<T: MoveResource>(&self, addr: &AccountAddress) -> Option<T> {
+        let ap =
+            AccessPath::resource_access_path(*addr, T::struct_tag()).expect("access path in test");
+        let data_blob =
+            TStateView::get_state_value_bytes(&self.data_store, &StateKey::access_path(ap))
+                .expect("account must exist in data store")
+                .unwrap_or_else(|| panic!("Can't fetch {} resource for {}", T::STRUCT_NAME, addr));
+        bcs::from_bytes(data_blob.as_slice()).ok()
+    }
+
+    /// Reads the resource `Value` for an account under the given address from
     /// this executor's data store.
     pub fn read_account_resource_at_address(
         &self,
         addr: &AccountAddress,
-    ) -> Option<DiemAccountResource> {
-        let ap = AccessPath::resource_access_path(ResourceKey::new(
-            *addr,
-            DiemAccountResource::struct_tag(),
-        ));
-        let data_blob = StateView::get(&self.data_store, &ap)
-            .expect("account must exist in data store")
-            .unwrap_or_else(|| panic!("Can't fetch account resource for {}", addr));
-        bcs::from_bytes(data_blob.as_slice()).ok()
+    ) -> Option<AccountResource> {
+        self.read_resource(addr)
     }
 
-    /// Reads the balance resource value for an account from this executor's data store with the
-    /// given balance currency_code.
-    pub fn read_balance_resource(
-        &self,
-        account: &Account,
-        balance_currency_code: Identifier,
-    ) -> Option<BalanceResource> {
-        self.read_balance_resource_at_address(account.address(), balance_currency_code)
+    /// Reads the CoinStore resource value for an account from this executor's data store.
+    pub fn read_coin_store_resource(&self, account: &Account) -> Option<CoinStoreResource> {
+        self.read_coin_store_resource_at_address(account.address())
     }
 
-    /// Reads the balance resource value for an account under the given address from this executor's
-    /// data store with the given balance currency_code.
-    pub fn read_balance_resource_at_address(
+    /// Reads supply from CoinInfo resource value from this executor's data store.
+    pub fn read_coin_supply(&self) -> Option<u128> {
+        self.read_coin_info_resource()
+            .expect("coin info must exist in data store")
+            .supply()
+            .as_ref()
+            .map(|o| match o.aggregator.as_ref() {
+                Some(aggregator) => {
+                    let state_key = aggregator.state_key();
+                    let value_bytes = self
+                        .read_state_value_bytes(&state_key)
+                        .expect("aggregator value must exist in data store");
+                    bcs::from_bytes(&value_bytes).unwrap()
+                },
+                None => o.integer.as_ref().unwrap().value,
+            })
+    }
+
+    /// Reads the CoinInfo resource value from this executor's data store.
+    pub fn read_coin_info_resource(&self) -> Option<CoinInfoResource> {
+        self.read_resource(&AccountAddress::ONE)
+    }
+
+    /// Reads the CoinStore resource value for an account under the given address from this executor's
+    /// data store.
+    pub fn read_coin_store_resource_at_address(
         &self,
         addr: &AccountAddress,
-        balance_currency_code: Identifier,
-    ) -> Option<BalanceResource> {
-        let currency_code_tag = type_tag_for_currency_code(balance_currency_code);
-        let balance_resource_tag = BalanceResource::struct_tag_for_currency(currency_code_tag);
-        let ap = AccessPath::resource_access_path(ResourceKey::new(*addr, balance_resource_tag));
-        StateView::get(&self.data_store, &ap)
-            .unwrap_or_else(|_| panic!("account {:?} must exist in data store", addr))
-            .map(|data_blob| {
-                bcs::from_bytes(data_blob.as_slice()).expect("Failure decoding balance resource")
-            })
+    ) -> Option<CoinStoreResource> {
+        self.read_resource(addr)
     }
 
     /// Executes the given block of transactions.
@@ -342,21 +397,6 @@ impl FakeExecutor {
         )
     }
 
-    /// Alternate form of 'execute_block' that keeps the vm_status before it goes into the
-    /// `TransactionOutput`
-    pub fn execute_block_and_keep_vm_status(
-        &self,
-        txn_block: Vec<SignedTransaction>,
-    ) -> Result<Vec<(VMStatus, TransactionOutput)>, VMStatus> {
-        DiemVM::execute_block_and_keep_vm_status(
-            txn_block
-                .into_iter()
-                .map(Transaction::UserTransaction)
-                .collect(),
-            &self.data_store,
-        )
-    }
-
     /// Executes the transaction as a singleton block and applies the resulting write set to the
     /// data store. Panics if execution fails
     pub fn execute_and_apply(&mut self, transaction: SignedTransaction) -> TransactionOutput {
@@ -366,13 +406,14 @@ impl FakeExecutor {
         match output.status() {
             TransactionStatus::Keep(status) => {
                 self.apply_write_set(output.write_set());
-                assert!(
-                    status == &KeptVMStatus::Executed,
+                assert_eq!(
+                    status,
+                    &ExecutionStatus::Success,
                     "transaction failed with {:?}",
                     status
                 );
                 output
-            }
+            },
             TransactionStatus::Discard(status) => panic!("transaction discarded with {:?}", status),
             TransactionStatus::Retry => panic!("transaction status is retry"),
         }
@@ -382,21 +423,21 @@ impl FakeExecutor {
         &self,
         txn_block: Vec<Transaction>,
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
-        let analyze_result = analyze(current_modules().iter())
-            .unwrap()
-            .normalize_all_scripts(add_on_functions_list());
-
-        let (result, _) =
-            ParallelDiemVM::execute_block(&analyze_result, txn_block, &self.data_store)?;
-
-        Ok(result)
+        BlockDiemVM::execute_block::<_, NoOpTransactionCommitHook<DiemTransactionOutput, VMStatus>>(
+            self.executor_thread_pool.clone(),
+            BlockExecutorTransactions::Unsharded(txn_block),
+            &self.data_store,
+            usize::min(4, num_cpus::get()),
+            None,
+            None,
+        )
     }
 
     pub fn execute_transaction_block(
         &self,
         txn_block: Vec<Transaction>,
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
-        let mut trace_map = TraceSeqMapping::default();
+        let mut trace_map: (usize, Vec<usize>, Vec<usize>) = TraceSeqMapping::default();
 
         // dump serialized transaction details before execution, if tracing
         if let Some(trace_dir) = &self.trace_dir {
@@ -409,12 +450,14 @@ impl FakeExecutor {
             }
         }
 
-        let output = DiemVM::execute_block(txn_block.clone(), &self.data_store);
-        let parallel_output = self.execute_transaction_block_parallel(txn_block);
-        assert_eq!(output, parallel_output);
+        let output = DiemVM::execute_block(txn_block.clone(), &self.data_store, None);
+        if !self.no_parallel_exec {
+            let parallel_output = self.execute_transaction_block_parallel(txn_block);
+            assert_eq!(output, parallel_output);
+        }
 
         if let Some(logger) = &self.executed_output {
-            logger.log(format!("{:?}\n", output).as_str());
+            logger.log(format!("{:#?}\n", output).as_str());
         }
 
         // dump serialized transaction output after execution, if tracing
@@ -426,7 +469,7 @@ impl FakeExecutor {
                         let output_seq = Self::trace(trace_output_dir.as_path(), res);
                         trace_map.2.push(output_seq);
                     }
-                }
+                },
                 Err(e) => {
                     let mut error_file = OpenOptions::new()
                         .write(true)
@@ -434,7 +477,7 @@ impl FakeExecutor {
                         .open(trace_dir.join(TRACE_FILE_ERROR))
                         .unwrap();
                     error_file.write_all(e.to_string().as_bytes()).unwrap();
-                }
+                },
             }
             let trace_meta_dir = trace_dir.join(TRACE_DIR_META);
             Self::trace(trace_meta_dir.as_path(), &trace_map);
@@ -452,6 +495,49 @@ impl FakeExecutor {
             .expect("A block with one transaction should have one output")
     }
 
+    pub fn execute_transaction_with_gas_profiler(
+        &self,
+        txn: SignedTransaction,
+    ) -> anyhow::Result<(TransactionOutput, TransactionGasLog)> {
+        let txn = txn
+            .check_signature()
+            .expect("invalid signature for transaction");
+
+        let log_context = AdapterLogSchema::new(self.data_store.id(), 0);
+
+        let (_status, output, gas_profiler) =
+            DiemVM::execute_user_transaction_with_custom_gas_meter(
+                &self.data_store,
+                &txn,
+                &log_context,
+                |gas_feature_version, gas_params, storage_gas_params, balance| {
+                    let gas_meter = StandardGasMeter::new(
+                        gas_feature_version,
+                        gas_params,
+                        storage_gas_params,
+                        balance,
+                    );
+                    let gas_profiler = match txn.payload() {
+                        TransactionPayload::Script(_) => GasProfiler::new_script(gas_meter),
+                        TransactionPayload::EntryFunction(entry_func) => GasProfiler::new_function(
+                            gas_meter,
+                            entry_func.module().clone(),
+                            entry_func.function().to_owned(),
+                            entry_func.ty_args().to_vec(),
+                        ),
+                        TransactionPayload::ModuleBundle(..) => unreachable!("not supported"),
+                        TransactionPayload::Multisig(..) => unimplemented!("not supported yet"),
+                    };
+                    Ok(gas_profiler)
+                },
+            )?;
+
+        Ok((
+            output.into_transaction_output(self.get_state_view())?,
+            gas_profiler.finish(),
+        ))
+    }
+
     fn trace<P: AsRef<Path>, T: Serialize>(dir: P, item: &T) -> usize {
         let dir = dir.as_ref();
         let seq = fs::read_dir(dir).expect("Unable to read trace dir").count();
@@ -467,9 +553,19 @@ impl FakeExecutor {
         seq
     }
 
+    pub fn read_state_value(&self, state_key: &StateKey) -> Option<StateValue> {
+        TStateView::get_state_value(&self.data_store, state_key).unwrap()
+    }
+
     /// Get the blob for the associated AccessPath
-    pub fn read_from_access_path(&self, path: &AccessPath) -> Option<Vec<u8>> {
-        StateView::get(&self.data_store, path).unwrap()
+    pub fn read_state_value_bytes(&self, state_key: &StateKey) -> Option<Vec<u8>> {
+        TStateView::get_state_value_bytes(&self.data_store, state_key).unwrap()
+    }
+
+    /// Set the blob for the associated AccessPath
+    pub fn write_state_value(&mut self, state_key: StateKey, data_blob: Vec<u8>) {
+        self.data_store
+            .set(state_key, StateValue::new_legacy(data_blob));
     }
 
     /// Verifies the given transaction by running it through the VM verifier.
@@ -486,59 +582,62 @@ impl FakeExecutor {
         self.new_block_with_timestamp(self.block_time + 1);
     }
 
-    pub fn new_block_with_timestamp(&mut self, time_stamp: u64) {
-        let validator_set = ValidatorSet::fetch_config(&self.data_store)
+    pub fn new_block_with_timestamp(&mut self, time_microseconds: u64) {
+        self.block_time = time_microseconds;
+
+        let validator_set = ValidatorSet::fetch_config(&self.data_store.as_move_resolver())
             .expect("Unable to retrieve the validator set from storage");
-        self.block_time = time_stamp;
-        let new_block = BlockMetadata::new(
+        let proposer = *validator_set.payload().next().unwrap().account_address();
+        // when updating time, proposer cannot be ZERO.
+        self.new_block_with_metadata(proposer, vec![])
+    }
+
+    pub fn run_block_with_metadata(
+        &mut self,
+        proposer: AccountAddress,
+        failed_proposer_indices: Vec<u32>,
+        txns: Vec<SignedTransaction>,
+    ) -> Vec<(TransactionStatus, u64)> {
+        let mut txn_block: Vec<Transaction> =
+            txns.into_iter().map(Transaction::UserTransaction).collect();
+        let validator_set = ValidatorSet::fetch_config(&self.data_store.as_move_resolver())
+            .expect("Unable to retrieve the validator set from storage");
+        let new_block_metadata = BlockMetadata::new(
             HashValue::zero(),
             0,
+            0,
+            proposer,
+            BitVec::with_num_bits(validator_set.num_validators() as u16).into(),
+            failed_proposer_indices,
             self.block_time,
-            vec![],
-            *validator_set.payload()[0].account_address(),
         );
-        let output = self
-            .execute_transaction_block(vec![Transaction::BlockMetadata(new_block)])
-            .expect("Executing block prologue should succeed")
-            .pop()
-            .expect("Failed to get the execution result for Block Prologue");
-        // check if we emit the expected event, there might be more events for transaction fees
-        let event = output.events()[0].clone();
+        txn_block.insert(0, Transaction::BlockMetadata(new_block_metadata));
+
+        let outputs = self
+            .execute_transaction_block(txn_block)
+            .expect("Must execute transactions");
+
+        // Check if we emit the expected event for block metadata, there might be more events for transaction fees.
+        let event = outputs[0].events()[0].clone();
         assert_eq!(event.key(), &new_block_event_key());
         assert!(bcs::from_bytes::<NewBlockEvent>(event.event_data()).is_ok());
-        self.apply_write_set(output.write_set());
-    }
 
-    pub fn enable_parallel_execution(&mut self) {
-        let diem_root = Account::new_diem_root();
-        let seq_num = self
-            .read_account_resource_at_address(diem_root.address())
-            .unwrap()
-            .sequence_number();
-
-        let txn = diem_root
-            .transaction()
-            .write_set(encode_enable_parallel_execution_with_config())
-            .sequence_number(seq_num)
-            .sign();
-        self.execute_and_apply(txn);
-        assert!(ParallelExecutionConfig::fetch_config(&self.data_store).is_some());
-    }
-
-    pub fn disable_parallel_execution(&mut self) {
-        if ParallelExecutionConfig::fetch_config(&self.data_store).is_some() {
-            let diem_root = Account::new_diem_root();
-            let txn = diem_root
-                .transaction()
-                .write_set(encode_disable_parallel_execution())
-                .sequence_number(
-                    self.read_account_resource_at_address(diem_root.address())
-                        .unwrap()
-                        .sequence_number(),
-                )
-                .sign();
-            self.execute_and_apply(txn);
+        let mut results = vec![];
+        for output in outputs {
+            if !output.status().is_discarded() {
+                self.apply_write_set(output.write_set());
+            }
+            results.push((output.status().clone(), output.gas_used()));
         }
+        results
+    }
+
+    pub fn new_block_with_metadata(
+        &mut self,
+        proposer: AccountAddress,
+        failed_proposer_indices: Vec<u32>,
+    ) {
+        self.run_block_with_metadata(proposer, failed_proposer_indices, vec![]);
     }
 
     fn module(name: &str) -> ModuleId {
@@ -557,6 +656,10 @@ impl FakeExecutor {
         self.block_time
     }
 
+    pub fn get_block_time_seconds(&mut self) -> u64 {
+        self.block_time / 1_000_000
+    }
+
     pub fn exec(
         &mut self,
         module_name: &str,
@@ -565,17 +668,29 @@ impl FakeExecutor {
         args: Vec<Vec<u8>>,
     ) {
         let write_set = {
-            let mut gas_status = GasStatus::new_unmetered();
-            let vm = MoveVM::new(diem_vm::natives::diem_natives()).unwrap();
-            let remote_view = RemoteStorage::new(&self.data_store);
-            let mut session = vm.new_session(&remote_view);
+            // FIXME: should probably read the timestamp from storage.
+            let timed_features =
+                TimedFeatures::enable_all().with_override_profile(TimedFeatureOverride::Testing);
+            // TODO(Gas): we probably want to switch to non-zero costs in the future
+            let vm = MoveVmExt::new(
+                NativeGasParameters::zeros(),
+                AbstractValueSizeGasParameters::zeros(),
+                LATEST_GAS_FEATURE_VERSION,
+                self.chain_id,
+                self.features.clone(),
+                timed_features,
+            )
+            .unwrap();
+            let remote_view = StorageAdapter::new(&self.data_store);
+            let mut session =
+                vm.new_session(&remote_view, SessionId::void(), self.aggregator_enabled);
             session
-                .execute_function(
+                .execute_function_bypass_visibility(
                     &Self::module(module_name),
                     &Self::name(function_name),
                     type_params,
                     args,
-                    &mut gas_status,
+                    &mut UnmeteredGasMeter,
                 )
                 .unwrap_or_else(|e| {
                     panic!(
@@ -585,10 +700,14 @@ impl FakeExecutor {
                         e.into_vm_status()
                     )
                 });
-            let (changeset, events) = session.finish().expect("Failed to generate txn effects");
-            let (writeset, _events) = convert_changeset_and_events(changeset, events)
-                .expect("Failed to generate writeset");
-            writeset
+            let change_set = session
+                .finish(
+                    &mut (),
+                    &ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION),
+                )
+                .expect("Failed to generate txn effects");
+            let (write_set, _delta_change_set, _events) = change_set.unpack();
+            write_set
         };
         self.data_store.add_write_set(&write_set);
     }
@@ -600,22 +719,55 @@ impl FakeExecutor {
         type_params: Vec<TypeTag>,
         args: Vec<Vec<u8>>,
     ) -> Result<WriteSet, VMStatus> {
-        let mut gas_status = GasStatus::new_unmetered();
-        let vm = MoveVM::new(diem_vm::natives::diem_natives()).unwrap();
-        let remote_view = RemoteStorage::new(&self.data_store);
-        let mut session = vm.new_session(&remote_view);
+        // TODO(Gas): we probably want to switch to non-zero costs in the future
+        let vm = MoveVmExt::new(
+            NativeGasParameters::zeros(),
+            AbstractValueSizeGasParameters::zeros(),
+            LATEST_GAS_FEATURE_VERSION,
+            self.chain_id,
+            self.features.clone(),
+            // FIXME: should probably read the timestamp from storage.
+            TimedFeatures::enable_all(),
+        )
+        .unwrap();
+        let remote_view = StorageAdapter::new(&self.data_store);
+        let mut session = vm.new_session(&remote_view, SessionId::void(), self.aggregator_enabled);
         session
-            .execute_function(
+            .execute_function_bypass_visibility(
                 &Self::module(module_name),
                 &Self::name(function_name),
                 type_params,
                 args,
-                &mut gas_status,
+                &mut UnmeteredGasMeter,
             )
             .map_err(|e| e.into_vm_status())?;
-        let (changeset, events) = session.finish().expect("Failed to generate txn effects");
-        let (writeset, _events) =
-            convert_changeset_and_events(changeset, events).expect("Failed to generate writeset");
-        Ok(writeset)
+
+        let change_set = session
+            .finish(
+                &mut (),
+                &ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION),
+            )
+            .expect("Failed to generate txn effects");
+        // TODO: Support deltas in fake executor.
+        let (write_set, _delta_change_set, _events) = change_set.unpack();
+        Ok(write_set)
+    }
+
+    pub fn execute_view_function(
+        &mut self,
+        module_id: ModuleId,
+        func_name: Identifier,
+        type_args: Vec<TypeTag>,
+        arguments: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        // No gas limit
+        DiemVM::execute_view_function(
+            self.get_state_view(),
+            module_id,
+            func_name,
+            type_args,
+            arguments,
+            u64::MAX,
+        )
     }
 }

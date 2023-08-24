@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Implementation of the unary RPC protocol as per [DiemNet wire protocol v1].
@@ -40,17 +41,17 @@
 //! We limit the number of pending inbound and outbound RPC tasks to ensure that
 //! resource usage is bounded.
 //!
-//! [DiemNet wire protocol v1]: https://github.com/diem/diem/blob/main/specifications/network/messaging-v1.md
+//! [DiemNet wire protocol v1]: https://github.com/aptos-labs/diem-core/blob/main/specifications/network/messaging-v1.md
 //! [`Peer`]: crate::peer::Peer
 
 use crate::{
     counters::{
-        self, CANCELED_LABEL, DECLINED_LABEL, FAILED_LABEL, RECEIVED_LABEL, REQUEST_LABEL,
+        self, network_application_inbound_traffic, network_application_outbound_traffic,
+        CANCELED_LABEL, DECLINED_LABEL, FAILED_LABEL, RECEIVED_LABEL, REQUEST_LABEL,
         RESPONSE_LABEL, SENT_LABEL,
     },
     logging::NetworkSchema,
     peer::PeerNotification,
-    peer_manager::PeerManagerError,
     protocols::{
         network::SerializedRequest,
         wire::messaging::v1::{NetworkMessage, Priority, RequestId, RpcRequest, RpcResponse},
@@ -58,13 +59,14 @@ use crate::{
     ProtocolId,
 };
 use anyhow::anyhow;
-use bytes::Bytes;
-use channel::diem_channel;
+use diem_channels::diem_channel;
 use diem_config::network_id::NetworkContext;
 use diem_id_generator::{IdGenerator, U32IdGenerator};
 use diem_logger::prelude::*;
+use diem_short_hex_str::AsShortHexStr;
 use diem_time_service::{timeout, TimeService, TimeServiceTrait};
 use diem_types::PeerId;
+use bytes::Bytes;
 use error::RpcError;
 use futures::{
     channel::oneshot,
@@ -73,7 +75,6 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use serde::Serialize;
-use short_hex_str::AsShortHexStr;
 use std::{cmp::PartialEq, collections::HashMap, fmt::Debug, time::Duration};
 
 pub mod error;
@@ -234,6 +235,7 @@ impl InboundRpcs {
         // Collect counters for received request.
         counters::rpc_messages(network_context, REQUEST_LABEL, RECEIVED_LABEL).inc();
         counters::rpc_bytes(network_context, REQUEST_LABEL, RECEIVED_LABEL).inc_by(req_len);
+        network_application_inbound_traffic(self.network_context, protocol_id, req_len);
         let timer =
             counters::inbound_rpc_handler_latency(network_context, protocol_id).start_timer();
 
@@ -295,10 +297,7 @@ impl InboundRpcs {
     /// the outbound write queue.
     pub async fn send_outbound_response(
         &mut self,
-        write_reqs_tx: &mut channel::Sender<(
-            NetworkMessage,
-            oneshot::Sender<Result<(), PeerManagerError>>,
-        )>,
+        write_reqs_tx: &mut diem_channels::Sender<NetworkMessage>,
         maybe_response: Result<RpcResponse, RpcError>,
     ) -> Result<(), RpcError> {
         let network_context = &self.network_context;
@@ -307,7 +306,7 @@ impl InboundRpcs {
             Err(err) => {
                 counters::rpc_messages(network_context, RESPONSE_LABEL, FAILED_LABEL).inc();
                 return Err(err);
-            }
+            },
         };
         let res_len = response.raw_response.len() as u64;
 
@@ -320,8 +319,7 @@ impl InboundRpcs {
             response.request_id,
         );
         let message = NetworkMessage::RpcResponse(response);
-        let (ack_tx, _) = oneshot::channel();
-        write_reqs_tx.send((message, ack_tx)).await?;
+        write_reqs_tx.send(message).await?;
 
         // Collect counters for sent response.
         counters::rpc_messages(network_context, RESPONSE_LABEL, SENT_LABEL).inc();
@@ -354,7 +352,7 @@ pub struct OutboundRpcs {
     /// Maps a `RequestId` into a handle to a task in the `outbound_rpc_tasks`
     /// completion queue. When a new `RpcResponse` message comes in, we will use
     /// this map to notify the corresponding task that its response has arrived.
-    pending_outbound_rpcs: HashMap<RequestId, oneshot::Sender<RpcResponse>>,
+    pending_outbound_rpcs: HashMap<RequestId, (ProtocolId, oneshot::Sender<RpcResponse>)>,
     /// Only allow this many concurrent outbound rpcs at one time from this remote
     /// peer. New outbound requests exceeding this limit will be dropped.
     max_concurrent_outbound_rpcs: u32,
@@ -382,10 +380,7 @@ impl OutboundRpcs {
     pub async fn handle_outbound_request(
         &mut self,
         request: OutboundRpcRequest,
-        write_reqs_tx: &mut channel::Sender<(
-            NetworkMessage,
-            oneshot::Sender<Result<(), PeerManagerError>>,
-        )>,
+        write_reqs_tx: &mut diem_channels::Sender<NetworkMessage>,
     ) -> Result<(), RpcError> {
         let network_context = &self.network_context;
         let peer_id = &self.remote_peer_id;
@@ -436,19 +431,20 @@ impl OutboundRpcs {
             priority: Priority::default(),
             raw_request: Vec::from(request_data.as_ref()),
         });
-        let (ack_tx, _) = oneshot::channel();
-        write_reqs_tx.send((message, ack_tx)).await?;
+        write_reqs_tx.send(message).await?;
 
         // Collect counters for requests sent.
         counters::rpc_messages(network_context, REQUEST_LABEL, SENT_LABEL).inc();
         counters::rpc_bytes(network_context, REQUEST_LABEL, SENT_LABEL).inc_by(req_len);
+        network_application_outbound_traffic(self.network_context, protocol_id, req_len);
 
         // Create channel over which response is delivered to outbound_rpc_task.
         let (response_tx, response_rx) = oneshot::channel::<RpcResponse>();
 
         // Store send-side in the pending map so we can notify outbound_rpc_task
         // when the rpc response has arrived.
-        self.pending_outbound_rpcs.insert(request_id, response_tx);
+        self.pending_outbound_rpcs
+            .insert(request_id, (protocol_id, response_tx));
 
         // A future that waits for the rpc response with a timeout. We create the
         // timeout out here to start the timer as soon as we push onto the queue
@@ -496,12 +492,12 @@ impl OutboundRpcs {
                 Ok(response_len) => {
                     let latency = timer.stop_and_record();
                     (request_id, Ok((latency, response_len)))
-                }
+                },
                 Err(err) => {
                     // don't record
                     timer.stop_and_discard();
                     (request_id, Err(err))
-                }
+                },
             }
         };
 
@@ -552,23 +548,25 @@ impl OutboundRpcs {
                     peer_id.short_str(),
                     latency,
                 );
-            }
-            Err(err) => {
-                if let RpcError::UnexpectedResponseChannelCancel = err {
+            },
+            Err(error) => {
+                if let RpcError::UnexpectedResponseChannelCancel = error {
+                    // We don't log when the application has dropped the RPC
+                    // response channel because this is often expected (e.g.,
+                    // on state sync subscription requests that timeout).
                     counters::rpc_messages(network_context, REQUEST_LABEL, CANCELED_LABEL).inc();
                 } else {
                     counters::rpc_messages(network_context, REQUEST_LABEL, FAILED_LABEL).inc();
+                    warn!(
+                        NetworkSchema::new(network_context).remote_peer(peer_id),
+                        "{} Error making outbound RPC request to {} (request_id {}). Error: {}",
+                        network_context,
+                        peer_id.short_str(),
+                        request_id,
+                        error
+                    );
                 }
-
-                warn!(
-                    NetworkSchema::new(network_context).remote_peer(peer_id),
-                    "{} Error making outbound rpc request with request_id {} to {}: {}",
-                    network_context,
-                    request_id,
-                    peer_id.short_str(),
-                    err
-                );
-            }
+            },
         }
     }
 
@@ -581,8 +579,14 @@ impl OutboundRpcs {
         let peer_id = &self.remote_peer_id;
         let request_id = response.request_id;
 
-        let is_canceled = if let Some(response_tx) = self.pending_outbound_rpcs.remove(&request_id)
+        let is_canceled = if let Some((protocol_id, response_tx)) =
+            self.pending_outbound_rpcs.remove(&request_id)
         {
+            network_application_inbound_traffic(
+                self.network_context,
+                protocol_id,
+                response.raw_response.len() as u64,
+            );
             response_tx.send(response).is_err()
         } else {
             true

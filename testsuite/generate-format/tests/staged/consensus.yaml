@@ -8,7 +8,7 @@ AccountAddress:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
-      SIZE: 16
+      SIZE: 32
 AccountAuthenticator:
   ENUM:
     0:
@@ -25,13 +25,71 @@ AccountAuthenticator:
               TYPENAME: MultiEd25519PublicKey
           - signature:
               TYPENAME: MultiEd25519Signature
+AggregateSignature:
+  STRUCT:
+    - validator_bitmask:
+        TYPENAME: BitVec
+    - sig:
+        OPTION:
+          TYPENAME: Signature
+AggregateSignatureWithRounds:
+  STRUCT:
+    - sig:
+        TYPENAME: AggregateSignature
+    - rounds:
+        SEQ: U64
+Batch:
+  STRUCT:
+    - batch_info:
+        TYPENAME: BatchInfo
+    - payload:
+        TYPENAME: BatchPayload
+BatchId:
+  STRUCT:
+    - id: U64
+    - nonce: U64
+BatchInfo:
+  STRUCT:
+    - author:
+        TYPENAME: AccountAddress
+    - batch_id:
+        TYPENAME: BatchId
+    - epoch: U64
+    - expiration: U64
+    - digest:
+        TYPENAME: HashValue
+    - num_txns: U64
+    - num_bytes: U64
+    - gas_bucket_start: U64
+BatchMsg:
+  STRUCT:
+    - batches:
+        SEQ:
+          TYPENAME: Batch
+BatchPayload:
+  STRUCT:
+    - author:
+        TYPENAME: AccountAddress
+    - txns:
+        SEQ:
+          TYPENAME: SignedTransaction
+BatchRequest:
+  STRUCT:
+    - epoch: U64
+    - source:
+        TYPENAME: AccountAddress
+    - digest:
+        TYPENAME: HashValue
+BitVec:
+  STRUCT:
+    - inner: BYTES
 Block:
   STRUCT:
     - block_data:
         TYPENAME: BlockData
     - signature:
         OPTION:
-          TYPENAME: Ed25519Signature
+          TYPENAME: Signature
 BlockData:
   STRUCT:
     - epoch: U64
@@ -58,13 +116,14 @@ BlockMetadata:
   STRUCT:
     - id:
         TYPENAME: HashValue
+    - epoch: U64
     - round: U64
-    - timestamp_usecs: U64
-    - previous_block_votes:
-        SEQ:
-          TYPENAME: AccountAddress
     - proposer:
         TYPENAME: AccountAddress
+    - previous_block_votes_bitvec: BYTES
+    - failed_proposer_indices:
+        SEQ: U32
+    - timestamp_usecs: U64
 BlockRetrievalRequest:
   STRUCT:
     - block_id:
@@ -96,12 +155,22 @@ BlockType:
       Proposal:
         STRUCT:
           - payload:
-              SEQ:
-                TYPENAME: SignedTransaction
+              TYPENAME: Payload
           - author:
               TYPENAME: AccountAddress
+          - failed_authors:
+              SEQ:
+                TUPLE:
+                  - U64
+                  - TYPENAME: AccountAddress
     1:
-      NilBlock: UNIT
+      NilBlock:
+        STRUCT:
+          - failed_authors:
+              SEQ:
+                TUPLE:
+                  - U64
+                  - TYPENAME: AccountAddress
     2:
       Genesis: UNIT
 ChainId:
@@ -124,7 +193,7 @@ CommitVote:
     - ledger_info:
         TYPENAME: LedgerInfo
     - signature:
-        TYPENAME: Ed25519Signature
+        TYPENAME: Signature
 ConsensusMsg:
   ENUM:
     0:
@@ -163,6 +232,30 @@ ConsensusMsg:
       CommitDecisionMsg:
         NEWTYPE:
           TYPENAME: CommitDecision
+    9:
+      BatchMsg:
+        NEWTYPE:
+          TYPENAME: BatchMsg
+    10:
+      BatchRequestMsg:
+        NEWTYPE:
+          TYPENAME: BatchRequest
+    11:
+      BatchResponse:
+        NEWTYPE:
+          TYPENAME: Batch
+    12:
+      SignedBatchInfo:
+        NEWTYPE:
+          TYPENAME: SignedBatchInfoMsg
+    13:
+      ProofOfStoreMsg:
+        NEWTYPE:
+          TYPENAME: ProofOfStoreMsg
+    14:
+      DAGMessage:
+        NEWTYPE:
+          TYPENAME: DAGNetworkMessage
 ContractEvent:
   ENUM:
     0:
@@ -177,10 +270,25 @@ ContractEventV0:
     - type_tag:
         TYPENAME: TypeTag
     - event_data: BYTES
+DAGNetworkMessage:
+  STRUCT:
+    - epoch: U64
+    - data: BYTES
 Ed25519PublicKey:
   NEWTYPESTRUCT: BYTES
 Ed25519Signature:
   NEWTYPESTRUCT: BYTES
+EntryFunction:
+  STRUCT:
+    - module:
+        TYPENAME: ModuleId
+    - function:
+        TYPENAME: Identifier
+    - ty_args:
+        SEQ:
+          TYPENAME: TypeTag
+    - args:
+        SEQ: BYTES
 EpochChangeProof:
   STRUCT:
     - ledger_info_with_sigs:
@@ -197,9 +305,16 @@ EpochState:
     - verifier:
         TYPENAME: ValidatorVerifier
 EventKey:
-  NEWTYPESTRUCT: BYTES
+  STRUCT:
+    - creation_number: U64
+    - account_address:
+        TYPENAME: AccountAddress
 HashValue:
-  NEWTYPESTRUCT: BYTES
+  STRUCT:
+    - hash:
+        TUPLEARRAY:
+          CONTENT: U8
+          SIZE: 32
 Identifier:
   NEWTYPESTRUCT: STR
 LedgerInfo:
@@ -219,11 +334,7 @@ LedgerInfoWithV0:
     - ledger_info:
         TYPENAME: LedgerInfo
     - signatures:
-        MAP:
-          KEY:
-            TYPENAME: AccountAddress
-          VALUE:
-            TYPENAME: Ed25519Signature
+        TYPENAME: AggregateSignature
 Module:
   STRUCT:
     - code: BYTES
@@ -242,12 +353,54 @@ MultiEd25519PublicKey:
   NEWTYPESTRUCT: BYTES
 MultiEd25519Signature:
   NEWTYPESTRUCT: BYTES
+Multisig:
+  STRUCT:
+    - multisig_address:
+        TYPENAME: AccountAddress
+    - transaction_payload:
+        OPTION:
+          TYPENAME: MultisigTransactionPayload
+MultisigTransactionPayload:
+  ENUM:
+    0:
+      EntryFunction:
+        NEWTYPE:
+          TYPENAME: EntryFunction
+Payload:
+  ENUM:
+    0:
+      DirectMempool:
+        NEWTYPE:
+          SEQ:
+            TYPENAME: SignedTransaction
+    1:
+      InQuorumStore:
+        NEWTYPE:
+          TYPENAME: ProofWithData
+ProofOfStore:
+  STRUCT:
+    - info:
+        TYPENAME: BatchInfo
+    - multi_signature:
+        TYPENAME: AggregateSignature
+ProofOfStoreMsg:
+  STRUCT:
+    - proofs:
+        SEQ:
+          TYPENAME: ProofOfStore
+ProofWithData:
+  STRUCT:
+    - proofs:
+        SEQ:
+          TYPENAME: ProofOfStore
 ProposalMsg:
   STRUCT:
     - proposal:
         TYPENAME: Block
     - sync_info:
         TYPENAME: SyncInfo
+PublicKey:
+  NEWTYPESTRUCT: BYTES
 QuorumCert:
   STRUCT:
     - vote_data:
@@ -263,7 +416,6 @@ RawTransaction:
         TYPENAME: TransactionPayload
     - max_gas_amount: U64
     - gas_unit_price: U64
-    - gas_currency_code: STR
     - expiration_timestamp_secs: U64
     - chain_id:
         TYPENAME: ChainId
@@ -276,23 +428,51 @@ Script:
     - args:
         SEQ:
           TYPENAME: TransactionArgument
-ScriptFunction:
+Signature:
+  NEWTYPESTRUCT: BYTES
+SignedBatchInfo:
   STRUCT:
-    - module:
-        TYPENAME: ModuleId
-    - function:
-        TYPENAME: Identifier
-    - ty_args:
+    - info:
+        TYPENAME: BatchInfo
+    - signer:
+        TYPENAME: AccountAddress
+    - signature:
+        TYPENAME: Signature
+SignedBatchInfoMsg:
+  STRUCT:
+    - signed_infos:
         SEQ:
-          TYPENAME: TypeTag
-    - args:
-        SEQ: BYTES
+          TYPENAME: SignedBatchInfo
 SignedTransaction:
   STRUCT:
     - raw_txn:
         TYPENAME: RawTransaction
     - authenticator:
         TYPENAME: TransactionAuthenticator
+StateKey:
+  ENUM:
+    0:
+      AccessPath:
+        NEWTYPE:
+          TYPENAME: AccessPath
+    1:
+      TableItem:
+        STRUCT:
+          - handle:
+              TYPENAME: TableHandle
+          - key: BYTES
+    2:
+      Raw:
+        NEWTYPE: BYTES
+StateValueMetadata:
+  ENUM:
+    0:
+      V0:
+        STRUCT:
+          - payer:
+              TYPENAME: AccountAddress
+          - deposit: U64
+          - creation_time_usecs: U64
 StructTag:
   STRUCT:
     - address:
@@ -301,7 +481,7 @@ StructTag:
         TYPENAME: Identifier
     - name:
         TYPENAME: Identifier
-    - type_params:
+    - type_args:
         SEQ:
           TYPENAME: TypeTag
 SyncInfo:
@@ -311,29 +491,14 @@ SyncInfo:
     - highest_ordered_cert:
         OPTION:
           TYPENAME: QuorumCert
-    - highest_ledger_info:
-        OPTION:
-          TYPENAME: LedgerInfoWithSignatures
-    - highest_timeout_cert:
-        OPTION:
-          TYPENAME: TimeoutCertificate
+    - highest_commit_cert:
+        TYPENAME: QuorumCert
     - highest_2chain_timeout_cert:
         OPTION:
           TYPENAME: TwoChainTimeoutCertificate
-Timeout:
-  STRUCT:
-    - epoch: U64
-    - round: U64
-TimeoutCertificate:
-  STRUCT:
-    - timeout:
-        TYPENAME: Timeout
-    - signatures:
-        MAP:
-          KEY:
-            TYPENAME: AccountAddress
-          VALUE:
-            TYPENAME: Ed25519Signature
+TableHandle:
+  NEWTYPESTRUCT:
+    TYPENAME: AccountAddress
 Transaction:
   ENUM:
     0:
@@ -349,7 +514,9 @@ Transaction:
         NEWTYPE:
           TYPENAME: BlockMetadata
     3:
-      StateCheckpoint: UNIT
+      StateCheckpoint:
+        NEWTYPE:
+          TYPENAME: HashValue
 TransactionArgument:
   ENUM:
     0:
@@ -371,6 +538,18 @@ TransactionArgument:
     5:
       Bool:
         NEWTYPE: BOOL
+    6:
+      U16:
+        NEWTYPE: U16
+    7:
+      U32:
+        NEWTYPE: U32
+    8:
+      U256:
+        NEWTYPE:
+          TUPLEARRAY:
+            CONTENT: U8
+            SIZE: 32
 TransactionAuthenticator:
   ENUM:
     0:
@@ -398,24 +577,39 @@ TransactionAuthenticator:
           - secondary_signers:
               SEQ:
                 TYPENAME: AccountAuthenticator
+    3:
+      FeePayer:
+        STRUCT:
+          - sender:
+              TYPENAME: AccountAuthenticator
+          - secondary_signer_addresses:
+              SEQ:
+                TYPENAME: AccountAddress
+          - secondary_signers:
+              SEQ:
+                TYPENAME: AccountAuthenticator
+          - fee_payer_address:
+              TYPENAME: AccountAddress
+          - fee_payer_signer:
+              TYPENAME: AccountAuthenticator
 TransactionPayload:
   ENUM:
     0:
-      WriteSet:
-        NEWTYPE:
-          TYPENAME: WriteSetPayload
-    1:
       Script:
         NEWTYPE:
           TYPENAME: Script
-    2:
+    1:
       ModuleBundle:
         NEWTYPE:
           TYPENAME: ModuleBundle
-    3:
-      ScriptFunction:
+    2:
+      EntryFunction:
         NEWTYPE:
-          TYPENAME: ScriptFunction
+          TYPENAME: EntryFunction
+    3:
+      Multisig:
+        NEWTYPE:
+          TYPENAME: Multisig
 TwoChainTimeout:
   STRUCT:
     - epoch: U64
@@ -426,51 +620,48 @@ TwoChainTimeoutCertificate:
   STRUCT:
     - timeout:
         TYPENAME: TwoChainTimeout
-    - signatures:
-        MAP:
-          KEY:
-            TYPENAME: AccountAddress
-          VALUE:
-            TUPLE:
-              - U64
-              - TYPENAME: Ed25519Signature
+    - signatures_with_rounds:
+        TYPENAME: AggregateSignatureWithRounds
 TypeTag:
   ENUM:
     0:
-      Bool: UNIT
+      bool: UNIT
     1:
-      U8: UNIT
+      u8: UNIT
     2:
-      U64: UNIT
+      u64: UNIT
     3:
-      U128: UNIT
+      u128: UNIT
     4:
-      Address: UNIT
+      address: UNIT
     5:
-      Signer: UNIT
+      signer: UNIT
     6:
-      Vector:
+      vector:
         NEWTYPE:
           TYPENAME: TypeTag
     7:
-      Struct:
+      struct:
         NEWTYPE:
           TYPENAME: StructTag
+    8:
+      u16: UNIT
+    9:
+      u32: UNIT
+    10:
+      u256: UNIT
 ValidatorConsensusInfo:
   STRUCT:
+    - address:
+        TYPENAME: AccountAddress
     - public_key:
-        TYPENAME: Ed25519PublicKey
+        TYPENAME: PublicKey
     - voting_power: U64
 ValidatorVerifier:
   STRUCT:
-    - address_to_validator_info:
-        MAP:
-          KEY:
-            TYPENAME: AccountAddress
-          VALUE:
-            TYPENAME: ValidatorConsensusInfo
-    - quorum_voting_power: U64
-    - total_voting_power: U64
+    - validator_infos:
+        SEQ:
+          TYPENAME: ValidatorConsensusInfo
 Vote:
   STRUCT:
     - vote_data:
@@ -480,15 +671,12 @@ Vote:
     - ledger_info:
         TYPENAME: LedgerInfo
     - signature:
-        TYPENAME: Ed25519Signature
-    - timeout_signature:
-        OPTION:
-          TYPENAME: Ed25519Signature
+        TYPENAME: Signature
     - two_chain_timeout:
         OPTION:
           TUPLE:
             - TYPENAME: TwoChainTimeout
-            - TYPENAME: Ed25519Signature
+            - TYPENAME: Signature
 VoteData:
   STRUCT:
     - proposed:
@@ -504,20 +692,44 @@ VoteMsg:
 WriteOp:
   ENUM:
     0:
-      Deletion: UNIT
-    1:
-      Value:
+      Creation:
         NEWTYPE: BYTES
+    1:
+      Modification:
+        NEWTYPE: BYTES
+    2:
+      Deletion: UNIT
+    3:
+      CreationWithMetadata:
+        STRUCT:
+          - data: BYTES
+          - metadata:
+              TYPENAME: StateValueMetadata
+    4:
+      ModificationWithMetadata:
+        STRUCT:
+          - data: BYTES
+          - metadata:
+              TYPENAME: StateValueMetadata
+    5:
+      DeletionWithMetadata:
+        STRUCT:
+          - metadata:
+              TYPENAME: StateValueMetadata
 WriteSet:
-  NEWTYPESTRUCT:
-    TYPENAME: WriteSetMut
+  ENUM:
+    0:
+      V0:
+        NEWTYPE:
+          TYPENAME: WriteSetV0
 WriteSetMut:
   STRUCT:
     - write_set:
-        SEQ:
-          TUPLE:
-            - TYPENAME: AccessPath
-            - TYPENAME: WriteOp
+        MAP:
+          KEY:
+            TYPENAME: StateKey
+          VALUE:
+            TYPENAME: WriteOp
 WriteSetPayload:
   ENUM:
     0:
@@ -531,3 +743,6 @@ WriteSetPayload:
               TYPENAME: AccountAddress
           - script:
               TYPENAME: Script
+WriteSetV0:
+  NEWTYPESTRUCT:
+    TYPENAME: WriteSetMut

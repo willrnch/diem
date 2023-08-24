@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     peer::DisconnectReason,
@@ -33,6 +34,16 @@ pub enum PeerManagerNotification {
     RecvMessage(PeerId, Message),
 }
 
+impl PeerManagerNotification {
+    /// Returns the peer ID of the notification
+    pub fn get_peer_id(&self) -> PeerId {
+        match self {
+            PeerManagerNotification::RecvRpc(peer_id, _) => *peer_id,
+            PeerManagerNotification::RecvMessage(peer_id, _) => *peer_id,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub enum ConnectionRequest {
     DialPeer(
@@ -46,7 +57,7 @@ pub enum ConnectionRequest {
     ),
 }
 
-#[derive(Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub enum ConnectionNotification {
     /// Connection with a new peer has been established.
     NewPeer(ConnectionMetadata, NetworkContext),
@@ -65,10 +76,10 @@ impl fmt::Display for ConnectionNotification {
         match self {
             ConnectionNotification::NewPeer(metadata, context) => {
                 write!(f, "[{},{}]", metadata, context)
-            }
+            },
             ConnectionNotification::LostPeer(metadata, context, reason) => {
                 write!(f, "[{},{},{}]", metadata, context, reason)
-            }
+            },
         }
     }
 }

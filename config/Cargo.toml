@@ -1,39 +1,48 @@
 [package]
 name = "diem-config"
+description = "Diem config"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem diem-config"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-get_if_addrs = { version = "0.5.3", default-features = false }
-log = { version = "0.4.14", features = ["serde"] }
-mirai-annotations = "1.10.1"
-rand = "0.8.3"
-serde = { version = "1.0.124", features = ["rc"], default-features = false }
-serde_yaml = "0.8.17"
-thiserror = "1.0.24"
-
-bcs = "0.1.2"
-diem-crypto = { path = "../crates/diem-crypto" }
-diem-crypto-derive = { path = "../crates/diem-crypto-derive" }
-diem-global-constants = { path = "./global-constants"}
-diem-logger = { path = "../crates/diem-logger" }
-diem-network-address-encryption = { path = "management/network-address-encryption" }
-diem-secure-storage = { path = "../secure/storage" }
-diem-temppath = { path = "../crates/diem-temppath" }
-diem-types = { path = "../types" }
-diem-workspace-hack = { version = "0.1", path = "../crates/diem-workspace-hack" }
-short-hex-str = { path = "../crates/short-hex-str" }
+anyhow = { workspace = true }
+diem-crypto = { workspace = true }
+diem-crypto-derive = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-logger = { workspace = true }
+diem-secure-storage = { workspace = true }
+diem-short-hex-str = { workspace = true }
+diem-temppath = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+byteorder = { workspace = true }
+cfg-if = { workspace = true }
+cfg_block = { workspace = true }
+get_if_addrs = { workspace = true }
+mirai-annotations = { workspace = true }
+num_cpus = { workspace = true }
+poem-openapi = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_merge = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-diem-crypto = { path = "../crates/diem-crypto", features = ["fuzzing"] }
+diem-crypto = { workspace = true }
+diem-types = { workspace = true, features = ["fuzzing"] }
 
 [features]
 default = []
 fuzzing = ["diem-crypto/fuzzing", "diem-types/fuzzing"]
+network-perf-test = []
 testing = []

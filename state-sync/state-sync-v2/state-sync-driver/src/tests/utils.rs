@@ -1,168 +1,162 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::driver_factory::DriverFactory;
-use consensus_notifications::ConsensusNotifier;
-use data_streaming_service::streaming_client::new_streaming_service_client_listener_pair;
-use diem_config::config::{NodeConfig, RoleType};
+use crate::driver::DriverConfiguration;
+use diem_config::config::{RoleType, StateSyncDriverConfig};
 use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519Signature},
     HashValue, PrivateKey, Uniform,
 };
-use diem_data_client::diemnet::DiemNetDataClient;
-use diem_infallible::RwLock;
-use diem_time_service::TimeService;
+use diem_data_client::global_summary::GlobalDataSummary;
+use diem_data_streaming_service::{
+    data_notification::DataNotification, data_stream::DataStreamListener, streaming_client::Epoch,
+};
+use diem_event_notifications::EventNotificationListener;
+use diem_mempool_notifications::{CommittedTransaction, MempoolNotificationListener};
+use diem_storage_service_types::responses::CompleteDataRange;
 use diem_types::{
     account_address::AccountAddress,
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     chain_id::ChainId,
+    contract_event::ContractEvent,
+    epoch_state::EpochState,
+    event::EventKey,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    move_resource::MoveStorage,
-    on_chain_config::ON_CHAIN_CONFIG_REGISTRY,
+    on_chain_config::ValidatorSet,
+    proof::{
+        SparseMerkleRangeProof, TransactionAccumulatorRangeProof, TransactionInfoListWithProof,
+    },
+    state_store::state_value::StateValueChunkWithProof,
     transaction::{
-        RawTransaction, Script, SignedTransaction, Transaction, TransactionPayload, Version,
-        WriteSetPayload,
+        ExecutionStatus, RawTransaction, Script, SignedTransaction, Transaction, TransactionInfo,
+        TransactionListWithProof, TransactionOutput, TransactionOutputListWithProof,
+        TransactionPayload, TransactionStatus, Version,
     },
     waypoint::Waypoint,
+    write_set::WriteSet,
 };
-use diem_vm::DiemVM;
-use diemdb::DiemDB;
-use event_notifications::{
-    EventNotificationSender, EventSubscriptionService, ReconfigNotificationListener,
-};
-use executor::chunk_executor::ChunkExecutor;
-use executor_test_helpers::bootstrap_genesis;
-use mempool_notifications::MempoolNotificationListener;
-use network::application::{interface::MultiNetworkSender, storage::PeerMetadataStorage};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
-use storage_interface::{DbReader, DbReaderWriter};
-use storage_service_client::StorageServiceClient;
+use futures::{channel::mpsc, StreamExt};
+use move_core_types::language_storage::TypeTag;
+use rand::{rngs::OsRng, Rng};
 
-/// Creates a state sync driver with the given config and waypoint
-#[allow(dead_code)]
-pub fn create_driver_with_config_and_waypoint(
-    node_config: NodeConfig,
-    waypoint: Waypoint,
-) -> (
-    DriverFactory,
-    ConsensusNotifier,
-    MempoolNotificationListener,
-    ReconfigNotificationListener,
-) {
-    create_driver_for_tests(node_config, waypoint)
+/// Creates a new data stream listener and notification sender pair
+pub fn create_data_stream_listener() -> (mpsc::Sender<DataNotification>, DataStreamListener) {
+    let (notification_sender, notification_receiver) = mpsc::channel(100);
+    let data_stream_listener = DataStreamListener::new(create_random_u64(), notification_receiver);
+
+    (notification_sender, data_stream_listener)
 }
 
-/// Creates a state sync driver for a validator node
-pub fn create_validator_driver() -> (
-    DriverFactory,
-    ConsensusNotifier,
-    MempoolNotificationListener,
-    ReconfigNotificationListener,
-) {
-    let mut node_config = NodeConfig::default();
-    node_config.base.role = RoleType::Validator;
-
-    create_driver_for_tests(node_config, Waypoint::default())
+/// Creates a test epoch ending ledger info
+pub fn create_epoch_ending_ledger_info() -> LedgerInfoWithSignatures {
+    let ledger_info = LedgerInfo::genesis(HashValue::zero(), ValidatorSet::empty());
+    LedgerInfoWithSignatures::new(ledger_info, AggregateSignature::empty())
 }
 
-/// Creates a state sync driver for a full node
-pub fn create_full_node_driver() -> (
-    DriverFactory,
-    ConsensusNotifier,
-    MempoolNotificationListener,
-    ReconfigNotificationListener,
-) {
-    let mut node_config = NodeConfig::default();
-    node_config.base.role = RoleType::FullNode;
-
-    create_driver_for_tests(node_config, Waypoint::default())
+/// Creates a single test event
+pub fn create_event(event_key: Option<EventKey>) -> ContractEvent {
+    let event_key = event_key.unwrap_or_else(EventKey::random);
+    ContractEvent::new(event_key, 0, TypeTag::Bool, bcs::to_bytes(&0).unwrap())
 }
 
-/// Creates a state sync driver using the given node config and waypoint
-fn create_driver_for_tests(
-    node_config: NodeConfig,
-    waypoint: Waypoint,
-) -> (
-    DriverFactory,
-    ConsensusNotifier,
-    MempoolNotificationListener,
-    ReconfigNotificationListener,
-) {
-    // Create test diem database
-    let db_path = diem_temppath::TempPath::new();
-    db_path.create_as_dir().unwrap();
-    let (db, db_rw) = DbReaderWriter::wrap(DiemDB::new_for_test(db_path.path()));
+/// Creates a test driver configuration for full nodes
+pub fn create_full_node_driver_configuration() -> DriverConfiguration {
+    let config = StateSyncDriverConfig::default();
+    let role = RoleType::FullNode;
+    let waypoint = Waypoint::default();
 
-    // Bootstrap the genesis transaction
-    let (genesis, _) = vm_genesis::test_genesis_change_set_and_validators(Some(1));
-    let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis));
-    bootstrap_genesis::<DiemVM>(&db_rw, &genesis_txn).unwrap();
-
-    // Create the event subscription service and notify initial configs
-    let storage: Arc<dyn DbReader> = db;
-    let synced_version = (&*storage).fetch_synced_version().unwrap();
-    let mut event_subscription_service = EventSubscriptionService::new(
-        ON_CHAIN_CONFIG_REGISTRY,
-        Arc::new(RwLock::new(db_rw.clone())),
-    );
-    let reconfiguration_subscriber = event_subscription_service
-        .subscribe_to_reconfigurations()
-        .unwrap();
-    event_subscription_service
-        .notify_initial_configs(synced_version)
-        .unwrap();
-
-    // Create consensus and mempool notifiers and listeners
-    let (consensus_notifier, consensus_listener) =
-        consensus_notifications::new_consensus_notifier_listener_pair(1000);
-    let (mempool_notifier, mempool_listener) =
-        mempool_notifications::new_mempool_notifier_listener_pair();
-
-    // Create the chunk executor
-    let chunk_executor = Arc::new(ChunkExecutor::<DiemVM>::new(db_rw.clone()).unwrap());
-
-    // Create a streaming service client
-    let (streaming_service_client, _) = new_streaming_service_client_listener_pair();
-
-    // Create a test diem data client
-    let network_client = StorageServiceClient::new(
-        MultiNetworkSender::new(HashMap::new()),
-        PeerMetadataStorage::new(&[]),
-    );
-    let (diem_data_client, _) = DiemNetDataClient::new(
-        node_config.state_sync.diem_data_client,
-        node_config.state_sync.storage_service,
-        TimeService::mock(),
-        network_client,
-    );
-
-    // Create and spawn the driver
-    let driver_factory = DriverFactory::create_and_spawn_driver(
-        false,
-        &node_config,
+    DriverConfiguration {
+        config,
+        role,
         waypoint,
-        db_rw.reader,
-        chunk_executor,
-        mempool_notifier,
-        consensus_listener,
-        event_subscription_service,
-        diem_data_client,
-        streaming_service_client,
-    );
+    }
+}
 
-    (
-        driver_factory,
-        consensus_notifier,
-        mempool_listener,
-        reconfiguration_subscriber,
+/// Creates a global data summary with the highest ended epoch
+pub fn create_global_summary(highest_ended_epoch: Epoch) -> GlobalDataSummary {
+    let mut global_data_summary = GlobalDataSummary::empty();
+    global_data_summary
+        .advertised_data
+        .epoch_ending_ledger_infos = vec![CompleteDataRange::new(0, highest_ended_epoch).unwrap()];
+    global_data_summary
+}
+
+/// Creates a new ledger info with signatures at the specified version
+pub fn create_ledger_info_at_version(version: Version) -> LedgerInfoWithSignatures {
+    let block_info = BlockInfo::new(0, 0, HashValue::zero(), HashValue::zero(), version, 0, None);
+    let ledger_info = LedgerInfo::new(block_info, HashValue::random());
+    LedgerInfoWithSignatures::new(ledger_info, AggregateSignature::empty())
+}
+
+/// Creates a test transaction output list with proof
+pub fn create_output_list_with_proof() -> TransactionOutputListWithProof {
+    let transaction_info_list_with_proof = create_transaction_info_list_with_proof();
+    let transaction_and_output = (create_transaction(), create_transaction_output());
+    TransactionOutputListWithProof::new(
+        vec![transaction_and_output],
+        Some(0),
+        transaction_info_list_with_proof,
     )
 }
 
+/// Creates a random epoch ending ledger info with the specified values
+pub fn create_random_epoch_ending_ledger_info(
+    version: Version,
+    epoch: Epoch,
+) -> LedgerInfoWithSignatures {
+    let block_info = BlockInfo::new(
+        epoch,
+        0,
+        HashValue::zero(),
+        HashValue::random(),
+        version,
+        0,
+        Some(EpochState::empty()),
+    );
+    let ledger_info = LedgerInfo::new(block_info, HashValue::random());
+    LedgerInfoWithSignatures::new(ledger_info, AggregateSignature::empty())
+}
+
+/// Returns an empty epoch state
+pub fn create_empty_epoch_state() -> EpochState {
+    EpochState::empty()
+}
+
+/// Returns an epoch state at the specified epoch
+pub fn create_epoch_state(epoch: u64) -> EpochState {
+    let mut epoch_state = create_empty_epoch_state();
+    epoch_state.epoch = epoch;
+    epoch_state
+}
+
+/// Returns a random u64
+fn create_random_u64() -> u64 {
+    let mut rng = OsRng;
+    rng.gen()
+}
+
+/// Creates a test state value chunk with proof
+pub fn create_state_value_chunk_with_proof(last_chunk: bool) -> StateValueChunkWithProof {
+    let right_siblings = if last_chunk {
+        vec![]
+    } else {
+        vec![HashValue::random()]
+    };
+    StateValueChunkWithProof {
+        first_index: 0,
+        last_index: 100,
+        first_key: HashValue::random(),
+        last_key: HashValue::random(),
+        raw_values: vec![],
+        proof: SparseMerkleRangeProof::new(right_siblings),
+        root_hash: HashValue::random(),
+    }
+}
+
 /// Creates a single test transaction
-pub fn create_test_transaction() -> Transaction {
+pub fn create_transaction() -> Transaction {
     let private_key = Ed25519PrivateKey::generate_for_testing();
     let public_key = private_key.public_key();
 
@@ -173,7 +167,6 @@ pub fn create_test_transaction() -> Transaction {
         transaction_payload,
         0,
         0,
-        "".into(),
         0,
         ChainId::new(10),
     );
@@ -186,9 +179,70 @@ pub fn create_test_transaction() -> Transaction {
     Transaction::UserTransaction(signed_transaction)
 }
 
-/// Creates a new ledger info with signatures at the specified version
-pub fn create_ledger_info_at_version(version: Version) -> LedgerInfoWithSignatures {
-    let block_info = BlockInfo::new(0, 0, HashValue::zero(), HashValue::zero(), version, 0, None);
-    let ledger_info = LedgerInfo::new(block_info, HashValue::random());
-    LedgerInfoWithSignatures::new(ledger_info, BTreeMap::new())
+/// Creates a test transaction info
+pub fn create_transaction_info() -> TransactionInfo {
+    TransactionInfo::new(
+        HashValue::random(),
+        HashValue::random(),
+        HashValue::random(),
+        Some(HashValue::random()),
+        0,
+        ExecutionStatus::Success,
+    )
+}
+
+/// Creates a test transaction info list with proof
+pub fn create_transaction_info_list_with_proof() -> TransactionInfoListWithProof {
+    TransactionInfoListWithProof::new(TransactionAccumulatorRangeProof::new_empty(), vec![
+        create_transaction_info(),
+    ])
+}
+
+/// Creates a test transaction list with proof
+pub fn create_transaction_list_with_proof() -> TransactionListWithProof {
+    let transaction_info_list_with_proof = create_transaction_info_list_with_proof();
+    TransactionListWithProof::new(
+        vec![create_transaction()],
+        None,
+        Some(0),
+        transaction_info_list_with_proof,
+    )
+}
+
+/// Creates a single test transaction output
+pub fn create_transaction_output() -> TransactionOutput {
+    TransactionOutput::new(
+        WriteSet::default(),
+        vec![create_event(None)],
+        0,
+        TransactionStatus::Keep(ExecutionStatus::Success),
+    )
+}
+
+/// Verifies that mempool is notified about the committed transactions and
+/// verifies that the event listener is notified about the committed
+/// events (if it exists).
+pub async fn verify_mempool_and_event_notification(
+    event_listener: Option<&mut EventNotificationListener>,
+    mempool_notification_listener: &mut MempoolNotificationListener,
+    expected_transactions: Vec<Transaction>,
+    expected_events: Vec<ContractEvent>,
+) {
+    // Verify mempool is notified and ack the notification
+    let mempool_notification = mempool_notification_listener.select_next_some().await;
+    let committed_transactions: Vec<CommittedTransaction> = expected_transactions
+        .into_iter()
+        .map(|txn| CommittedTransaction {
+            sender: txn.try_as_signed_user_txn().unwrap().sender(),
+            sequence_number: 0,
+        })
+        .collect();
+    assert_eq!(mempool_notification.transactions, committed_transactions);
+    let _ = mempool_notification_listener.ack_commit_notification(mempool_notification);
+
+    // Verify the event listener is notified about the specified events
+    if let Some(event_listener) = event_listener {
+        let event_notification = event_listener.select_next_some().await;
+        assert_eq!(event_notification.subscribed_events, expected_events);
+    }
 }

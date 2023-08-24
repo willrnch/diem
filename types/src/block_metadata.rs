@@ -1,18 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    account_address::AccountAddress,
-    account_config::diem_root_address,
-    event::{EventHandle, EventKey},
-};
 use diem_crypto::HashValue;
-use move_core_types::{
-    ident_str,
-    identifier::IdentStr,
-    move_resource::{MoveResource, MoveStructType},
-};
-use once_cell::sync::Lazy;
+use move_core_types::{account_address::AccountAddress, value::MoveValue};
 use serde::{Deserialize, Serialize};
 
 /// Struct that will be persisted on chain to store the information of the current block.
@@ -29,27 +20,33 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
     id: HashValue,
+    epoch: u64,
     round: u64,
-    timestamp_usecs: u64,
-    // The vector has to be sorted to ensure consistent result among all nodes
-    previous_block_votes: Vec<AccountAddress>,
     proposer: AccountAddress,
+    #[serde(with = "serde_bytes")]
+    previous_block_votes_bitvec: Vec<u8>,
+    failed_proposer_indices: Vec<u32>,
+    timestamp_usecs: u64,
 }
 
 impl BlockMetadata {
     pub fn new(
         id: HashValue,
+        epoch: u64,
         round: u64,
-        timestamp_usecs: u64,
-        previous_block_votes: Vec<AccountAddress>,
         proposer: AccountAddress,
+        previous_block_votes_bitvec: Vec<u8>,
+        failed_proposer_indices: Vec<u32>,
+        timestamp_usecs: u64,
     ) -> Self {
         Self {
             id,
+            epoch,
             round,
-            timestamp_usecs,
-            previous_block_votes,
             proposer,
+            previous_block_votes_bitvec,
+            failed_proposer_indices,
+            timestamp_usecs,
         }
     }
 
@@ -57,16 +54,31 @@ impl BlockMetadata {
         self.id
     }
 
-    pub fn into_inner(self) -> (u64, u64, Vec<AccountAddress>, AccountAddress) {
-        (
-            self.round,
-            self.timestamp_usecs,
-            self.previous_block_votes.clone(),
-            self.proposer,
-        )
+    pub fn get_prologue_move_args(self, signer: AccountAddress) -> Vec<MoveValue> {
+        vec![
+            MoveValue::Signer(signer),
+            MoveValue::Address(AccountAddress::from_bytes(self.id.to_vec()).unwrap()),
+            MoveValue::U64(self.epoch),
+            MoveValue::U64(self.round),
+            MoveValue::Address(self.proposer),
+            MoveValue::Vector(
+                self.failed_proposer_indices
+                    .into_iter()
+                    .map(u64::from)
+                    .map(MoveValue::U64)
+                    .collect(),
+            ),
+            MoveValue::Vector(
+                self.previous_block_votes_bitvec
+                    .into_iter()
+                    .map(MoveValue::U8)
+                    .collect(),
+            ),
+            MoveValue::U64(self.timestamp_usecs),
+        ]
     }
 
-    pub fn timestamp_usec(&self) -> u64 {
+    pub fn timestamp_usecs(&self) -> u64 {
         self.timestamp_usecs
     }
 
@@ -74,81 +86,19 @@ impl BlockMetadata {
         self.proposer
     }
 
-    pub fn previous_block_votes(&self) -> &Vec<AccountAddress> {
-        &self.previous_block_votes
+    pub fn previous_block_votes_bitvec(&self) -> &Vec<u8> {
+        &self.previous_block_votes_bitvec
+    }
+
+    pub fn failed_proposer_indices(&self) -> &Vec<u32> {
+        &self.failed_proposer_indices
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn round(&self) -> u64 {
         self.round
-    }
-}
-
-pub fn new_block_event_key() -> EventKey {
-    EventKey::new_from_address(&diem_root_address(), 17)
-}
-
-/// The path to the new block event handle under a DiemBlock::BlockMetadata resource.
-pub static NEW_BLOCK_EVENT_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
-    let mut path = DiemBlockResource::resource_path();
-    // it can be anything as long as it's referenced in AccountState::get_event_handle_by_query_path
-    path.extend_from_slice(b"/new_block_event/");
-    path
-});
-
-#[derive(Deserialize, Serialize)]
-pub struct DiemBlockResource {
-    height: u64,
-    new_block_events: EventHandle,
-}
-
-impl DiemBlockResource {
-    pub fn new_block_events(&self) -> &EventHandle {
-        &self.new_block_events
-    }
-
-    pub fn height(&self) -> u64 {
-        self.height
-    }
-}
-
-impl MoveStructType for DiemBlockResource {
-    const MODULE_NAME: &'static IdentStr = ident_str!("DiemBlock");
-    const STRUCT_NAME: &'static IdentStr = ident_str!("BlockMetadata");
-}
-
-impl MoveResource for DiemBlockResource {}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct NewBlockEvent {
-    round: u64,
-    proposer: AccountAddress,
-    votes: Vec<AccountAddress>,
-    timestamp: u64,
-}
-
-impl NewBlockEvent {
-    pub fn new(
-        round: u64,
-        proposer: AccountAddress,
-        votes: Vec<AccountAddress>,
-        timestamp: u64,
-    ) -> Self {
-        Self {
-            round,
-            proposer,
-            votes,
-            timestamp,
-        }
-    }
-    pub fn round(&self) -> u64 {
-        self.round
-    }
-
-    pub fn proposer(&self) -> AccountAddress {
-        self.proposer
-    }
-
-    pub fn votes(&self) -> Vec<AccountAddress> {
-        self.votes.clone()
     }
 }

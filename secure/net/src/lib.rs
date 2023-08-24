@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -16,7 +17,7 @@
 //! where a block is a length prefixed array of bytes.
 
 use diem_logger::{info, trace, warn, Schema};
-use diem_secure_push_metrics::{register_int_counter_vec, IntCounterVec};
+use diem_metrics_core::{register_int_counter_vec, IntCounterVec};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::{
@@ -387,7 +388,7 @@ impl NetworkServer {
                     )
                     .error(&err));
                     return Err(err);
-                }
+                },
             };
 
             self.increment_counter(Method::Connect, MethodResult::Success);

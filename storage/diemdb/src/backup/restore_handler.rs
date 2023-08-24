@@ -1,29 +1,33 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    change_set::ChangeSet, event_store::EventStore, ledger_store::LedgerStore,
-    schema::transaction_accumulator::TransactionAccumulatorSchema, state_store::StateStore,
-    transaction_store::TransactionStore, DiemDB,
+    backup::restore_utils,
+    db_metadata::{DbMetadataKey, DbMetadataSchema},
+    event_store::EventStore,
+    ledger_store::LedgerStore,
+    state_restore::{StateSnapshotRestore, StateSnapshotRestoreMode},
+    state_store::StateStore,
+    transaction_store::TransactionStore,
+    DiemDB,
 };
-use anyhow::{ensure, Result};
-use diem_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
-use diem_jellyfish_merkle::restore::JellyfishMerkleRestore;
+use anyhow::Result;
+use diem_crypto::HashValue;
+use diem_storage_interface::DbReader;
 use diem_types::{
-    account_state_blob::AccountStateBlob,
     contract_event::ContractEvent,
     ledger_info::LedgerInfoWithSignatures,
-    proof::{definition::LeafCount, position::FrozenSubTreeIterator},
-    transaction::{Transaction, TransactionInfo, Version, PRE_GENESIS_VERSION},
+    proof::definition::LeafCount,
+    state_store::{state_key::StateKey, state_value::StateValue},
+    transaction::{Transaction, TransactionInfo, Version},
+    write_set::WriteSet,
 };
-use schemadb::DB;
 use std::sync::Arc;
-use storage_interface::{DbReader, TreeState};
 
 /// Provides functionalities for DiemDB data restore.
 #[derive(Clone)]
 pub struct RestoreHandler {
-    db: Arc<DB>,
     pub diemdb: Arc<DiemDB>,
     ledger_store: Arc<LedgerStore>,
     transaction_store: Arc<TransactionStore>,
@@ -33,7 +37,6 @@ pub struct RestoreHandler {
 
 impl RestoreHandler {
     pub(crate) fn new(
-        db: Arc<DB>,
         diemdb: Arc<DiemDB>,
         ledger_store: Arc<LedgerStore>,
         transaction_store: Arc<TransactionStore>,
@@ -41,7 +44,6 @@ impl RestoreHandler {
         event_store: Arc<EventStore>,
     ) -> Self {
         Self {
-            db,
             diemdb,
             ledger_store,
             transaction_store,
@@ -54,36 +56,29 @@ impl RestoreHandler {
         &self,
         version: Version,
         expected_root_hash: HashValue,
-        account_count_migration: bool,
-    ) -> Result<JellyfishMerkleRestore<AccountStateBlob>> {
-        JellyfishMerkleRestore::new_overwrite(
-            Arc::clone(&self.state_store),
+        restore_mode: StateSnapshotRestoreMode,
+    ) -> Result<StateSnapshotRestore<StateKey, StateValue>> {
+        StateSnapshotRestore::new(
+            &self.state_store.state_merkle_db,
+            &self.state_store,
             version,
             expected_root_hash,
-            account_count_migration,
+            true, /* async_commit */
+            restore_mode,
         )
     }
 
+    pub fn reset_state_store(&self) {
+        self.state_store.reset();
+    }
+
     pub fn save_ledger_infos(&self, ledger_infos: &[LedgerInfoWithSignatures]) -> Result<()> {
-        ensure!(!ledger_infos.is_empty(), "No LedgerInfos to save.");
-
-        let mut cs = ChangeSet::new();
-        ledger_infos
-            .iter()
-            .map(|li| self.ledger_store.put_ledger_info(li, &mut cs))
-            .collect::<Result<Vec<_>>>()?;
-        self.db.write_schemas(cs.batch)?;
-
-        if let Some(li) = self.ledger_store.get_latest_ledger_info_option() {
-            if li.ledger_info().epoch() > ledger_infos.last().unwrap().ledger_info().epoch() {
-                // No need to update latest ledger info.
-                return Ok(());
-            }
-        }
-
-        self.ledger_store
-            .set_latest_ledger_info(ledger_infos.last().unwrap().clone());
-        Ok(())
+        restore_utils::save_ledger_infos(
+            self.diemdb.ledger_db.metadata_db(),
+            self.ledger_store.clone(),
+            ledger_infos,
+            None,
+        )
     }
 
     pub fn confirm_or_save_frozen_subtrees(
@@ -91,34 +86,12 @@ impl RestoreHandler {
         num_leaves: LeafCount,
         frozen_subtrees: &[HashValue],
     ) -> Result<()> {
-        let mut cs = ChangeSet::new();
-        let positions: Vec<_> = FrozenSubTreeIterator::new(num_leaves).collect();
-
-        ensure!(
-            positions.len() == frozen_subtrees.len(),
-            "Number of frozen subtree roots not expected. Expected: {}, actual: {}",
-            positions.len(),
-            frozen_subtrees.len(),
-        );
-
-        positions
-            .iter()
-            .zip(frozen_subtrees.iter().rev())
-            .map(|(p, h)| {
-                if let Some(_h) = self.db.get::<TransactionAccumulatorSchema>(p)? {
-                    ensure!(
-                        h == &_h,
-                        "Frozen subtree root does not match that already in DB. Provided: {}, in db: {}.",
-                        h,
-                        _h,
-                    );
-                } else {
-                    cs.batch.put::<TransactionAccumulatorSchema>(p, h)?;
-                }
-                Ok(())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.db.write_schemas(cs.batch)
+        restore_utils::confirm_or_save_frozen_subtrees(
+            self.diemdb.ledger_db.transaction_accumulator_db(),
+            num_leaves,
+            frozen_subtrees,
+            None,
+        )
     }
 
     pub fn save_transactions(
@@ -127,43 +100,69 @@ impl RestoreHandler {
         txns: &[Transaction],
         txn_infos: &[TransactionInfo],
         events: &[Vec<ContractEvent>],
+        write_sets: Vec<WriteSet>,
     ) -> Result<()> {
-        let mut cs = ChangeSet::new();
-        for (idx, txn) in txns.iter().enumerate() {
-            self.transaction_store
-                .put_transaction(first_version + idx as Version, txn, &mut cs)?;
-        }
-        self.ledger_store
-            .put_transaction_infos(first_version, txn_infos, &mut cs)?;
-        self.event_store
-            .put_events_multiple_versions(first_version, events, &mut cs)?;
-
-        self.db.write_schemas(cs.batch)
+        restore_utils::save_transactions(
+            self.ledger_store.clone(),
+            self.transaction_store.clone(),
+            self.event_store.clone(),
+            self.state_store.clone(),
+            first_version,
+            txns,
+            txn_infos,
+            events,
+            write_sets,
+            None,
+            false,
+        )
     }
 
-    pub fn get_tree_state(&self, num_transactions: LeafCount) -> Result<TreeState> {
-        let frozen_subtrees = self
-            .ledger_store
-            .get_frozen_subtree_hashes(num_transactions)?;
-        let state_root_hash = if num_transactions == 0 {
-            self.state_store
-                .get_root_hash_option(PRE_GENESIS_VERSION)?
-                .unwrap_or(*SPARSE_MERKLE_PLACEHOLDER_HASH)
-        } else {
-            self.state_store.get_root_hash(num_transactions - 1)?
-        };
-
-        Ok(TreeState::new(
-            num_transactions,
-            frozen_subtrees,
-            state_root_hash,
-        ))
+    pub fn save_transactions_and_replay_kv(
+        &self,
+        first_version: Version,
+        txns: &[Transaction],
+        txn_infos: &[TransactionInfo],
+        events: &[Vec<ContractEvent>],
+        write_sets: Vec<WriteSet>,
+    ) -> Result<()> {
+        restore_utils::save_transactions(
+            self.ledger_store.clone(),
+            self.transaction_store.clone(),
+            self.event_store.clone(),
+            self.state_store.clone(),
+            first_version,
+            txns,
+            txn_infos,
+            events,
+            write_sets,
+            None,
+            true,
+        )
     }
 
     pub fn get_next_expected_transaction_version(&self) -> Result<Version> {
-        Ok(self
+        Ok(self.diemdb.get_latest_version().map_or(0, |ver| ver + 1))
+    }
+
+    pub fn get_state_snapshot_before(
+        &self,
+        version: Version,
+    ) -> Result<Option<(Version, HashValue)>> {
+        self.diemdb.get_state_snapshot_before(version)
+    }
+
+    pub fn get_in_progress_state_kv_snapshot_version(&self) -> Result<Option<Version>> {
+        let mut iter = self
             .diemdb
-            .get_latest_transaction_info_option()?
-            .map_or(0, |(ver, _txn_info)| ver + 1))
+            .ledger_db
+            .metadata_db()
+            .iter::<DbMetadataSchema>(Default::default())?;
+        iter.seek_to_first();
+        while let Some((k, _v)) = iter.next().transpose()? {
+            if let DbMetadataKey::StateSnapshotRestoreProgress(version) = k {
+                return Ok(Some(version));
+            }
+        }
+        Ok(None)
     }
 }

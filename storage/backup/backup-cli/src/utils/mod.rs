@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod backup_service_client;
@@ -7,16 +8,34 @@ pub mod read_record_bytes;
 pub mod storage_ext;
 pub(crate) mod stream;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
 use anyhow::{anyhow, Result};
-use diem_config::config::RocksdbConfig;
+use diem_config::config::{
+    RocksdbConfig, RocksdbConfigs, BUFFERED_STATE_TARGET_ITEMS,
+    DEFAULT_MAX_NUM_NODES_PER_LRU_CACHE_SHARD, NO_OP_STORAGE_PRUNER_CONFIG,
+};
 use diem_crypto::HashValue;
+use diem_db::{
+    backup::restore_handler::RestoreHandler,
+    state_restore::{
+        StateSnapshotProgress, StateSnapshotRestore, StateSnapshotRestoreMode, StateValueBatch,
+        StateValueWriter,
+    },
+    DiemDB, GetRestoreHandler,
+};
 use diem_infallible::duration_since_epoch;
-use diem_jellyfish_merkle::{restore::JellyfishMerkleRestore, NodeBatch, TreeWriter};
-use diem_types::{account_state_blob::AccountStateBlob, transaction::Version, waypoint::Waypoint};
-use diemdb::{backup::restore_handler::RestoreHandler, DiemDB, GetRestoreHandler};
+use diem_jellyfish_merkle::{NodeBatch, TreeWriter};
+use diem_logger::info;
+use diem_types::{
+    state_store::{
+        state_key::StateKey, state_storage_usage::StateStorageUsage, state_value::StateValue,
+    },
+    transaction::Version,
+    waypoint::Waypoint,
+};
+use clap::Parser;
 use std::{
     collections::HashMap,
     convert::TryFrom,
@@ -24,81 +43,116 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use structopt::StructOpt;
 use tokio::fs::metadata;
 
-#[derive(Clone, StructOpt)]
+#[derive(Clone, Parser)]
 pub struct GlobalBackupOpt {
     // Defaults to 128MB, so concurrent chunk downloads won't take up too much memory.
-    #[structopt(
+    #[clap(
         long = "max-chunk-size",
-        default_value = "134217728",
+        default_value_t = 134217728,
         help = "Maximum chunk file size in bytes."
     )]
     pub max_chunk_size: usize,
 }
 
-#[derive(Clone, StructOpt)]
+#[derive(Clone, Parser)]
 pub struct RocksdbOpt {
-    // using a smaller value than a node since we don't care much about reading performance
-    // in this tool.
-    #[structopt(long, default_value = "1000")]
-    max_open_files: i32,
-    // using the same default with a node (1GB).
-    #[structopt(long, default_value = "1073741824")]
-    max_total_wal_size: u64,
+    #[clap(long, hide(true), default_value_t = 5000)]
+    ledger_db_max_open_files: i32,
+    #[clap(long, hide(true), default_value_t = 1073741824)] // 1GB
+    ledger_db_max_total_wal_size: u64,
+    #[clap(long, hide(true), default_value_t = 5000)]
+    state_merkle_db_max_open_files: i32,
+    #[clap(long, hide(true), default_value_t = 1073741824)] // 1GB
+    state_merkle_db_max_total_wal_size: u64,
+    #[clap(long, hide(true))]
+    split_ledger_db: bool,
+    #[clap(long, hide(true))]
+    use_sharded_state_merkle_db: bool,
+    #[clap(long, hide(true), default_value_t = 5000)]
+    state_kv_db_max_open_files: i32,
+    #[clap(long, hide(true), default_value_t = 1073741824)] // 1GB
+    state_kv_db_max_total_wal_size: u64,
+    #[clap(long, hide(true), default_value_t = 1000)]
+    index_db_max_open_files: i32,
+    #[clap(long, hide(true), default_value_t = 1073741824)] // 1GB
+    index_db_max_total_wal_size: u64,
+    #[clap(long, hide(true), default_value_t = 16)]
+    max_background_jobs: i32,
 }
 
-impl From<RocksdbOpt> for RocksdbConfig {
+impl From<RocksdbOpt> for RocksdbConfigs {
     fn from(opt: RocksdbOpt) -> Self {
         Self {
-            max_open_files: opt.max_open_files,
-            max_total_wal_size: opt.max_total_wal_size,
+            ledger_db_config: RocksdbConfig {
+                max_open_files: opt.ledger_db_max_open_files,
+                max_total_wal_size: opt.ledger_db_max_total_wal_size,
+                max_background_jobs: opt.max_background_jobs,
+                ..Default::default()
+            },
+            state_merkle_db_config: RocksdbConfig {
+                max_open_files: opt.state_merkle_db_max_open_files,
+                max_total_wal_size: opt.state_merkle_db_max_total_wal_size,
+                max_background_jobs: opt.max_background_jobs,
+                ..Default::default()
+            },
+            split_ledger_db: opt.split_ledger_db,
+            use_sharded_state_merkle_db: opt.use_sharded_state_merkle_db,
+            skip_index_and_usage: false,
+            state_kv_db_config: RocksdbConfig {
+                max_open_files: opt.state_kv_db_max_open_files,
+                max_total_wal_size: opt.state_kv_db_max_total_wal_size,
+                max_background_jobs: opt.max_background_jobs,
+                ..Default::default()
+            },
+            index_db_config: RocksdbConfig {
+                max_open_files: opt.index_db_max_open_files,
+                max_total_wal_size: opt.index_db_max_total_wal_size,
+                max_background_jobs: opt.max_background_jobs,
+                ..Default::default()
+            },
         }
     }
 }
 
 impl Default for RocksdbOpt {
     fn default() -> Self {
-        Self::from_iter(vec!["exe"])
+        Self::parse_from(vec!["exe"])
     }
 }
 
-#[derive(Clone, StructOpt)]
+#[derive(Clone, Parser)]
 pub struct GlobalRestoreOpt {
-    #[structopt(long, help = "Dry run without writing data to DB.")]
+    #[clap(long, help = "Dry run without writing data to DB.")]
     pub dry_run: bool,
 
-    #[structopt(
+    #[clap(
         long = "target-db-dir",
-        parse(from_os_str),
-        conflicts_with = "dry-run",
-        required_unless = "dry-run"
+        value_parser,
+        conflicts_with = "dry_run",
+        required_unless_present = "dry_run"
     )]
     pub db_dir: Option<PathBuf>,
 
-    #[structopt(
+    #[clap(
         long,
         help = "Content newer than this version will not be recovered to DB, \
         defaulting to the largest version possible, meaning recover everything in the backups."
     )]
     pub target_version: Option<Version>,
 
-    #[structopt(flatten)]
+    #[clap(flatten)]
     pub trusted_waypoints: TrustedWaypointOpt,
 
-    #[structopt(flatten)]
+    #[clap(flatten)]
     pub rocksdb_opt: RocksdbOpt,
 
-    #[structopt(flatten)]
-    pub concurernt_downloads: ConcurrentDownloadsOpt,
+    #[clap(flatten)]
+    pub concurrent_downloads: ConcurrentDownloadsOpt,
 
-    #[structopt(
-        long,
-        help = "If StateDB is written into, write in the new format supporting account counting, \
-        but incompatible with older node versions."
-    )]
-    pub account_count_migration: bool,
+    #[clap(flatten)]
+    pub replay_concurrency_level: ReplayConcurrencyLevelOpt,
 }
 
 pub enum RestoreRunMode {
@@ -106,11 +160,30 @@ pub enum RestoreRunMode {
     Verify,
 }
 
-struct MockTreeWriter;
+struct MockStore;
 
-impl TreeWriter<AccountStateBlob> for MockTreeWriter {
-    fn write_node_batch(&self, _node_batch: &NodeBatch<AccountStateBlob>) -> Result<()> {
+impl TreeWriter<StateKey> for MockStore {
+    fn write_node_batch(&self, _node_batch: &NodeBatch<StateKey>) -> Result<()> {
         Ok(())
+    }
+}
+
+impl StateValueWriter<StateKey, StateValue> for MockStore {
+    fn write_kv_batch(
+        &self,
+        _version: Version,
+        _kv_batch: &StateValueBatch<StateKey, Option<StateValue>>,
+        _progress: StateSnapshotProgress,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_usage(&self, _version: Version, _usage: StateStorageUsage) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_progress(&self, _version: Version) -> Result<Option<StateSnapshotProgress>> {
+        Ok(None)
     }
 }
 
@@ -133,20 +206,63 @@ impl RestoreRunMode {
         &self,
         version: Version,
         expected_root_hash: HashValue,
-        account_count_migration: bool,
-    ) -> Result<JellyfishMerkleRestore<AccountStateBlob>> {
+        restore_mode: StateSnapshotRestoreMode,
+    ) -> Result<StateSnapshotRestore<StateKey, StateValue>> {
         match self {
             Self::Restore { restore_handler } => restore_handler.get_state_restore_receiver(
                 version,
                 expected_root_hash,
-                account_count_migration,
+                restore_mode,
             ),
-            Self::Verify => JellyfishMerkleRestore::new_overwrite(
-                Arc::new(MockTreeWriter),
-                version,
-                expected_root_hash,
-                account_count_migration,
-            ),
+            Self::Verify => {
+                let mock_store = Arc::new(MockStore);
+                StateSnapshotRestore::new_overwrite(
+                    &mock_store,
+                    &mock_store,
+                    version,
+                    expected_root_hash,
+                    restore_mode,
+                )
+            },
+        }
+    }
+
+    pub fn finish(&self) {
+        match self {
+            Self::Restore { restore_handler } => {
+                restore_handler.reset_state_store();
+            },
+            Self::Verify => (),
+        }
+    }
+
+    pub fn get_next_expected_transaction_version(&self) -> Result<Version> {
+        match self {
+            RestoreRunMode::Restore { restore_handler } => {
+                restore_handler.get_next_expected_transaction_version()
+            },
+            RestoreRunMode::Verify => {
+                info!("This is a dry run. Assuming resuming point at version 0.");
+                Ok(0)
+            },
+        }
+    }
+
+    pub fn get_state_snapshot_before(&self, version: Version) -> Option<(Version, HashValue)> {
+        match self {
+            RestoreRunMode::Restore { restore_handler } => restore_handler
+                .get_state_snapshot_before(version)
+                .unwrap_or(None),
+            RestoreRunMode::Verify => None,
+        }
+    }
+
+    pub fn get_in_progress_state_kv_snapshot(&self) -> Result<Option<Version>> {
+        match self {
+            RestoreRunMode::Restore { restore_handler } => {
+                restore_handler.get_in_progress_state_kv_snapshot_version()
+            },
+            RestoreRunMode::Verify => Ok(None),
         }
     }
 }
@@ -157,7 +273,7 @@ pub struct GlobalRestoreOptions {
     pub trusted_waypoints: Arc<HashMap<Version, Waypoint>>,
     pub run_mode: Arc<RestoreRunMode>,
     pub concurrent_downloads: usize,
-    pub account_count_migration: bool,
+    pub replay_concurrency_level: usize,
 }
 
 impl TryFrom<GlobalRestoreOpt> for GlobalRestoreOptions {
@@ -165,16 +281,21 @@ impl TryFrom<GlobalRestoreOpt> for GlobalRestoreOptions {
 
     fn try_from(opt: GlobalRestoreOpt) -> Result<Self> {
         let target_version = opt.target_version.unwrap_or(Version::max_value());
-        let concurrent_downloads = opt.concurernt_downloads.get();
+        let concurrent_downloads = opt.concurrent_downloads.get();
+        let replay_concurrency_level = opt.replay_concurrency_level.get();
         let run_mode = if let Some(db_dir) = &opt.db_dir {
-            let restore_handler = Arc::new(DiemDB::open(
+            // for restore, we can always start state store with empty buffered_state since we will restore
+            let restore_handler = Arc::new(DiemDB::open_kv_only(
                 db_dir,
-                false, /* read_only */
-                None,  /* pruner */
-                opt.rocksdb_opt.into(),
-                opt.account_count_migration,
+                false,                       /* read_only */
+                NO_OP_STORAGE_PRUNER_CONFIG, /* pruner config */
+                opt.rocksdb_opt.clone().into(),
+                false,
+                BUFFERED_STATE_TARGET_ITEMS,
+                DEFAULT_MAX_NUM_NODES_PER_LRU_CACHE_SHARD,
             )?)
             .get_restore_handler();
+
             RestoreRunMode::Restore { restore_handler }
         } else {
             RestoreRunMode::Verify
@@ -184,14 +305,14 @@ impl TryFrom<GlobalRestoreOpt> for GlobalRestoreOptions {
             trusted_waypoints: Arc::new(opt.trusted_waypoints.verify()?),
             run_mode: Arc::new(run_mode),
             concurrent_downloads,
-            account_count_migration: opt.account_count_migration,
+            replay_concurrency_level,
         })
     }
 }
 
-#[derive(Clone, Default, StructOpt)]
+#[derive(Clone, Default, Parser)]
 pub struct TrustedWaypointOpt {
-    #[structopt(
+    #[clap(
         long,
         help = "(multiple) When provided, an epoch ending LedgerInfo at the waypoint version will be \
         checked against the hash in the waypoint, but signatures on it are NOT checked. \
@@ -220,19 +341,46 @@ impl TrustedWaypointOpt {
     }
 }
 
-#[derive(Clone, Copy, Default, StructOpt)]
+#[derive(Clone, Copy, Default, Parser)]
 pub struct ConcurrentDownloadsOpt {
-    #[structopt(
+    #[clap(
         long,
-        help = "[Defaults to number of CPUs] \
-        number of concurrent downloads including metadata files from the backup storage."
+        help = "Number of concurrent downloads from the backup storage. This covers the initial \
+        metadata downloads as well. Speeds up remote backup access. [Defaults to number of CPUs]"
     )]
     concurrent_downloads: Option<usize>,
 }
 
 impl ConcurrentDownloadsOpt {
     pub fn get(&self) -> usize {
-        self.concurrent_downloads.unwrap_or_else(num_cpus::get)
+        let ret = self.concurrent_downloads.unwrap_or_else(num_cpus::get);
+        info!(
+            concurrent_downloads = ret,
+            "Determined concurrency level for downloading."
+        );
+        ret
+    }
+}
+
+#[derive(Clone, Copy, Default, Parser)]
+pub struct ReplayConcurrencyLevelOpt {
+    /// DiemVM::set_concurrency_level_once() is called with this
+    #[clap(
+        long,
+        help = "concurrency_level used by the transaction executor, applicable when replaying transactions \
+        after a state snapshot. [Defaults to number of CPUs]"
+    )]
+    replay_concurrency_level: Option<usize>,
+}
+
+impl ReplayConcurrencyLevelOpt {
+    pub fn get(&self) -> usize {
+        let ret = self.replay_concurrency_level.unwrap_or_else(num_cpus::get);
+        info!(
+            concurrency = ret,
+            "Determined concurrency level for transaction replaying."
+        );
+        ret
     }
 }
 

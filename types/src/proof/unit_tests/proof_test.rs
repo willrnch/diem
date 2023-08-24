@@ -1,41 +1,37 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     account_address::AccountAddress,
-    account_config::XUS_NAME,
-    account_state_blob::AccountStateBlob,
     block_info::BlockInfo,
     block_metadata::BlockMetadata,
-    chain_id::ChainId,
     contract_event::ContractEvent,
     event::EventKey,
     ledger_info::LedgerInfo,
     proof::{
-        definition::{AccountStateProof, EventProof, MAX_ACCUMULATOR_PROOF_DEPTH},
-        AccumulatorExtensionProof, AccumulatorRangeProof, EventAccumulatorInternalNode,
-        EventAccumulatorProof, SparseMerkleInternalNode, SparseMerkleLeafNode,
-        TestAccumulatorInternalNode, TestAccumulatorProof, TransactionAccumulatorInternalNode,
-        TransactionAccumulatorProof, TransactionInfoListWithProof, TransactionInfoWithProof,
+        definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccumulatorExtensionProof, AccumulatorRangeProof,
+        SparseMerkleInternalNode, SparseMerkleLeafNode, TestAccumulatorInternalNode,
+        TestAccumulatorProof, TransactionAccumulatorInternalNode, TransactionAccumulatorProof,
+        TransactionInfoListWithProof, TransactionInfoWithProof,
     },
+    state_store::state_value::StateValue,
     transaction::{
-        RawTransaction, Script, Transaction, TransactionInfo, TransactionListWithProof,
-        TransactionOutput, TransactionOutputListWithProof, TransactionStatus,
+        ExecutionStatus, Transaction, TransactionInfo, TransactionListWithProof, TransactionOutput,
+        TransactionOutputListWithProof, TransactionStatus,
     },
-    vm_status::KeptVMStatus,
     write_set::WriteSet,
 };
 use diem_crypto::{
-    ed25519::Ed25519PrivateKey,
     hash::{
         CryptoHash, TestOnlyHash, TestOnlyHasher, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID,
         SPARSE_MERKLE_PLACEHOLDER_HASH,
     },
-    HashValue, PrivateKey, Uniform,
+    HashValue,
 };
 use move_core_types::language_storage::TypeTag;
 
-type SparseMerkleProof = crate::proof::SparseMerkleProof<AccountStateBlob>;
+type SparseMerkleProof = crate::proof::SparseMerkleProof;
 
 #[test]
 fn test_verify_empty_accumulator() {
@@ -152,37 +148,43 @@ fn test_verify_empty_sparse_merkle() {
     let proof = SparseMerkleProof::new(None, vec![]);
 
     // Trying to show that this key doesn't exist.
-    assert!(proof.verify(root_hash, key, None).is_ok());
+    assert!(proof.verify::<StateValue>(root_hash, key, None).is_ok());
     // Trying to show that this key exists.
-    assert!(proof.verify(root_hash, key, Some(&blob)).is_err());
+    assert!(proof
+        .verify::<StateValue>(root_hash, key, Some(&blob))
+        .is_err());
 }
 
 #[test]
 fn test_verify_single_element_sparse_merkle() {
     let key = b"hello".test_only_hash();
-    let blob: AccountStateBlob = b"world".to_vec().into();
+    let blob: StateValue = b"world".to_vec().into();
     let blob_hash = blob.hash();
-    let non_existing_blob = b"world?".to_vec().into();
+    let non_existing_blob: StateValue = b"world?".to_vec().into();
     let root_node = SparseMerkleLeafNode::new(key, blob_hash);
     let root_hash = root_node.hash();
     let proof = SparseMerkleProof::new(Some(root_node), vec![]);
 
     // Trying to show this exact key exists with its value.
-    assert!(proof.verify(root_hash, key, Some(&blob)).is_ok());
+    assert!(proof
+        .verify::<StateValue>(root_hash, key, Some(&blob))
+        .is_ok());
     // Trying to show this exact key exists with another value.
     assert!(proof
-        .verify(root_hash, key, Some(&non_existing_blob))
+        .verify::<StateValue>(root_hash, key, Some(&non_existing_blob))
         .is_err());
     // Trying to show this key doesn't exist.
-    assert!(proof.verify(root_hash, key, None).is_err());
+    assert!(proof.verify::<StateValue>(root_hash, key, None).is_err());
 
     let non_existing_key = b"HELLO".test_only_hash();
 
     // The proof can be used to show non_existing_key doesn't exist.
-    assert!(proof.verify(root_hash, non_existing_key, None).is_ok());
+    assert!(proof
+        .verify::<StateValue>(root_hash, non_existing_key, None)
+        .is_ok());
     // The proof can't be used to non_existing_key exists.
     assert!(proof
-        .verify(root_hash, non_existing_key, Some(&blob))
+        .verify::<StateValue>(root_hash, non_existing_key, Some(&blob))
         .is_err());
 }
 
@@ -202,9 +204,9 @@ fn test_verify_three_element_sparse_merkle() {
     assert_eq!(key2[0], 0b0100_0010);
     assert_eq!(key3[0], 0b0110_1001);
 
-    let blob1 = AccountStateBlob::from(b"1".to_vec());
-    let blob2 = AccountStateBlob::from(b"2".to_vec());
-    let blob3 = AccountStateBlob::from(b"3".to_vec());
+    let blob1 = StateValue::from(b"1".to_vec());
+    let blob2 = StateValue::from(b"2".to_vec());
+    let blob3 = StateValue::from(b"3".to_vec());
 
     let leaf1 = SparseMerkleLeafNode::new(key1, blob1.hash());
     let leaf1_hash = leaf1.hash();
@@ -222,27 +224,31 @@ fn test_verify_three_element_sparse_merkle() {
 
     {
         // Construct a proof of key1.
-        let proof = SparseMerkleProof::new(
-            Some(leaf1),
-            vec![internal_b_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH],
-        );
+        let proof = SparseMerkleProof::new(Some(leaf1), vec![
+            internal_b_hash,
+            *SPARSE_MERKLE_PLACEHOLDER_HASH,
+        ]);
 
         // The exact key value exists.
         assert!(proof.verify(root_hash, key1, Some(&blob1)).is_ok());
         // Trying to show that this key has another value.
         assert!(proof.verify(root_hash, key1, Some(&blob2)).is_err());
         // Trying to show that this key doesn't exist.
-        assert!(proof.verify(root_hash, key1, None).is_err());
+        assert!(proof.verify::<StateValue>(root_hash, key1, None).is_err());
         // This proof can't be used to show anything about key2.
-        assert!(proof.verify(root_hash, key2, None).is_err());
+        assert!(proof.verify::<StateValue>(root_hash, key2, None).is_err());
         assert!(proof.verify(root_hash, key2, Some(&blob1)).is_err());
         assert!(proof.verify(root_hash, key2, Some(&blob2)).is_err());
 
         // This proof can be used to show that non_existing_key1 indeed doesn't exist.
-        assert!(proof.verify(root_hash, non_existing_key1, None).is_ok());
+        assert!(proof
+            .verify::<StateValue>(root_hash, non_existing_key1, None)
+            .is_ok());
         // This proof can't be used to show that non_existing_key2 doesn't exist because it lives
         // in a different subtree.
-        assert!(proof.verify(root_hash, non_existing_key2, None).is_err());
+        assert!(proof
+            .verify::<StateValue>(root_hash, non_existing_key2, None)
+            .is_err());
     }
 
     {
@@ -250,9 +256,13 @@ fn test_verify_three_element_sparse_merkle() {
         let proof = SparseMerkleProof::new(None, vec![internal_a_hash]);
 
         // This proof can't be used to show that a key starting with 0 doesn't exist.
-        assert!(proof.verify(root_hash, non_existing_key1, None).is_err());
+        assert!(proof
+            .verify::<StateValue>(root_hash, non_existing_key1, None)
+            .is_err());
         // This proof can be used to show that a key starting with 1 doesn't exist.
-        assert!(proof.verify(root_hash, non_existing_key2, None).is_ok());
+        assert!(proof
+            .verify::<StateValue>(root_hash, non_existing_key2, None)
+            .is_ok());
     }
 }
 
@@ -272,10 +282,11 @@ fn test_verify_transaction() {
     let event_root1_hash = b"b".test_only_hash();
     let txn_info1 = TransactionInfo::new(
         txn1_hash,
-        state_root1_hash,
+        HashValue::zero(),
         event_root1_hash,
+        Some(state_root1_hash),
         /* gas_used = */ 0,
-        /* major_status = */ KeptVMStatus::Executed,
+        /* major_status = */ ExecutionStatus::Success,
     );
     let txn_info1_hash = txn_info1.hash();
 
@@ -304,175 +315,14 @@ fn test_verify_transaction() {
     // Replacing txn1 with some other txn should cause the verification to fail.
     let fake_txn_info = TransactionInfo::new(
         HashValue::random(),
-        state_root1_hash,
+        HashValue::zero(),
         event_root1_hash,
+        Some(state_root1_hash),
         /* gas_used = */ 0,
-        /* major_status = */ KeptVMStatus::Executed,
+        /* major_status = */ ExecutionStatus::Success,
     );
     let proof = TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof, fake_txn_info);
     assert!(proof.verify(&ledger_info, 1).is_err());
-}
-
-#[test]
-fn test_verify_account_state_and_event() {
-    //                  root
-    //                 /     \
-    //               /         \
-    //             a             b
-    //            / \           / \
-    //        txn0   txn1   txn2   default
-    //                       ^
-    //                       |
-    //                 transaction_info2
-    //                /    /           \
-    //              /     /              \
-    //           txn  state_root          event_root
-    //                  /    \               / \
-    //                 c      default  event0   event1
-    //                / \
-    //            key1   d
-    //                  / \
-    //              key2   key3
-    let key1 = b"hello".test_only_hash();
-    let key2 = b"world".test_only_hash();
-    let key3 = b"!".test_only_hash();
-    let non_existing_key = b"#".test_only_hash();
-    assert_eq!(key1[0], 0b0011_0011);
-    assert_eq!(key2[0], 0b0100_0010);
-    assert_eq!(key3[0], 0b0110_1001);
-    assert_eq!(non_existing_key[0], 0b0100_0001);
-
-    let blob1 = AccountStateBlob::from(b"value1".to_vec());
-    let blob2 = AccountStateBlob::from(b"value2".to_vec());
-    let blob3 = AccountStateBlob::from(b"value3".to_vec());
-
-    let leaf1_hash = SparseMerkleLeafNode::new(key1, blob1.hash()).hash();
-    let leaf2 = SparseMerkleLeafNode::new(key2, blob2.hash());
-    let leaf2_hash = leaf2.hash();
-    let leaf3_hash = SparseMerkleLeafNode::new(key3, blob3.hash()).hash();
-    let internal_d_hash = SparseMerkleInternalNode::new(leaf2_hash, leaf3_hash).hash();
-    let internal_c_hash = SparseMerkleInternalNode::new(leaf1_hash, internal_d_hash).hash();
-    let state_root_hash =
-        SparseMerkleInternalNode::new(internal_c_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH).hash();
-
-    let txn_info0_hash = b"hellohello".test_only_hash();
-    let txn_info1_hash = b"worldworld".test_only_hash();
-
-    let privkey = Ed25519PrivateKey::generate_for_testing();
-    let pubkey = privkey.public_key();
-    let txn2_hash = Transaction::UserTransaction(
-        RawTransaction::new_script(
-            crate::account_address::from_public_key(&pubkey),
-            /* sequence_number = */ 0,
-            Script::new(vec![], vec![], vec![]),
-            /* max_gas_amount = */ 0,
-            /* gas_unit_price = */ 0,
-            /* gas_currency_code = */ XUS_NAME.to_owned(),
-            /* expiration_timestamp_secs = */ 0,
-            ChainId::test(),
-        )
-        .sign(&privkey, pubkey)
-        .expect("Signing failed.")
-        .into_inner(),
-    )
-    .hash();
-
-    let event0_hash = b"event0".test_only_hash();
-    let event1_hash = b"event1".test_only_hash();
-    let event_root_hash = EventAccumulatorInternalNode::new(event0_hash, event1_hash).hash();
-
-    let txn_info2 = TransactionInfo::new(
-        txn2_hash,
-        state_root_hash,
-        event_root_hash,
-        /* gas_used = */ 0,
-        /* major_status = */ KeptVMStatus::Executed,
-    );
-    let txn_info2_hash = txn_info2.hash();
-
-    let internal_a_hash =
-        TransactionAccumulatorInternalNode::new(txn_info0_hash, txn_info1_hash).hash();
-    let internal_b_hash =
-        TransactionAccumulatorInternalNode::new(txn_info2_hash, *ACCUMULATOR_PLACEHOLDER_HASH)
-            .hash();
-    let root_hash =
-        TransactionAccumulatorInternalNode::new(internal_a_hash, internal_b_hash).hash();
-
-    // consensus_data_hash isn't used in proofs, but we need it to construct LedgerInfo.
-    let consensus_data_hash = b"consensus_data".test_only_hash();
-    let ledger_info = LedgerInfo::new(
-        BlockInfo::new(0, 0, *GENESIS_BLOCK_ID, root_hash, 2, 10000, None),
-        consensus_data_hash,
-    );
-
-    let ledger_info_to_transaction_info_proof =
-        TransactionAccumulatorProof::new(vec![*ACCUMULATOR_PLACEHOLDER_HASH, internal_a_hash]);
-    let transaction_info_to_account_proof = SparseMerkleProof::new(
-        Some(leaf2),
-        vec![leaf3_hash, leaf1_hash, *SPARSE_MERKLE_PLACEHOLDER_HASH],
-    );
-    let account_state_proof = AccountStateProof::new(
-        TransactionInfoWithProof::new(
-            ledger_info_to_transaction_info_proof.clone(),
-            txn_info2.clone(),
-        ),
-        transaction_info_to_account_proof,
-    );
-
-    // Prove that account at `key2` has value `value2`.
-    assert!(account_state_proof
-        .verify(
-            &ledger_info,
-            /* state_version = */ 2,
-            key2,
-            Some(&blob2),
-        )
-        .is_ok());
-    // Use the same proof to prove that `non_existing_key` doesn't exist.
-    assert!(account_state_proof
-        .verify(
-            &ledger_info,
-            /* state_version = */ 2,
-            non_existing_key,
-            None,
-        )
-        .is_ok());
-
-    let bad_blob2 = b"3".to_vec().into();
-    assert!(account_state_proof
-        .verify(
-            &ledger_info,
-            /* state_version = */ 2,
-            key2,
-            Some(&bad_blob2),
-        )
-        .is_err());
-
-    let transaction_info_to_event_proof = EventAccumulatorProof::new(vec![event1_hash]);
-    let event_proof = EventProof::new(
-        TransactionInfoWithProof::new(ledger_info_to_transaction_info_proof, txn_info2),
-        transaction_info_to_event_proof,
-    );
-
-    // Prove that the first event within transaction 2 is `event0`.
-    assert!(event_proof
-        .verify(
-            &ledger_info,
-            event0_hash,
-            /* transaction_version = */ 2,
-            /* event_version_within_transaction = */ 0,
-        )
-        .is_ok());
-
-    let bad_event0_hash = b"event1".test_only_hash();
-    assert!(event_proof
-        .verify(
-            &ledger_info,
-            bad_event0_hash,
-            /* transaction_version = */ 2,
-            /* event_version_within_transaction = */ 0,
-        )
-        .is_err());
 }
 
 // This test does the following:
@@ -499,11 +349,10 @@ fn test_accumulator_extension_proof() {
     assert_eq!(derived_tree.version(), 0);
 
     // Test multiple values
-    let two_tree = AccumulatorExtensionProof::<TestOnlyHasher>::new(
-        vec![HashValue::zero()],
-        1,
-        vec![HashValue::zero()],
-    );
+    let two_tree =
+        AccumulatorExtensionProof::<TestOnlyHasher>::new(vec![HashValue::zero()], 1, vec![
+            HashValue::zero(),
+        ]);
 
     let derived_tree = two_tree.verify(HashValue::zero()).unwrap();
     let two_hash = TestAccumulatorInternalNode::new(HashValue::zero(), HashValue::zero()).hash();
@@ -518,7 +367,7 @@ fn test_accumulator_extension_proof() {
 #[test]
 fn test_transaction_info_list_with_proof() {
     // Create transaction info list proof
-    let transaction_info_list_proof = create_single_transaction_info_proof(None, None);
+    let transaction_info_list_proof = create_single_transaction_info_proof(None, None, None);
 
     // Verify first transaction version must match the proof
     let empty_ledger_info = LedgerInfo::new(BlockInfo::empty(), HashValue::zero());
@@ -550,8 +399,10 @@ fn test_transaction_list_with_proof() {
         HashValue::random(),
         0,
         0,
-        vec![],
         AccountAddress::random(),
+        vec![0],
+        vec![],
+        0,
     ))];
 
     // Create transaction list with proof
@@ -559,7 +410,7 @@ fn test_transaction_list_with_proof() {
         transactions.clone(),
         Some(vec![vec![event.clone()]]),
         Some(1),
-        create_single_transaction_info_proof(None, None),
+        create_single_transaction_info_proof(None, None, None),
     );
 
     // Verify first transaction version must match the proof
@@ -575,7 +426,7 @@ fn test_transaction_list_with_proof() {
 
     // Verify transaction hashes match but info root hash verification fails (ledger info expected zero root hash)
     let transaction_list_proof =
-        create_single_transaction_info_proof(Some(transactions[0].hash()), None);
+        create_single_transaction_info_proof(Some(transactions[0].hash()), None, None);
     let transaction_list_with_proof = TransactionListWithProof::new(
         transactions.clone(),
         Some(vec![vec![event.clone()]]),
@@ -595,8 +446,11 @@ fn test_transaction_list_with_proof() {
         .unwrap_err();
 
     // Construct a new transaction list with proof where the transaction info and event hashes match
-    let transaction_list_proof =
-        create_single_transaction_info_proof(Some(transactions[0].hash()), Some(event.hash()));
+    let transaction_list_proof = create_single_transaction_info_proof(
+        Some(transactions[0].hash()),
+        Some(event.hash()),
+        None,
+    );
     let transaction_list_with_proof = TransactionListWithProof::new(
         transactions,
         Some(vec![vec![event]]),
@@ -620,24 +474,30 @@ fn test_transaction_and_output_list_with_proof() {
         HashValue::random(),
         0,
         0,
-        vec![],
         AccountAddress::random(),
-    ));
-    let event = create_event();
-    let transaction_output = TransactionOutput::new(
-        WriteSet::default(),
-        vec![event.clone()],
+        vec![0],
+        vec![],
         0,
-        TransactionStatus::Keep(KeptVMStatus::MiscellaneousError),
+    ));
+    let txn_hash = transaction.hash();
+    let event = create_event();
+    let event_root_hash = event.hash();
+    let write_set = WriteSet::default();
+    let write_set_hash = CryptoHash::hash(&write_set);
+    let transaction_output = TransactionOutput::new(
+        write_set,
+        vec![event],
+        0,
+        TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(None)),
     );
 
     // Create transaction output list with proof
-    let transaction_info_list_proof =
-        create_single_transaction_info_proof(Some(transaction.hash()), None);
-    let transaction_output_list_proof = TransactionOutputListWithProof::new(
-        vec![(transaction.clone(), transaction_output.clone())],
-        Some(1),
-        transaction_info_list_proof.clone(),
+    let (_root_hash, transaction_output_list_proof) = create_txn_output_list_with_proof(
+        &transaction,
+        &transaction_output,
+        Some(txn_hash),
+        Some(event_root_hash),
+        Some(write_set_hash),
     );
 
     // Verify first transaction version must match the proof
@@ -647,53 +507,98 @@ fn test_transaction_and_output_list_with_proof() {
         .unwrap_err();
 
     // Verify correct info hash but event verification now fails (event hash mismatch)
-    let expected_info_hash = transaction_info_list_proof.transaction_infos[0].hash();
-    let block_info = BlockInfo::new(0, 0, HashValue::random(), expected_info_hash, 0, 0, None);
-    let ledger_info = LedgerInfo::new(block_info, HashValue::zero());
+    let (root_hash, transaction_output_list_proof) = create_txn_output_list_with_proof(
+        &transaction,
+        &transaction_output,
+        Some(txn_hash),
+        None,
+        Some(write_set_hash),
+    );
+    let ledger_info = create_ledger_info_at_version0(root_hash);
+    transaction_output_list_proof
+        .verify(&ledger_info, Some(1))
+        .unwrap_err();
+
+    // Verify failure on state change hash mismatch
+    let (root_hash, transaction_output_list_proof) = create_txn_output_list_with_proof(
+        &transaction,
+        &transaction_output,
+        Some(txn_hash),
+        Some(event_root_hash),
+        None,
+    );
+    let ledger_info = create_ledger_info_at_version0(root_hash);
     transaction_output_list_proof
         .verify(&ledger_info, Some(1))
         .unwrap_err();
 
     // Construct a new transaction output list proof where the transaction info and event hashes match
+    let (root_hash, transaction_output_list_proof) = create_txn_output_list_with_proof(
+        &transaction,
+        &transaction_output,
+        Some(txn_hash),
+        Some(event_root_hash),
+        Some(write_set_hash),
+    );
+    let ledger_info = create_ledger_info_at_version0(root_hash);
+    transaction_output_list_proof
+        .verify(&ledger_info, Some(1))
+        .unwrap();
+}
+
+fn create_ledger_info_at_version0(root_hash: HashValue) -> LedgerInfo {
+    let block_info = BlockInfo::new(0, 0, HashValue::random(), root_hash, 0, 0, None);
+    LedgerInfo::new(block_info, HashValue::zero())
+}
+
+fn create_txn_output_list_with_proof(
+    transaction: &Transaction,
+    transaction_output: &TransactionOutput,
+    transaction_hash: Option<HashValue>,
+    event_root_hash: Option<HashValue>,
+    state_change_hash: Option<HashValue>,
+) -> (HashValue, TransactionOutputListWithProof) {
     let transaction_info_list_proof =
-        create_single_transaction_info_proof(Some(transaction.hash()), Some(event.hash()));
-    let expected_info_hash = transaction_info_list_proof.transaction_infos[0].hash();
-    let transaction_and_output_list_proof = TransactionOutputListWithProof::new(
-        vec![(transaction, transaction_output)],
+        create_single_transaction_info_proof(transaction_hash, event_root_hash, state_change_hash);
+    let root_hash = transaction_info_list_proof.transaction_infos[0].hash();
+    let transaction_output_list_proof = TransactionOutputListWithProof::new(
+        vec![(transaction.clone(), transaction_output.clone())],
         Some(1),
         transaction_info_list_proof,
     );
 
-    // Ensure ledger verification now passes
-    let block_info = BlockInfo::new(0, 0, HashValue::random(), expected_info_hash, 0, 0, None);
-    let ledger_info = LedgerInfo::new(block_info, HashValue::zero());
-    transaction_and_output_list_proof
-        .verify(&ledger_info, Some(1))
-        .unwrap();
+    (root_hash, transaction_output_list_proof)
 }
 
 fn create_single_transaction_info_proof(
     transaction_hash: Option<HashValue>,
     event_root_hash: Option<HashValue>,
+    state_change_hash: Option<HashValue>,
 ) -> TransactionInfoListWithProof {
-    let transaction_infos = vec![create_transaction_info(transaction_hash, event_root_hash)];
+    let transaction_infos = vec![create_transaction_info(
+        transaction_hash,
+        event_root_hash,
+        state_change_hash,
+    )];
     TransactionInfoListWithProof::new(AccumulatorRangeProof::new_empty(), transaction_infos)
 }
 
 fn create_transaction_info(
     transaction_hash: Option<HashValue>,
     event_root_hash: Option<HashValue>,
+    state_change_hash: Option<HashValue>,
 ) -> TransactionInfo {
     TransactionInfo::new(
         transaction_hash.unwrap_or_else(HashValue::random),
-        HashValue::random(),
+        state_change_hash.unwrap_or_else(HashValue::random),
         event_root_hash.unwrap_or_else(HashValue::random),
+        Some(HashValue::random()),
         0,
-        KeptVMStatus::MiscellaneousError,
+        ExecutionStatus::MiscellaneousError(None),
     )
 }
 
 fn create_event() -> ContractEvent {
-    let event_key = EventKey::new_from_address(&AccountAddress::random(), 0);
+    let event_key = EventKey::new(0, AccountAddress::random());
     ContractEvent::new(event_key, 0, TypeTag::Bool, bcs::to_bytes(&0).unwrap())
 }

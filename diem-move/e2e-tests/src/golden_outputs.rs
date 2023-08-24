@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use goldenfile::Mint;
@@ -15,13 +16,17 @@ pub(crate) struct GoldenOutputs {
 
 fn golden_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push(GOLDEN_DIR_PATH.to_string());
+    path.push(GOLDEN_DIR_PATH);
     path
 }
 
 impl GoldenOutputs {
     pub fn new(name: &str) -> Self {
-        let mut mint = Mint::new(golden_path());
+        GoldenOutputs::new_at_path(golden_path(), name)
+    }
+
+    pub fn new_at_path(path: PathBuf, name: &str) -> Self {
+        let mut mint = Mint::new(path);
         let mut file_path = PathBuf::new();
         file_path.push(name);
         let file = RefCell::new(

@@ -1,9 +1,10 @@
 #!/bin/bash -eux
-# Copyright (c) The Diem Core Contributors
+# Copyright © Diem Foundation
+# Parts of the project are originally copyright © Meta Platforms, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
 # This build script is used with Google OSS-Fuzz to build fuzzer with their docker container.
-# It must be called from diem/testsuite/diem-fuzzer
+# It must be called from diem-core/testsuite/diem-fuzzer
 # usage: OUT=out_dir ./build.sh
 
 # recipe:

@@ -1,14 +1,15 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{corpus_from_strategy, fuzz_data_to_value, FuzzTargetImpl};
 use diem_proptest_helpers::ValueGenerator;
-use safety_rules::fuzzing_utils::{
-    arb_block_data, arb_epoch_change_proof, arb_maybe_signed_vote_proposal, arb_safety_rules_input,
-    arb_timeout,
-    fuzzing::{
-        fuzz_construct_and_sign_vote, fuzz_handle_message, fuzz_initialize, fuzz_sign_proposal,
-        fuzz_sign_timeout,
+use diem_safety_rules::{
+    fuzzing::{fuzz_construct_and_sign_vote_two_chain, fuzz_sign_timeout_with_qc},
+    fuzzing_utils::{
+        arb_block_data, arb_epoch_change_proof, arb_safety_rules_input, arb_timeout,
+        arb_vote_proposal,
+        fuzzing::{fuzz_handle_message, fuzz_initialize, fuzz_sign_proposal},
     },
 };
 
@@ -61,12 +62,12 @@ impl FuzzTargetImpl for SafetyRulesConstructAndSignVote {
     }
 
     fn generate(&self, _idx: usize, _gen: &mut ValueGenerator) -> Option<Vec<u8>> {
-        Some(corpus_from_strategy(arb_maybe_signed_vote_proposal()))
+        Some(corpus_from_strategy(arb_vote_proposal()))
     }
 
     fn fuzz(&self, data: &[u8]) {
-        let maybe_signed_vote_proposal = fuzz_data_to_value(data, arb_maybe_signed_vote_proposal());
-        let _ = fuzz_construct_and_sign_vote(maybe_signed_vote_proposal);
+        let vote_proposal = fuzz_data_to_value(data, arb_vote_proposal());
+        let _ = fuzz_construct_and_sign_vote_two_chain(vote_proposal);
     }
 }
 
@@ -104,6 +105,6 @@ impl FuzzTargetImpl for SafetyRulesSignTimeout {
 
     fn fuzz(&self, data: &[u8]) {
         let timeout = fuzz_data_to_value(data, arb_timeout());
-        let _ = fuzz_sign_timeout(timeout);
+        let _ = fuzz_sign_timeout_with_qc(timeout);
     }
 }

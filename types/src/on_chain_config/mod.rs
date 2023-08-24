@@ -1,40 +1,52 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     access_path::AccessPath,
-    account_address::AccountAddress,
     account_config::CORE_CODE_ADDRESS,
+    chain_id::ChainId,
     event::{EventHandle, EventKey},
 };
 use anyhow::{format_err, Result};
 use move_core_types::{
     ident_str,
     identifier::{IdentStr, Identifier},
-    language_storage::{StructTag, TypeTag},
+    language_storage::StructTag,
     move_resource::{MoveResource, MoveStructType},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
 
-mod consensus_config;
+mod approved_execution_hashes;
+mod diem_features;
 mod diem_version;
-mod parallel_execution_config;
-mod registered_currencies;
+mod chain_id;
+mod consensus_config;
+mod execution_config;
+mod gas_schedule;
+mod timed_features;
+mod timestamp;
 mod validator_set;
-mod vm_config;
-mod vm_publishing_option;
 
 pub use self::{
-    consensus_config::{ConsensusConfigV1, ConsensusConfigV2, OnChainConsensusConfig},
+    approved_execution_hashes::ApprovedExecutionHashes,
+    diem_features::*,
     diem_version::{
-        DiemVersion, DIEM_MAX_KNOWN_VERSION, DIEM_VERSION_2, DIEM_VERSION_3, DIEM_VERSION_4,
+        Version, DIEM_MAX_KNOWN_VERSION, DIEM_VERSION_2, DIEM_VERSION_3, DIEM_VERSION_4,
     },
-    parallel_execution_config::{ParallelExecutionConfig, ReadWriteSetAnalysis},
-    registered_currencies::RegisteredCurrencies,
-    validator_set::ValidatorSet,
-    vm_config::VMConfig,
-    vm_publishing_option::VMPublishingOption,
+    consensus_config::{
+        ConsensusConfigV1, LeaderReputationType, OnChainConsensusConfig, ProposerAndVoterConfig,
+        ProposerElectionType,
+    },
+    execution_config::{
+        ExecutionConfigV1, ExecutionConfigV2, OnChainExecutionConfig, TransactionDeduperType,
+        TransactionShufflerType,
+    },
+    gas_schedule::{GasSchedule, GasScheduleV2, StorageGasSchedule},
+    timed_features::{TimedFeatureFlag, TimedFeatureOverride, TimedFeatures},
+    timestamp::CurrentTimeMicroseconds,
+    validator_set::{ConsensusScheme, ValidatorSet},
 };
 
 /// To register an on-chain config in Rust:
@@ -42,17 +54,11 @@ pub use self::{
 /// 2. Add the config's `ConfigID` to `ON_CHAIN_CONFIG_REGISTRY`
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ConfigID(&'static str, &'static str);
-
-const CONFIG_ADDRESS_STR: &str = "0xA550C18";
-
-pub fn config_address() -> AccountAddress {
-    AccountAddress::from_hex_literal(CONFIG_ADDRESS_STR).expect("failed to get address")
-}
+pub struct ConfigID(&'static str, &'static str, &'static str);
 
 impl ConfigID {
     pub fn name(&self) -> String {
-        self.1.to_string()
+        self.2.to_string()
     }
 }
 
@@ -68,16 +74,14 @@ impl fmt::Display for ConfigID {
 
 /// State sync will panic if the value of any config in this registry is uninitialized
 pub const ON_CHAIN_CONFIG_REGISTRY: &[ConfigID] = &[
-    VMConfig::CONFIG_ID,
-    VMPublishingOption::CONFIG_ID,
-    DiemVersion::CONFIG_ID,
+    ApprovedExecutionHashes::CONFIG_ID,
     ValidatorSet::CONFIG_ID,
-    RegisteredCurrencies::CONFIG_ID,
+    Version::CONFIG_ID,
     OnChainConsensusConfig::CONFIG_ID,
-    ParallelExecutionConfig::CONFIG_ID,
+    ChainId::CONFIG_ID,
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnChainConfigPayload {
     epoch: u64,
     configs: Arc<HashMap<ConfigID, Vec<u8>>>,
@@ -127,10 +131,14 @@ pub trait ConfigStorage {
 /// Trait to be implemented by a Rust struct representation of an on-chain config
 /// that is stored in storage as a serialized byte array
 pub trait OnChainConfig: Send + Sync + DeserializeOwned {
-    // diem_root_address
-    const ADDRESS: &'static str = CONFIG_ADDRESS_STR;
-    const IDENTIFIER: &'static str;
-    const CONFIG_ID: ConfigID = ConfigID(Self::ADDRESS, Self::IDENTIFIER);
+    const ADDRESS: &'static str = "0x1";
+    const MODULE_IDENTIFIER: &'static str;
+    const TYPE_IDENTIFIER: &'static str;
+    const CONFIG_ID: ConfigID = ConfigID(
+        Self::ADDRESS,
+        Self::MODULE_IDENTIFIER,
+        Self::TYPE_IDENTIFIER,
+    );
 
     // Single-round BCS deserialization from bytes to `Self`
     // This is the expected deserialization pattern if the Rust representation lives natively in Move.
@@ -154,56 +162,43 @@ pub trait OnChainConfig: Send + Sync + DeserializeOwned {
 
     fn fetch_config<T>(storage: &T) -> Option<Self>
     where
-        T: ConfigStorage,
+        T: ConfigStorage + ?Sized,
     {
-        let experimental_path = experimental_access_path_for_config(Self::CONFIG_ID);
-        match storage.fetch_config(experimental_path) {
+        let access_path = Self::access_path().ok()?;
+        match storage.fetch_config(access_path) {
             Some(bytes) => Self::deserialize_into_config(&bytes).ok(),
-            None => storage
-                .fetch_config(default_access_path_for_config(Self::CONFIG_ID))
-                .and_then(|bytes| Self::deserialize_into_config(&bytes).ok()),
+            None => None,
         }
+    }
+
+    fn access_path() -> anyhow::Result<AccessPath> {
+        access_path_for_config(Self::CONFIG_ID)
+    }
+
+    fn struct_tag() -> StructTag {
+        struct_tag_for_config(Self::CONFIG_ID)
     }
 }
 
 pub fn new_epoch_event_key() -> EventKey {
-    EventKey::new_from_address(&config_address(), 4)
+    EventKey::new(2, CORE_CODE_ADDRESS)
 }
 
-pub fn default_access_path_for_config(config_id: ConfigID) -> AccessPath {
-    AccessPath::new(
-        config_address(),
-        AccessPath::resource_access_vec(config_struct_tag(
-            Identifier::new(config_id.1).expect("fail to make identifier"),
-        )),
-    )
+pub fn access_path_for_config(config_id: ConfigID) -> anyhow::Result<AccessPath> {
+    let struct_tag = struct_tag_for_config(config_id);
+    Ok(AccessPath::new(
+        CORE_CODE_ADDRESS,
+        AccessPath::resource_path_vec(struct_tag)?,
+    ))
 }
 
-pub fn config_struct_tag(config_name: Identifier) -> StructTag {
+pub fn struct_tag_for_config(config_id: ConfigID) -> StructTag {
     StructTag {
         address: CORE_CODE_ADDRESS,
-        module: ConfigurationResource::MODULE_NAME.to_owned(),
-        name: ConfigurationResource::MODULE_NAME.to_owned(),
-        type_params: vec![TypeTag::Struct(StructTag {
-            address: CORE_CODE_ADDRESS,
-            module: config_name.clone(),
-            name: config_name,
-            type_params: vec![],
-        })],
-    }
-}
-
-pub fn experimental_access_path_for_config(config_id: ConfigID) -> AccessPath {
-    let struct_tag = StructTag {
-        address: CORE_CODE_ADDRESS,
         module: Identifier::new(config_id.1).expect("fail to make identifier"),
-        name: Identifier::new(config_id.1).expect("fail to make identifier"),
+        name: Identifier::new(config_id.2).expect("fail to make identifier"),
         type_params: vec![],
-    };
-    AccessPath::new(
-        config_address(),
-        AccessPath::resource_access_vec(struct_tag),
-    )
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -247,14 +242,19 @@ impl Default for ConfigurationResource {
         Self {
             epoch: 0,
             last_reconfiguration_time: 0,
-            events: EventHandle::new_from_address(&crate::account_config::diem_root_address(), 16),
+            events: EventHandle::new(EventKey::new(16, CORE_CODE_ADDRESS), 0),
         }
     }
 }
 
 impl MoveStructType for ConfigurationResource {
-    const MODULE_NAME: &'static IdentStr = ident_str!("DiemConfig");
+    const MODULE_NAME: &'static IdentStr = ident_str!("reconfiguration");
     const STRUCT_NAME: &'static IdentStr = ident_str!("Configuration");
 }
 
 impl MoveResource for ConfigurationResource {}
+
+impl OnChainConfig for ConfigurationResource {
+    const MODULE_IDENTIFIER: &'static str = "reconfiguration";
+    const TYPE_IDENTIFIER: &'static str = "Configuration";
+}

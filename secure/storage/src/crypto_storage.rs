@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Error;
@@ -20,7 +21,7 @@ pub trait CryptoStorage {
     /// This is not intended to be used in production and the API may throw unimplemented if
     /// not used correctly. As this is purely a testing API, there is no defined behavior for
     /// importing a key for a given name if that name already exists.  It only exists to allow
-    /// Diem to be run in test environments where a set of deterministic keys must be generated.
+    /// running in test environments where a set of deterministic keys must be generated.
     fn import_private_key(&mut self, name: &str, key: Ed25519PrivateKey) -> Result<(), Error>;
 
     /// Returns the Ed25519 private key stored at 'name' and identified by 'version', which is the
@@ -64,7 +65,7 @@ pub trait CryptoStorage {
     ) -> Result<Ed25519Signature, Error>;
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "data")]
 pub struct PublicKeyResponse {
     /// Time since Unix Epoch in seconds.

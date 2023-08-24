@@ -1,13 +1,16 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
+    iterator::SchemaIterator,
     schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec},
-    SchemaIterator, DB, DEFAULT_CF_NAME,
+    DB,
 };
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 
 define_schema!(TestSchema, TestKey, TestValue, "TestCF");
 
@@ -78,11 +81,11 @@ struct TestDB {
 impl TestDB {
     fn new() -> Self {
         let tmpdir = diem_temppath::TempPath::new();
-        let column_families = vec![DEFAULT_CF_NAME, TestSchema::COLUMN_FAMILY_NAME];
+        let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME, TestSchema::COLUMN_FAMILY_NAME];
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        let db = DB::open(&tmpdir.path(), "test", column_families, &db_opts).unwrap();
+        let db = DB::open(tmpdir.path(), "test", column_families, &db_opts).unwrap();
 
         db.put::<TestSchema>(&TestKey(1, 0, 0), &TestValue(100))
             .unwrap();
@@ -136,10 +139,9 @@ fn test_seek_to_first() {
 
     let mut iter = db.iter();
     iter.seek_to_first();
-    assert_eq!(
-        collect_values(iter),
-        [100, 102, 104, 110, 112, 114, 200, 202]
-    );
+    assert_eq!(collect_values(iter), [
+        100, 102, 104, 110, 112, 114, 200, 202
+    ]);
 
     let mut iter = db.rev_iter();
     iter.seek_to_first();
@@ -156,10 +158,9 @@ fn test_seek_to_last() {
 
     let mut iter = db.rev_iter();
     iter.seek_to_last();
-    assert_eq!(
-        collect_values(iter),
-        [202, 200, 114, 112, 110, 104, 102, 100]
-    );
+    assert_eq!(collect_values(iter), [
+        202, 200, 114, 112, 110, 104, 102, 100
+    ]);
 }
 
 #[test]

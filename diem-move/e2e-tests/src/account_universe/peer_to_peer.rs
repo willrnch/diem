@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,8 +7,13 @@ use crate::{
     common_transactions::peer_to_peer_txn,
 };
 use diem_types::{
-    transaction::{SignedTransaction, TransactionStatus},
-    vm_status::{known_locations, KeptVMStatus, StatusCode},
+    transaction::{ExecutionStatus, SignedTransaction, TransactionStatus},
+    vm_status::StatusCode,
+};
+use move_core_types::{
+    ident_str,
+    language_storage::{ModuleId, CORE_CODE_ADDRESS},
+    vm_status::AbortLocation,
 };
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
@@ -40,6 +46,7 @@ impl AUTransactionGen for P2PTransferGen {
             receiver.account(),
             sender.sequence_number,
             self.amount,
+            1, // sets unit gas price, ensures an aggregator is used for total supply.
         );
 
         // Now figure out whether the transaction will actually work.
@@ -66,9 +73,9 @@ impl AUTransactionGen for P2PTransferGen {
                 receiver.balance += self.amount;
                 receiver.received_events_count += 1;
 
-                status = TransactionStatus::Keep(KeptVMStatus::Executed);
+                status = TransactionStatus::Keep(ExecutionStatus::Success);
                 gas_used = sender.peer_to_peer_gas_cost();
-            }
+            },
             (true, true, false) => {
                 // Enough gas to pass validation and to do the transfer, but not enough to succeed
                 // in the epilogue. The transaction will be run and gas will be deducted from the
@@ -76,32 +83,40 @@ impl AUTransactionGen for P2PTransferGen {
                 sender.sequence_number += 1;
                 gas_used = sender.peer_to_peer_gas_cost();
                 sender.balance -= gas_used * txn.gas_unit_price();
-                // 6 means the balance was insufficient while trying to deduct gas costs in the
+                // the balance was insufficient while trying to deduct gas costs in the
                 // epilogue.
                 // TODO: define these values in a central location
-                status = TransactionStatus::Keep(KeptVMStatus::MoveAbort(
-                    known_locations::diem_account_module_abort(),
-                    6,
-                ));
-            }
+                status = TransactionStatus::Keep(ExecutionStatus::MoveAbort {
+                    location: AbortLocation::Module(ModuleId::new(
+                        CORE_CODE_ADDRESS,
+                        ident_str!("coin").to_owned(),
+                    )),
+                    code: 65542,
+                    info: None,
+                });
+            },
             (true, false, _) => {
                 // Enough to pass validation but not to do the transfer. The transaction will be run
                 // and gas will be deducted from the sender, but no other changes will happen.
                 sender.sequence_number += 1;
                 gas_used = sender.peer_to_peer_too_low_gas_cost();
                 sender.balance -= gas_used * txn.gas_unit_price();
-                // 10 means the balance was insufficient while trying to transfer.
-                status = TransactionStatus::Keep(KeptVMStatus::MoveAbort(
-                    known_locations::diem_account_module_abort(),
-                    1288,
-                ));
-            }
+                // the balance was insufficient while trying to transfer.
+                status = TransactionStatus::Keep(ExecutionStatus::MoveAbort {
+                    location: AbortLocation::Module(ModuleId::new(
+                        CORE_CODE_ADDRESS,
+                        ident_str!("coin").to_owned(),
+                    )),
+                    code: 65542,
+                    info: None,
+                });
+            },
             (false, _, _) => {
                 // Not enough gas to pass validation. Nothing will happen.
                 status = TransactionStatus::Discard(
                     StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE,
                 );
-            }
+            },
         }
 
         (txn, (status, gas_used))

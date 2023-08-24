@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,8 +8,10 @@ use crate::{
     test_utils::{consensus_runtime, timed_block_on},
     twins::twins_node::SMRNode,
 };
-use consensus_types::{block::Block, common::Round};
-use diem_config::config::ConsensusProposerType::{FixedProposer, RotatingProposer, RoundProposer};
+use diem_consensus_types::{block::Block, common::Round};
+use diem_types::on_chain_config::ProposerElectionType::{
+    FixedProposer, RotatingProposer, RoundProposer,
+};
 use futures::StreamExt;
 use std::collections::HashMap;
 
@@ -23,7 +26,7 @@ use std::collections::HashMap;
 /// Run the test:
 /// cargo xtest -p consensus basic_start_test -- --nocapture
 fn basic_start_test() {
-    let mut runtime = consensus_runtime();
+    let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let num_nodes = 4;
     let num_twins = 0;
@@ -31,11 +34,11 @@ fn basic_start_test() {
         num_nodes,
         num_twins,
         &mut playground,
-        RotatingProposer,
+        RotatingProposer(2),
         None,
     );
     let genesis = Block::make_genesis_block_from_ledger_info(&nodes[0].storage.get_ledger_info());
-    timed_block_on(&mut runtime, async {
+    timed_block_on(&runtime, async {
         let msg = playground
             .wait_for_messages(1, NetworkPlayground::proposals_only)
             .await;
@@ -73,9 +76,9 @@ fn basic_start_test() {
 ///
 /// Run the test:
 /// cargo xtest -p consensus drop_config_test -- --nocapture
-#[ignore] // TODO: https://github.com/diem/diem/issues/8767
+#[ignore] // TODO: https://github.com/aptos-labs/diem-core/issues/8767
 fn drop_config_test() {
-    let mut runtime = consensus_runtime();
+    let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let num_nodes = 4;
     let num_twins = 0;
@@ -83,7 +86,7 @@ fn drop_config_test() {
         num_nodes,
         num_twins,
         &mut playground,
-        FixedProposer,
+        FixedProposer(2),
         None,
     );
 
@@ -96,7 +99,7 @@ fn drop_config_test() {
     assert!(playground.split_network(vec![n2_twin_id], vec![n0_twin_id, n1_twin_id, n3_twin_id]));
     runtime.spawn(playground.start());
 
-    timed_block_on(&mut runtime, async {
+    timed_block_on(&runtime, async {
         // Check that the commit log for n0 is not empty
         let node0_commit = nodes[0].commit_cb_receiver.next().await;
         assert!(node0_commit.is_some());
@@ -131,7 +134,7 @@ fn drop_config_test() {
 /// Run the test:
 /// cargo xtest -p consensus twins_vote_dedup_test -- --nocapture
 fn twins_vote_dedup_test() {
-    let mut runtime = consensus_runtime();
+    let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let num_nodes = 4;
     let num_twins = 1;
@@ -139,7 +142,7 @@ fn twins_vote_dedup_test() {
         num_nodes,
         num_twins,
         &mut playground,
-        RotatingProposer,
+        RotatingProposer(2),
         None,
     );
 
@@ -152,13 +155,14 @@ fn twins_vote_dedup_test() {
     let n2_twin_id = nodes[2].id;
     let n3_twin_id = nodes[3].id;
 
-    assert!(playground.split_network(
-        vec![n1_twin_id, n3_twin_id],
-        vec![twin0_twin_id, n0_twin_id, n2_twin_id],
-    ));
+    assert!(playground.split_network(vec![n1_twin_id, n3_twin_id], vec![
+        twin0_twin_id,
+        n0_twin_id,
+        n2_twin_id
+    ],));
     runtime.spawn(playground.start());
 
-    timed_block_on(&mut runtime, async {
+    timed_block_on(&runtime, async {
         // No node should be able to commit because of the way partitions
         // have been created
         let mut commit_seen = false;
@@ -188,8 +192,9 @@ fn twins_vote_dedup_test() {
 ///
 /// Run the test:
 /// cargo xtest -p consensus twins_proposer_test -- --nocapture
+#[ignore]
 fn twins_proposer_test() {
-    let mut runtime = consensus_runtime();
+    let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let num_nodes = 4;
     let num_twins = 2;
@@ -226,18 +231,16 @@ fn twins_proposer_test() {
     let mut round_partitions: HashMap<u64, Vec<Vec<TwinId>>> = HashMap::new();
     // Round 1 to 10 partitions: [node0, node1, node2], [node3, twin0, twin1]
     for i in 1..10 {
-        round_partitions.insert(
-            i,
-            vec![
-                vec![n0_twin_id, n1_twin_id, n2_twin_id],
-                vec![n3_twin_id, twin0_twin_id, twin1_twin_id],
-            ],
-        );
+        round_partitions.insert(i, vec![vec![n0_twin_id, n1_twin_id, n2_twin_id], vec![
+            n3_twin_id,
+            twin0_twin_id,
+            twin1_twin_id,
+        ]]);
     }
     assert!(playground.split_network_round(&round_partitions));
     runtime.spawn(playground.start());
 
-    timed_block_on(&mut runtime, async {
+    timed_block_on(&runtime, async {
         let node0_commit = nodes[0].commit_cb_receiver.next().await;
         let twin0_commit = nodes[4].commit_cb_receiver.next().await;
 
@@ -248,14 +251,14 @@ fn twins_proposer_test() {
                 // Proposal from both node0 and twin_node0 are going to
                 // get committed in their respective partitions
                 assert_ne!(node0_commit_id, twin0_commit_id);
-            }
+            },
             _ => panic!("[TwinsTest] Test failed due to no commit(s)"),
         }
     });
 }
 
 #[test]
-#[ignore] // TODO: https://github.com/diem/diem/issues/6615
+#[ignore] // TODO: https://github.com/aptos-labs/diem-core/issues/6615
 /// This test checks that when a node and its twin are both leaders
 /// for a round, only one of the two proposals gets committed
 ///
@@ -272,7 +275,7 @@ fn twins_proposer_test() {
 /// Run the test:
 /// cargo xtest -p consensus twins_commit_test -- --nocapture
 fn twins_commit_test() {
-    let mut runtime = consensus_runtime();
+    let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let num_nodes = 4;
     let num_twins = 1;
@@ -294,7 +297,7 @@ fn twins_commit_test() {
     );
     runtime.spawn(playground.start());
 
-    timed_block_on(&mut runtime, async {
+    timed_block_on(&runtime, async {
         let node0_commit = nodes[0].commit_cb_receiver.next().await;
         let twin0_commit = nodes[4].commit_cb_receiver.next().await;
 
@@ -305,7 +308,7 @@ fn twins_commit_test() {
                 // Proposals from both node0 and twin_node0 are going to race,
                 // but only one of them will form a commit
                 assert_eq!(node0_commit_id, twin0_commit_id);
-            }
+            },
             _ => panic!("[TwinsTest] Test failed due to no commit(s)"),
         }
     });

@@ -1,31 +1,30 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{metrics_safety_rules::MetricsSafetyRules, test_utils::MockStorage};
-use consensus_types::{
-    block::block_test_utils::certificate_for_genesis, common::Round, executed_block::ExecutedBlock,
-    quorum_cert::QuorumCert, vote_proposal::MaybeSignedVoteProposal,
+use diem_consensus_types::{
+    block::block_test_utils::certificate_for_genesis,
+    common::{Payload, Round},
+    executed_block::ExecutedBlock,
+    quorum_cert::QuorumCert,
+    vote_proposal::VoteProposal,
 };
-use diem_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519Signature},
-    hash::ACCUMULATOR_PLACEHOLDER_HASH,
-    HashValue, Uniform,
-};
+use diem_crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue};
+use diem_executor_types::StateComputeResult;
 use diem_infallible::Mutex;
+use diem_safety_rules::{
+    test_utils::{make_proposal_with_parent, make_proposal_with_qc},
+    PersistentSafetyStorage, SafetyRulesManager,
+};
 use diem_secure_storage::Storage;
 use diem_types::{
-    account_address::AccountAddress,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    ledger_info::{generate_ledger_info_with_sig, LedgerInfo, LedgerInfoWithSignatures},
     validator_signer::ValidatorSigner,
     validator_verifier::random_validator_verifier,
     waypoint::Waypoint,
 };
-use executor_types::StateComputeResult;
-use safety_rules::{
-    test_utils::{make_proposal_with_parent, make_proposal_with_qc},
-    PersistentSafetyStorage, SafetyRulesManager,
-};
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 pub fn prepare_safety_rules() -> (Arc<Mutex<MetricsSafetyRules>>, Vec<ValidatorSigner>) {
     let num_nodes = 1;
@@ -42,48 +41,47 @@ pub fn prepare_safety_rules() -> (Arc<Mutex<MetricsSafetyRules>>, Vec<ValidatorS
         Storage::from(diem_secure_storage::InMemoryStorage::new()),
         signer.author(),
         signer.private_key().clone(),
-        Ed25519PrivateKey::generate_for_testing(),
         waypoint,
         true,
     );
     let (_, storage) = MockStorage::start_for_testing((&validators).into());
 
-    let safety_rules_manager = SafetyRulesManager::new_local(safety_storage, false, false);
+    let safety_rules_manager = SafetyRulesManager::new_local(safety_storage);
     let mut safety_rules = MetricsSafetyRules::new(safety_rules_manager.client(), storage);
     safety_rules.perform_initialize().unwrap();
 
     (Arc::new(Mutex::new(safety_rules)), signers)
 }
 
-// This function priorizes using parent over init_qc
+// This function prioritizes using parent over init_qc
 pub fn prepare_executed_blocks_with_ledger_info(
     signer: &ValidatorSigner,
     num_blocks: Round,
     executed_hash: HashValue,
     consensus_hash: HashValue,
-    some_parent: Option<MaybeSignedVoteProposal>,
+    some_parent: Option<VoteProposal>,
     init_qc: Option<QuorumCert>,
     init_round: Round,
 ) -> (
     Vec<ExecutedBlock>,
     LedgerInfoWithSignatures,
-    Vec<MaybeSignedVoteProposal>,
+    Vec<VoteProposal>,
 ) {
     assert!(num_blocks > 0);
 
     let p1 = if let Some(parent) = some_parent {
-        make_proposal_with_parent(vec![], init_round, &parent, None, signer, None)
+        make_proposal_with_parent(Payload::empty(false), init_round, &parent, None, signer)
     } else {
-        make_proposal_with_qc(init_round, init_qc.unwrap(), signer, None)
+        make_proposal_with_qc(init_round, init_qc.unwrap(), signer)
     };
 
-    let mut proposals: Vec<MaybeSignedVoteProposal> = vec![p1];
+    let mut proposals: Vec<VoteProposal> = vec![p1];
 
     for i in 1..num_blocks {
         println!("Generating {}", i);
         let parent = proposals.last().unwrap();
         let proposal =
-            make_proposal_with_parent(vec![], init_round + i, parent, None, signer, None);
+            make_proposal_with_parent(Payload::empty(false), init_round + i, parent, None, signer);
         proposals.push(proposal);
     }
 
@@ -108,12 +106,7 @@ pub fn prepare_executed_blocks_with_ledger_info(
         consensus_hash,
     );
 
-    let mut li_sig = LedgerInfoWithSignatures::new(
-        li.clone(),
-        BTreeMap::<AccountAddress, Ed25519Signature>::new(),
-    );
-
-    li_sig.add_signature(signer.author(), signer.sign(&li));
+    let li_sig = generate_ledger_info_with_sig(&[signer.clone()], li);
 
     let executed_blocks: Vec<ExecutedBlock> = proposals
         .iter()
@@ -131,7 +124,7 @@ pub fn prepare_executed_blocks_with_executed_ledger_info(
         signer,
         1,
         HashValue::random(),
-        HashValue::from_u64(0xbeef),
+        HashValue::from_u64(0xBEEF),
         None,
         Some(genesis_qc),
         0,

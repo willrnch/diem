@@ -1,4 +1,4 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_crypto::{
@@ -7,7 +7,7 @@ use diem_crypto::{
     test_utils::KeyPair,
     traits::*,
 };
-use diem_crypto_derive::{CryptoHasher, BCSCryptoHash};
+use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
 use rand::{prelude::ThreadRng, thread_rng};
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ fn main() {
         KeyPair::generate(&mut csprng);
 
     let message = TestTypedSemantics(String::from("hello_world"));
-    let signature = ed25519_keypair.private_key.sign(&message);
+    let signature = ed25519_keypair.private_key.sign(&message).unwrap();
 
     let multi_ed25519_keypair: KeyPair<MultiEd25519PrivateKey, MultiEd25519PublicKey> =
         KeyPair::generate(&mut csprng);

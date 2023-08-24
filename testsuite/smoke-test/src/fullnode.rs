@@ -1,87 +1,77 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{
+    smoke_test_environment::new_local_swarm_with_diem, test_utils::MAX_HEALTHY_WAIT_SECS,
+};
+use anyhow::bail;
+use diem_cached_packages::diem_stdlib;
+use diem_config::config::NodeConfig;
+use diem_forge::{NodeExt, Result, Swarm};
+use diem_rest_client::Client as RestClient;
+use diem_types::account_address::AccountAddress;
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
-use diem_config::config::NodeConfig;
-use diem_rest_client::Client as RestClient;
-use diem_sdk::{transaction_builder::Currency, types::LocalAccount};
-use diem_types::account_address::AccountAddress;
-use forge::{NetworkContext, NetworkTest, NodeExt, Result, Test};
-use tokio::runtime::Runtime;
+#[tokio::test]
+async fn test_indexer() {
+    let mut swarm = new_local_swarm_with_diem(1).await;
 
-#[derive(Debug)]
-pub struct LaunchFullnode;
+    let version = swarm.versions().max().unwrap();
+    let fullnode_peer_id = swarm
+        .add_full_node(&version, NodeConfig::get_default_pfn_config())
+        .await
+        .unwrap();
+    let validator_peer_id = swarm.validators().next().unwrap().peer_id();
+    let _vfn_peer_id = swarm
+        .add_validator_full_node(
+            &version,
+            NodeConfig::get_default_vfn_config(),
+            validator_peer_id,
+        )
+        .unwrap();
 
-impl Test for LaunchFullnode {
-    fn name(&self) -> &'static str {
-        "smoke-test:launch-fullnode"
-    }
-}
+    let fullnode = swarm.full_node_mut(fullnode_peer_id).unwrap();
+    fullnode
+        .wait_until_healthy(Instant::now() + Duration::from_secs(MAX_HEALTHY_WAIT_SECS))
+        .await
+        .unwrap();
 
-impl NetworkTest for LaunchFullnode {
-    fn run<'t>(&self, ctx: &mut NetworkContext<'t>) -> Result<()> {
-        let runtime = Runtime::new().unwrap();
-        runtime.block_on(self.async_run(ctx))
-    }
-}
+    let client = fullnode.rest_client();
 
-impl LaunchFullnode {
-    async fn async_run(&self, ctx: &mut NetworkContext<'_>) -> Result<()> {
-        let version = ctx.swarm().versions().max().unwrap();
-        let fullnode_peer_id = ctx
-            .swarm()
-            .add_full_node(&version, NodeConfig::default_for_public_full_node())?;
+    let mut account1 = swarm.diem_public_info().random_account();
+    let account2 = swarm.diem_public_info().random_account();
 
-        let fullnode = ctx.swarm().full_node_mut(fullnode_peer_id).unwrap();
-        fullnode
-            .wait_until_healthy(Instant::now() + Duration::from_secs(10))
-            .await?;
+    let mut chain_info = swarm.chain_info().into_diem_public_info();
+    let factory = chain_info.transaction_factory();
+    chain_info
+        .create_user_account(account1.public_key())
+        .await
+        .unwrap();
+    // TODO(Gas): double check if this is correct
+    chain_info
+        .mint(account1.address(), 10_000_000_000)
+        .await
+        .unwrap();
+    chain_info
+        .create_user_account(account2.public_key())
+        .await
+        .unwrap();
 
-        let client = fullnode.rest_client();
+    wait_for_account(&client, account1.address()).await.unwrap();
 
-        let factory = ctx.swarm().chain_info().transaction_factory();
-        let mut account1 = LocalAccount::generate(ctx.core().rng());
-        let account2 = LocalAccount::generate(ctx.core().rng());
+    let txn = account1.sign_with_transaction_builder(
+        factory.payload(diem_stdlib::diem_coin_transfer(account2.address(), 10)),
+    );
 
-        ctx.swarm()
-            .chain_info()
-            .create_parent_vasp_account(Currency::XUS, account1.authentication_key())
-            .await?;
-        ctx.swarm()
-            .chain_info()
-            .fund(Currency::XUS, account1.address(), 100)
-            .await?;
-        ctx.swarm()
-            .chain_info()
-            .create_parent_vasp_account(Currency::XUS, account2.authentication_key())
-            .await?;
+    client.submit_and_wait(&txn).await.unwrap();
+    let balance = client
+        .get_account_balance(account2.address())
+        .await
+        .unwrap()
+        .into_inner();
 
-        wait_for_account(&client, account1.address()).await?;
-
-        let txn = account1.sign_with_transaction_builder(factory.peer_to_peer(
-            Currency::XUS,
-            account2.address(),
-            10,
-        ));
-
-        client.submit_and_wait(&txn).await?;
-        let balances = client
-            .get_account_balances(account1.address())
-            .await?
-            .into_inner();
-
-        assert_eq!(
-            vec![(90, "XUS".to_string())],
-            balances
-                .into_iter()
-                .map(|b| (b.amount, b.currency_code()))
-                .collect::<Vec<(u64, String)>>()
-        );
-
-        Ok(())
-    }
+    assert_eq!(balance.get(), 10);
 }
 
 async fn wait_for_account(client: &RestClient, address: AccountAddress) -> Result<()> {

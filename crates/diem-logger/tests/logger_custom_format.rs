@@ -1,8 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_infallible::RwLock;
-use diem_logger::{info, DiemLogger, Writer};
+use diem_logger::{diem_logger::DiemData, info, Writer};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -14,13 +15,17 @@ impl Writer for VecWriter {
     fn write(&self, log: String) {
         self.logs.write().push(log)
     }
+
+    fn write_buferred(&mut self, log: String) {
+        self.write(log);
+    }
 }
 
 #[test]
 fn test_custom_formatter() {
     let writer = VecWriter::default();
     let logs = writer.logs.clone();
-    DiemLogger::builder()
+    DiemData::builder()
         .is_async(false)
         .printer(Box::new(writer))
         .custom_format(|entry| {

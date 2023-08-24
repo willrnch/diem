@@ -1,4 +1,7 @@
 ---
+BitVec:
+  STRUCT:
+    - inner: BYTES
 ChainId:
   NEWTYPESTRUCT: U8
 DirectSendMsg:
@@ -143,8 +146,15 @@ ProtocolId:
       StorageServiceRpc: UNIT
     9:
       MempoolRpc: UNIT
+    10:
+      PeerMonitoringServiceRpc: UNIT
+    11:
+      ConsensusRpcCompressed: UNIT
+    12:
+      ConsensusDirectSendCompressed: UNIT
 ProtocolIdSet:
-  NEWTYPESTRUCT: BYTES
+  NEWTYPESTRUCT:
+    TYPENAME: BitVec
 PublicKey:
   NEWTYPESTRUCT: BYTES
 RpcRequest:

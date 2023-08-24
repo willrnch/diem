@@ -1,63 +1,87 @@
-# Faucet
+# Diem Faucet
 
-Faucet is a service for creating and funding accounts on Diem Network by treasury compliance account.
+The Diem Faucet is a service that runs alongside a test network and mints coins for users to test and develop on Diem.
 
-It is created for Testnet usage only.
+## Subdirectories
+This is a brief overview of the subdirectories to help you find what you seek. For more information on each of these subdirectories, see the README in that subdirectory.
 
-## Mint API
+- `core/`: All core logic, including the server, endpoint handlers, bypassers, checkers, funders, etc.
+- `service/`: The entrypoint for running the faucet as a service.
+- `cli/`: CLI for executing the core MintFunder code from the service.
+- `metrics-server/`: The metrics server for the faucet service.
+- `doc/`: OpenAPI spec generated from the server definition.
 
-Mint API can create and fund your account. It will fund your account if it is already created onchain.
+In all cases, if a directory holds a crate, the name of that crate is `diem-faucet-<directory>`. For example the name of the crate in `metrics-server/` is `diem-faucet-metrics-server`.
 
-* Base URL: `http://faucet.testnet.diem.com/`
-* Path: `/mint`
-* Method: POST
+## Features
 
-URL Query Params:
+Noteworthy features of the faucet include:
+- Checkers, which confirm that the given request is valid. Examples include:
+  - IP presence in a blocklist.
+  - Auth token.
+  - Google Captcha.
+- Built in rate limiting, e.g. with a [Redis](https://redis.io/) backend, eliminating the need for something like haproxy in front of the faucet. These are also just checkers.
+- Bypassers, the opposite of checkers, which allow requests to bypass checkers and rate limits if they meet some criteria. Examples include:
+  - IP presence in an allowlist.
+- Different funding backends. Examples include:
+  - MintFunder: This works like the legacy faucet. By default, on startup we use the root account to delegate minting capability to a new account and use that to create and mint coins for each fund request.
+  - TransferFunder: Each faucet has its own account and uses that to create accounts and transfer funds into them. No minting.
+- All of these features are configurable using a config file.
 
-| param name             | type   | required? |  description                                                         |
-|------------------------|--------|-----------|----------------------------------------------------------------------|
-| `amount`               | int    | Y         | amount of coins to mint                                              |
-| `auth_key`             | string | Y         | your account authentication key                                      |
-| `currency_code`        | string | Y         | the currency code, e.g. XDX                                          |
-| `return_txns`          | bool   | N         | returns the transactions for creating / funding the account          |
-| `is_designated_dealer` | bool   | N         | creates a designated dealer account instead of a parent VASP account |
-| `vasp_domain` | string   | N         | domain for VASP to add or remove for parent VASP, is_designated_dealer must be set to false |
-| `is_remove_domain` | bool   | N         | add or remove the above VASP domain to parent VASP account |
-
-Notes:
-* By default, the account created is a parent VASP account.
-* Type bool means you set value to a string "true" or "false"
-* For existing accounts as defined by the auth_key, the service submits 1 transfer funds transaction.
-* For new accounts as defined by the auth_key, the service first issues a transaction for creating the account and another for transferring funds.
-* All funds transferred come from the account 000000000000000000000000000000dd.
-* Clients should retry their request if the requests or the transactions execution failed. One reason for failure is that, under load, the service may issue transactions with duplicate sequence numbers. Only one of those transactions will be executed, the rest will fail.
-
-### Response
-
-If no query param `return_txns` or it is not "true", server returns an unsigned int 64 in HTTP response body. The number is the account sequence number of the account `000000000000000000000000000000dd` on Testnet after executing the request.
-Nominally, this number can be used for looking up the submitted transaction. However, under load, this number may be shared by multiple transactions.
-
-Set query param `return_txns`, server will response all transactions for creating and funding your account.
-The respond HTTP body is hex encoded bytes of BCS encoded `Vec<diem_types::transaction::SignedTransaction>`.
-
-Decode Example ([source](https://diem.github.io/client-sdk-python/diem/testnet.html#diem.testnet.Faucet)):
-
-``` python
-  de = bcs.BcsDeserializer(bytes.fromhex(response.text))
-  length = de.deserialize_len()
-
-  txns = []
-  for i in range(length):
-    txns.push(de.deserialize_any(diem_types.SignedTransaction))
-
+## Running
+To run the faucet, the simplest way to start is with this command:
+```
+cargo run -p diem-faucet-service -- run-simple --key <private_key> --node-url <api_url> --chain-id TESTING
 ```
 
-You should retry the mint API call if the returned transactions executed failed.
+Another example, running alongside a local testnet (without `--use-faucet`):
+```
+cargo run -p diem -- node run-local-testnet --force-restart --assume-yes
+cargo run -p diem-faucet-service -- run-simple --key ~/.diem/testnet/mint.key --node-url http://127.0.0.1:8080 --chain-id TESTING
+```
 
+This command lets you configure only a subset of the full functionality of the faucet. You cannot enable any checkers / bypassers, and it supports only the MintFunder. Generally it is intended for use with some kind of local swarm-based testnet or other such uses.
 
-## Example
+For running the faucet in production, you will instead want to build a configuration file and run it like this:
+```
+cargo run -p diem-faucet-service -- run -c <path_to_config_file>
+```
 
-```bash
-curl -X POST http://faucet.testnet.diem.com/mint\?amount\=1000000\&currency_code\=XUS\&auth_key\=459c77a38803bd53f3adee52703810e3a74fd7c46952c497e75afb0a7932586d\&return_txns\=true
-01000000000000000000000000000000dd05a600000000000001e001a11ceb0b010000000701000202020403061004160205181d0735600895011000000001010000020001000003020301010004010300010501060c0108000506080005030a020a020005060c05030a020a020109000b4469656d4163636f756e741257697468647261774361706162696c6974791b657874726163745f77697468647261775f6361706162696c697479087061795f66726f6d1b726573746f72655f77697468647261775f6361706162696c69747900000000000000000000000000000001010104010c0b0011000c050e050a010a020b030b0438000b051102020107000000000000000000000000000000010358555303585553000403a74fd7c46952c497e75afb0a7932586d0140420f00000000000400040040420f00000000000000000000000000035855532a610f6000000000020020056244e7bf776e471d818dc18fdf7b8833c5439ac9a96e126f8f32c7bc7c14b64026a2c45c8e4066c661dc4f36baa6ad61499999b548b9f63ad15853660c408cedec3078b7773a829ec48de8b04291cd11530734b2f91d5e42f35a4c6378cb7c09
+You can find many examples of different config files in [configs/](configs/).
+
+## Developing
+Certain components of the faucet, e.g. the MinterFunder, rely on a Move script to operate. If you change it, compile the Move script like this (from the root of the repo):
+```
+cd diem-move/move-examples/scripts/minter
+diem move compile
+```
+
+If you have issues with this, try deleting `~/.move`, updating your Diem CLI, and changing the DiemFramework version.
+
+Then build the faucet as normal (from the root of the repo):
+```
+cargo build
+```
+
+## Testing
+If you want to run the tests manually, follow the steps in [integration-tests/README.md](integration-tests/README.md). Note that this is **not necessary** for release safety as the tests are run as part of continuous integration (CI) already.
+
+## Validating configs
+To ensure all the configs are valid, run this:
+```
+cd crates/diem-faucet/configs
+ls . | xargs -I@ cargo run -p diem-faucet-service -- validate-config -c @
+```
+
+## Generating the specs
+From the root:
+```
+cargo run -- generate-openapi -o doc/spec.yaml -f yaml
+cargo run -- generate-openapi -o doc/spec.json -f json
+```
+
+## Generating the TS client
+From `ts-client`:
+```
+pnpm generate-client
 ```

@@ -3,12 +3,22 @@ AccountAddress:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
-      SIZE: 16
+      SIZE: 32
 ArgumentABI:
   STRUCT:
     - name: STR
     - type_tag:
         TYPENAME: TypeTag
+EntryABI:
+  ENUM:
+    0:
+      TransactionScript:
+        NEWTYPE:
+          TYPENAME: TransactionScriptABI
+    1:
+      EntryFunction:
+        NEWTYPE:
+          TYPENAME: ScriptFunctionABI
 Identifier:
   NEWTYPESTRUCT: STR
 ModuleId:
@@ -17,16 +27,6 @@ ModuleId:
         TYPENAME: AccountAddress
     - name:
         TYPENAME: Identifier
-ScriptABI:
-  ENUM:
-    0:
-      TransactionScript:
-        NEWTYPE:
-          TYPENAME: TransactionScriptABI
-    1:
-      ScriptFunction:
-        NEWTYPE:
-          TYPENAME: ScriptFunctionABI
 ScriptFunctionABI:
   STRUCT:
     - name: STR
@@ -47,7 +47,7 @@ StructTag:
         TYPENAME: Identifier
     - name:
         TYPENAME: Identifier
-    - type_params:
+    - type_args:
         SEQ:
           TYPENAME: TypeTag
 TransactionScriptABI:
@@ -67,22 +67,28 @@ TypeArgumentABI:
 TypeTag:
   ENUM:
     0:
-      Bool: UNIT
+      bool: UNIT
     1:
-      U8: UNIT
+      u8: UNIT
     2:
-      U64: UNIT
+      u64: UNIT
     3:
-      U128: UNIT
+      u128: UNIT
     4:
-      Address: UNIT
+      address: UNIT
     5:
-      Signer: UNIT
+      signer: UNIT
     6:
-      Vector:
+      vector:
         NEWTYPE:
           TYPENAME: TypeTag
     7:
-      Struct:
+      struct:
         NEWTYPE:
           TYPENAME: StructTag
+    8:
+      u16: UNIT
+    9:
+      u32: UNIT
+    10:
+      u256: UNIT

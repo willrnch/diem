@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for consensus block.
@@ -9,19 +10,18 @@
 //! | block_hash |    block    |
 //! ```
 
-use super::BLOCK_CF_NAME;
 use anyhow::Result;
-use consensus_types::block::Block;
+use diem_consensus_types::block::Block;
 use diem_crypto::HashValue;
-use schemadb::schema::{KeyCodec, Schema, ValueCodec};
+use diem_schemadb::{
+    define_schema,
+    schema::{KeyCodec, ValueCodec},
+    ColumnFamilyName,
+};
 
-pub struct BlockSchema;
+pub const BLOCK_CF_NAME: ColumnFamilyName = "block";
 
-impl Schema for BlockSchema {
-    const COLUMN_FAMILY_NAME: schemadb::ColumnFamilyName = BLOCK_CF_NAME;
-    type Key = HashValue;
-    type Value = Block;
-}
+define_schema!(BlockSchema, HashValue, Block, BLOCK_CF_NAME);
 
 impl KeyCodec<BlockSchema> for HashValue {
     fn encode_key(&self) -> Result<Vec<u8>> {

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for LedgerInfoWithSignatures structure.
@@ -12,22 +13,22 @@
 //! `epoch` is serialized in big endian so that records in RocksDB will be in order of their
 //! numeric value.
 
+use super::LEDGER_INFO_CF_NAME;
 use crate::schema::ensure_slice_len_eq;
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt};
-use diem_types::ledger_info::LedgerInfoWithSignatures;
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
-    DEFAULT_CF_NAME,
 };
+use diem_types::ledger_info::LedgerInfoWithSignatures;
+use byteorder::{BigEndian, ReadBytesExt};
 use std::mem::size_of;
 
 define_schema!(
     LedgerInfoSchema,
     u64, /* epoch num */
     LedgerInfoWithSignatures,
-    DEFAULT_CF_NAME
+    LEDGER_INFO_CF_NAME
 );
 
 impl KeyCodec<LedgerInfoSchema> for u64 {

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -27,18 +28,8 @@ pub trait RemoteService {
     fn network_timeout_ms(&self) -> u64;
 }
 
-pub fn execute(
-    storage: PersistentSafetyStorage,
-    listen_addr: SocketAddr,
-    verify_vote_proposal_signature: bool,
-    export_consensus_key: bool,
-    network_timeout_ms: u64,
-) {
-    let mut safety_rules = SafetyRules::new(
-        storage,
-        verify_vote_proposal_signature,
-        export_consensus_key,
-    );
+pub fn execute(storage: PersistentSafetyStorage, listen_addr: SocketAddr, network_timeout_ms: u64) {
+    let mut safety_rules = SafetyRules::new(storage);
     if let Err(e) = safety_rules.consensus_state() {
         warn!("Unable to print consensus state: {}", e);
     }

@@ -1,7 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! This module defines physical storage schema for write set emited by each transaction
+//! This module defines physical storage schema for write set emitted by each transaction
 //! saved to storage.
 //!
 //! Serialized signed transaction bytes identified by version.
@@ -15,12 +16,12 @@
 
 use crate::schema::{ensure_slice_len_eq, WRITE_SET_CF_NAME};
 use anyhow::Result;
-use byteorder::{BigEndian, ReadBytesExt};
-use diem_types::{transaction::Version, write_set::WriteSet};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
 };
+use diem_types::{transaction::Version, write_set::WriteSet};
+use byteorder::{BigEndian, ReadBytesExt};
 use std::mem::size_of;
 
 define_schema!(WriteSetSchema, Version, WriteSet, WRITE_SET_CF_NAME);

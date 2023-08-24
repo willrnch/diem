@@ -1,80 +1,92 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Support for mocking the Diem data store.
 
 use crate::account::AccountData;
 use anyhow::Result;
-use diem_state_view::StateView;
+use diem_state_view::{in_memory_state_view::InMemoryStateView, TStateView};
 use diem_types::{
     access_path::AccessPath,
-    on_chain_config::ConfigStorage,
+    account_config::CoinInfoResource,
+    state_store::{
+        state_key::StateKey, state_storage_usage::StateStorageUsage, state_value::StateValue,
+        table::TableHandle as DiemTableHandle,
+    },
     transaction::ChangeSet,
-    write_set::{WriteOp, WriteSet},
+    write_set::{TransactionWrite, WriteSet},
 };
-use diem_vm::data_cache::RemoteStorage;
-use move_binary_format::errors::*;
-use move_core_types::{
-    account_address::AccountAddress,
-    language_storage::{ModuleId, StructTag},
-    resolver::{ModuleResolver, ResourceResolver},
+use diem_vm_genesis::{
+    generate_genesis_change_set_for_mainnet, generate_genesis_change_set_for_testing,
+    GenesisOptions,
 };
+use move_core_types::language_storage::ModuleId;
+use move_table_extension::{TableHandle, TableResolver};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use vm_genesis::{generate_genesis_change_set_for_testing, GenesisOptions};
 
 /// Dummy genesis ChangeSet for testing
-pub static GENESIS_CHANGE_SET: Lazy<ChangeSet> =
-    Lazy::new(|| generate_genesis_change_set_for_testing(GenesisOptions::Compiled));
+pub static GENESIS_CHANGE_SET_HEAD: Lazy<ChangeSet> =
+    Lazy::new(|| generate_genesis_change_set_for_testing(GenesisOptions::Head));
 
-pub static GENESIS_CHANGE_SET_FRESH: Lazy<ChangeSet> =
-    Lazy::new(|| generate_genesis_change_set_for_testing(GenesisOptions::Fresh));
+pub static GENESIS_CHANGE_SET_TESTNET: Lazy<ChangeSet> =
+    Lazy::new(|| generate_genesis_change_set_for_testing(GenesisOptions::Testnet));
 
-pub static GENESIS_CHANGE_SET_EXPERIMENTAL: Lazy<ChangeSet> =
-    Lazy::new(|| generate_genesis_change_set_for_testing(GenesisOptions::Experimental));
+pub static GENESIS_CHANGE_SET_MAINNET: Lazy<ChangeSet> =
+    Lazy::new(|| generate_genesis_change_set_for_mainnet(GenesisOptions::Mainnet));
 
-/// An in-memory implementation of [`StateView`] and [`RemoteCache`] for the VM.
+/// An in-memory implementation of `StateView` and `RemoteCache` for the VM.
 ///
 /// Tests use this to set up state, and pass in a reference to the cache whenever a `StateView` or
 /// `RemoteCache` is needed.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FakeDataStore {
-    data: HashMap<AccessPath, Vec<u8>>,
+    state_data: HashMap<StateKey, StateValue>,
 }
 
 impl FakeDataStore {
     /// Creates a new `FakeDataStore` with the provided initial data.
-    pub fn new(data: HashMap<AccessPath, Vec<u8>>) -> Self {
-        FakeDataStore { data }
+    pub fn new(data: HashMap<StateKey, Vec<u8>>) -> Self {
+        FakeDataStore {
+            state_data: data
+                .into_iter()
+                .map(|(k, v)| (k, StateValue::new_legacy(v)))
+                .collect(),
+        }
     }
 
     /// Adds a [`WriteSet`] to this data store.
     pub fn add_write_set(&mut self, write_set: &WriteSet) {
-        for (access_path, write_op) in write_set {
-            match write_op {
-                WriteOp::Value(blob) => {
-                    self.set(access_path.clone(), blob.clone());
-                }
-                WriteOp::Deletion => {
-                    self.remove(access_path);
-                }
-            }
+        for (state_key, write_op) in write_set {
+            match write_op.as_state_value() {
+                None => self.remove(state_key),
+                Some(state_value) => self.set(state_key.clone(), state_value),
+            };
         }
+    }
+
+    /// Sets a `(key, bytes)` pair within this data store. Wraps `bytes` in StateValue::new_legacy().
+    ///
+    /// Returns the previous data if the key was occupied.
+    pub fn set_legacy(&mut self, state_key: StateKey, bytes: Vec<u8>) -> Option<StateValue> {
+        self.state_data
+            .insert(state_key, StateValue::new_legacy(bytes))
     }
 
     /// Sets a (key, value) pair within this data store.
     ///
     /// Returns the previous data if the key was occupied.
-    pub fn set(&mut self, access_path: AccessPath, data_blob: Vec<u8>) -> Option<Vec<u8>> {
-        self.data.insert(access_path, data_blob)
+    pub fn set(&mut self, state_key: StateKey, state_value: StateValue) -> Option<StateValue> {
+        self.state_data.insert(state_key, state_value)
     }
 
     /// Deletes a key from this data store.
     ///
     /// Returns the previous data if the key was occupied.
-    pub fn remove(&mut self, access_path: &AccessPath) -> Option<Vec<u8>> {
-        self.data.remove(access_path)
+    pub fn remove(&mut self, state_key: &StateKey) -> Option<StateValue> {
+        self.state_data.remove(state_key)
     }
 
     /// Adds an [`AccountData`] to this data store.
@@ -83,55 +95,58 @@ impl FakeDataStore {
         self.add_write_set(&write_set)
     }
 
-    /// Adds a [`CompiledModule`] to this data store.
+    /// Adds CoinInfo to this data store.
+    pub fn add_coin_info(&mut self) {
+        let coin_info = CoinInfoResource::random(u128::MAX);
+        let write_set = coin_info.to_writeset().expect("access path in test");
+        self.add_write_set(&write_set)
+    }
+
+    /// Adds a `CompiledModule` to this data store.
     ///
     /// Does not do any sort of verification on the module.
     pub fn add_module(&mut self, module_id: &ModuleId, blob: Vec<u8>) {
         let access_path = AccessPath::from(module_id);
-        self.set(access_path, blob);
-    }
-
-    /// Yields a reference to the internal data structure of the global state
-    pub fn inner(&self) -> &HashMap<AccessPath, Vec<u8>> {
-        &self.data
-    }
-}
-
-impl ConfigStorage for FakeDataStore {
-    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
-        StateView::get(self, &access_path).unwrap_or_default()
+        self.set(
+            StateKey::access_path(access_path),
+            StateValue::new_legacy(blob),
+        );
     }
 }
 
 // This is used by the `execute_block` API.
-// TODO: only the "sync" get is implemented
-impl StateView for FakeDataStore {
-    fn get(&self, access_path: &AccessPath) -> Result<Option<Vec<u8>>> {
-        // Since the data is in-memory, it can't fail.
-        Ok(self.data.get(access_path).cloned())
+impl TStateView for FakeDataStore {
+    type Key = StateKey;
+
+    fn get_state_value(&self, state_key: &StateKey) -> Result<Option<StateValue>> {
+        Ok(self.state_data.get(state_key).cloned())
     }
 
     fn is_genesis(&self) -> bool {
-        self.data.is_empty()
+        self.state_data.is_empty()
+    }
+
+    fn get_usage(&self) -> Result<StateStorageUsage> {
+        let mut usage = StateStorageUsage::new_untracked();
+        for (k, v) in self.state_data.iter() {
+            usage.add_item(k.size() + v.size())
+        }
+        Ok(usage)
+    }
+
+    fn as_in_memory_state_view(&self) -> InMemoryStateView {
+        InMemoryStateView::new(self.state_data.clone())
     }
 }
 
-impl ModuleResolver for FakeDataStore {
-    type Error = VMError;
-
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        RemoteStorage::new(self).get_module(module_id)
-    }
-}
-
-impl ResourceResolver for FakeDataStore {
-    type Error = VMError;
-
-    fn get_resource(
+// This is used by aggregator tests.
+impl TableResolver for FakeDataStore {
+    fn resolve_table_entry(
         &self,
-        address: &AccountAddress,
-        tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        RemoteStorage::new(self).get_resource(address, tag)
+        handle: &TableHandle,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        let state_key = StateKey::table_item(DiemTableHandle::from(*handle), key.to_vec());
+        self.get_state_value_bytes(&state_key)
     }
 }

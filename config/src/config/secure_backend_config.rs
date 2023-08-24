@@ -1,10 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Error;
-use diem_secure_storage::{
-    GitHubStorage, InMemoryStorage, Namespaced, OnDiskStorage, Storage, VaultStorage,
-};
+use diem_secure_storage::{InMemoryStorage, Namespaced, OnDiskStorage, Storage, VaultStorage};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -12,10 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SecureBackend {
-    GitHub(GitHubConfig),
     InMemoryStorage,
     Vault(VaultConfig),
     OnDiskStorage(OnDiskStorageConfig),
@@ -24,44 +22,32 @@ pub enum SecureBackend {
 impl SecureBackend {
     pub fn namespace(&self) -> Option<&str> {
         match self {
-            SecureBackend::GitHub(GitHubConfig { namespace, .. })
-            | SecureBackend::Vault(VaultConfig { namespace, .. })
+            SecureBackend::Vault(VaultConfig { namespace, .. })
             | SecureBackend::OnDiskStorage(OnDiskStorageConfig { namespace, .. }) => {
                 namespace.as_deref()
-            }
+            },
             SecureBackend::InMemoryStorage => None,
         }
     }
 
     pub fn clear_namespace(&mut self) {
         match self {
-            SecureBackend::GitHub(GitHubConfig { namespace, .. })
-            | SecureBackend::Vault(VaultConfig { namespace, .. })
+            SecureBackend::Vault(VaultConfig { namespace, .. })
             | SecureBackend::OnDiskStorage(OnDiskStorageConfig { namespace, .. }) => {
                 *namespace = None;
-            }
-            SecureBackend::InMemoryStorage => {}
+            },
+            SecureBackend::InMemoryStorage => {},
         }
+    }
+
+    /// Returns true iff the backend is in memory
+    pub fn is_in_memory(&self) -> bool {
+        matches!(self, SecureBackend::InMemoryStorage)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct GitHubConfig {
-    /// The owner or account that hosts a repository
-    pub repository_owner: String,
-    /// The repository where storage will mount
-    pub repository: String,
-    /// The branch containing storage, defaults to master
-    pub branch: Option<String>,
-    /// The authorization token for accessing the repository
-    pub token: Token,
-    /// A namespace is an optional portion of the path to a key stored within GitHubConfig. For
-    /// example, a key, S, without a namespace would be available in S, with a namespace, N, it
-    /// would be in N/S.
-    pub namespace: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     /// Optional SSL Certificate for the vault host, this is expected to be a full path.
     pub ca_certificate: Option<PathBuf>,
@@ -95,7 +81,8 @@ impl VaultConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OnDiskStorageConfig {
     // Required path for on disk storage
     pub path: PathBuf,
@@ -108,7 +95,7 @@ pub struct OnDiskStorageConfig {
 }
 
 /// Tokens can either be directly within this config or stored somewhere on disk.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Token {
     FromConfig(String),
@@ -125,12 +112,14 @@ impl Token {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenFromConfig {
     token: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenFromDisk {
     path: PathBuf,
 }
@@ -171,23 +160,6 @@ fn read_file(path: &Path) -> Result<String, Error> {
 impl From<&SecureBackend> for Storage {
     fn from(backend: &SecureBackend) -> Self {
         match backend {
-            SecureBackend::GitHub(config) => {
-                let storage = Storage::from(GitHubStorage::new(
-                    config.repository_owner.clone(),
-                    config.repository.clone(),
-                    config
-                        .branch
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| "master".to_string()),
-                    config.token.read_token().expect("Unable to read token"),
-                ));
-                if let Some(namespace) = &config.namespace {
-                    Storage::from(Namespaced::new(namespace, Box::new(storage)))
-                } else {
-                    storage
-                }
-            }
             SecureBackend::InMemoryStorage => Storage::from(InMemoryStorage::new()),
             SecureBackend::OnDiskStorage(config) => {
                 let storage = Storage::from(OnDiskStorage::new(config.path()));
@@ -196,7 +168,7 @@ impl From<&SecureBackend> for Storage {
                 } else {
                     storage
                 }
-            }
+            },
             SecureBackend::Vault(config) => {
                 let storage = Storage::from(VaultStorage::new(
                     config.server.clone(),
@@ -215,7 +187,7 @@ impl From<&SecureBackend> for Storage {
                 } else {
                     storage
                 }
-            }
+            },
         }
     }
 }
@@ -224,7 +196,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
     struct Config {
         vault: VaultConfig,
     }

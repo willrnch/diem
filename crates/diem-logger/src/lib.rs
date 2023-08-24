@@ -1,14 +1,15 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! This crates provides an API for logging in diem.
+//! This crates provides an API for logging.
 //! # Instrumenting with Logs
 //! ## Basic instrumenting with Logs
 //!
 //! A set of logging macros (`info!`, `error!`, `warn!`, `debug!`, and `trace!`) is provided for
 //! emitting logs at different levels. All of these macros support the addition of providing
 //! structured data along with a formatted text message.  For guidelines on which level to use,
-//! see the [coding guidelines](https://developers.diem.com/docs/core/coding-guidelines#logging).
+//! see the [coding guidelines](https://diem.dev/docs/core/coding-guidelines#logging).
 //!
 //! The below examples do no type checking for structured log fields, and instead just serialize
 //! whatever is given.
@@ -135,16 +136,15 @@
 
 pub mod prelude {
     pub use crate::{
-        debug,
         diem_logger::FileWriter,
-        error, info, sample,
+        debug, error, info, sample,
         sample::{SampleRate, Sampling},
         security::SecurityEvent,
-        trace, warn,
+        spawn_named, trace, warn,
     };
 }
 
-mod diem_logger;
+pub mod diem_logger;
 mod event;
 mod filter;
 mod kv;
@@ -152,21 +152,20 @@ mod logger;
 mod macros;
 mod metadata;
 pub mod sample;
+pub mod telemetry_log_writer;
 pub mod tracing_adapter;
 
 mod security;
-mod struct_log;
 
 pub use crate::diem_logger::{
-    DiemLogger, DiemLogger as Logger, DiemLoggerBuilder, Writer, CHANNEL_SIZE,
+    DiemData as Logger, DiemDataBuilder, LoggerFilterUpdater, Writer, CHANNEL_SIZE,
 };
+pub use diem_log_derive::Schema;
 pub use event::Event;
 pub use filter::{Filter, LevelFilter};
+pub use kv::{Key, KeyValue, Schema, Value, Visitor};
 pub use logger::flush;
 pub use metadata::{Level, Metadata};
-
-pub use diem_log_derive::Schema;
-pub use kv::{Key, KeyValue, Schema, Value, Visitor};
 pub use security::SecurityEvent;
 
 mod counters;

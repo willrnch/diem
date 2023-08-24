@@ -1,9 +1,10 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_infallible::{Mutex, RwLock};
 use diem_logger::debug;
-use diem_metrics::HistogramVec;
+use diem_metrics_core::HistogramVec;
 use std::{cmp::min, collections::HashMap, fmt::Debug, hash::Hash, sync::Arc, time::Instant};
 use tokio::time::Duration;
 
@@ -116,11 +117,13 @@ impl<Key: Eq + Hash + Clone + Debug> TokenBucketRateLimiter<Key> {
     /// Retrieve bucket, or create a new one
     pub fn bucket(&self, key: Key) -> SharedBucket {
         self.bucket_inner(key, |label, log_info, key, initial, size, rate, metrics| {
-            Arc::new(Mutex::new(if self.enabled {
-                Bucket::new(label, log_info, key, initial, size, rate, metrics)
-            } else {
-                Bucket::open(label)
-            }))
+            Arc::new(Mutex::new(
+                if self.enabled {
+                    Bucket::new(label, log_info, key, initial, size, rate, metrics)
+                } else {
+                    Bucket::open(label)
+                },
+            ))
         })
     }
 

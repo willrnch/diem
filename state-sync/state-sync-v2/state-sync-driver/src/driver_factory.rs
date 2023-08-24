@@ -1,27 +1,31 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     driver::{DriverConfiguration, StateSyncDriver},
     driver_client::{ClientNotificationListener, DriverClient, DriverNotification},
+    metadata_storage::MetadataStorageInterface,
     notification_handlers::{
         CommitNotificationListener, ConsensusNotificationHandler, ErrorNotificationListener,
         MempoolNotificationHandler,
     },
     storage_synchronizer::StorageSynchronizer,
 };
-use consensus_notifications::ConsensusNotificationListener;
-use data_streaming_service::streaming_client::StreamingServiceClient;
 use diem_config::config::NodeConfig;
-use diem_data_client::diemnet::DiemNetDataClient;
-use diem_types::waypoint::Waypoint;
-use event_notifications::EventSubscriptionService;
-use executor_types::ChunkExecutorTrait;
-use futures::channel::mpsc;
-use mempool_notifications::MempoolNotificationSender;
+use diem_consensus_notifications::ConsensusNotificationListener;
+use diem_data_client::client::DiemDataClient;
+use diem_data_streaming_service::streaming_client::StreamingServiceClient;
+use diem_event_notifications::{EventNotificationSender, EventSubscriptionService};
+use diem_executor_types::ChunkExecutorTrait;
+use diem_infallible::Mutex;
+use diem_mempool_notifications::MempoolNotificationSender;
+use diem_storage_interface::DbReaderWriter;
+use diem_time_service::TimeService;
+use diem_types::{move_resource::MoveStorage, waypoint::Waypoint};
+use futures::{channel::mpsc, executor::block_on};
 use std::sync::Arc;
-use storage_interface::DbReader;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 
 /// Creates a new state sync driver and client
 pub struct DriverFactory {
@@ -34,18 +38,36 @@ impl DriverFactory {
     pub fn create_and_spawn_driver<
         ChunkExecutor: ChunkExecutorTrait + 'static,
         MempoolNotifier: MempoolNotificationSender + 'static,
+        MetadataStorage: MetadataStorageInterface + Clone + Send + Sync + 'static,
     >(
         create_runtime: bool,
         node_config: &NodeConfig,
         waypoint: Waypoint,
-        storage: Arc<dyn DbReader>,
+        storage: DbReaderWriter,
         chunk_executor: Arc<ChunkExecutor>,
         mempool_notification_sender: MempoolNotifier,
+        metadata_storage: MetadataStorage,
         consensus_listener: ConsensusNotificationListener,
-        event_subscription_service: EventSubscriptionService,
-        diem_data_client: DiemNetDataClient,
+        mut event_subscription_service: EventSubscriptionService,
+        diem_data_client: DiemDataClient,
         streaming_service_client: StreamingServiceClient,
+        time_service: TimeService,
     ) -> Self {
+        // Notify subscribers of the initial on-chain config values
+        match (&*storage.reader).fetch_latest_state_checkpoint_version() {
+            Ok(synced_version) => {
+                if let Err(error) =
+                    event_subscription_service.notify_initial_configs(synced_version)
+                {
+                    panic!(
+                        "Failed to notify subscribers of initial on-chain configs: {:?}",
+                        error
+                    )
+                }
+            },
+            Err(error) => panic!("Failed to fetch the initial synced version: {:?}", error),
+        }
+
         // Create the notification handlers
         let (client_notification_sender, client_notification_receiver) = mpsc::unbounded();
         let client_notification_listener =
@@ -55,27 +77,33 @@ impl DriverFactory {
         let consensus_notification_handler = ConsensusNotificationHandler::new(consensus_listener);
         let (error_notification_sender, error_notification_listener) =
             ErrorNotificationListener::new();
-        let mempool_notification_handler =
-            MempoolNotificationHandler::new(mempool_notification_sender);
+        let mempool_notification_handler = MempoolNotificationHandler::new(
+            mempool_notification_sender,
+            node_config
+                .state_sync
+                .state_sync_driver
+                .mempool_commit_ack_timeout_ms,
+        );
 
         // Create a new runtime (if required)
         let driver_runtime = if create_runtime {
-            Some(
-                Builder::new_multi_thread()
-                    .thread_name("state-sync-driver")
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create state sync v2 driver runtime!"),
-            )
+            let runtime = diem_runtimes::spawn_named_runtime("sync-driver".into(), None);
+            Some(runtime)
         } else {
             None
         };
 
         // Create the storage synchronizer
-        let storage_synchronizer = StorageSynchronizer::new(
+        let event_subscription_service = Arc::new(Mutex::new(event_subscription_service));
+        let (storage_synchronizer, _, _) = StorageSynchronizer::new(
+            node_config.state_sync.state_sync_driver,
             chunk_executor,
             commit_notification_sender,
             error_notification_sender,
+            event_subscription_service.clone(),
+            mempool_notification_handler.clone(),
+            metadata_storage.clone(),
+            storage.clone(),
             driver_runtime.as_ref(),
         );
 
@@ -95,10 +123,12 @@ impl DriverFactory {
             error_notification_listener,
             event_subscription_service,
             mempool_notification_handler,
+            metadata_storage,
             storage_synchronizer,
             diem_data_client,
             streaming_service_client,
-            storage,
+            storage.reader,
+            time_service,
         );
 
         // Spawn the driver
@@ -117,5 +147,37 @@ impl DriverFactory {
     /// Returns a new client that can be used to communicate with the driver
     pub fn create_driver_client(&self) -> DriverClient {
         DriverClient::new(self.client_notification_sender.clone())
+    }
+}
+
+/// A struct for holding the various runtimes required by state sync v2.
+/// Note: it's useful to maintain separate runtimes because the logger
+/// can prepend all logs with the runtime thread name.
+pub struct StateSyncRuntimes {
+    _diem_data_client: Runtime,
+    state_sync: DriverFactory,
+    _storage_service: Runtime,
+    _streaming_service: Runtime,
+}
+
+impl StateSyncRuntimes {
+    pub fn new(
+        diem_data_client: Runtime,
+        state_sync: DriverFactory,
+        storage_service: Runtime,
+        streaming_service: Runtime,
+    ) -> Self {
+        Self {
+            _diem_data_client: diem_data_client,
+            state_sync,
+            _storage_service: storage_service,
+            _streaming_service: streaming_service,
+        }
+    }
+
+    pub fn block_until_initialized(&self) {
+        let state_sync_client = self.state_sync.create_driver_client();
+        block_on(state_sync_client.notify_once_bootstrapped())
+            .expect("State sync v2 initialization failure");
     }
 }

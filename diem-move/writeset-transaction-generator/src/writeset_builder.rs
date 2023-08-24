@@ -1,27 +1,36 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::format_err;
+use diem_crypto::HashValue;
+use diem_gas::{
+    AbstractValueSizeGasParameters, ChangeSetConfigs, NativeGasParameters,
+    LATEST_GAS_FEATURE_VERSION,
+};
 use diem_state_view::StateView;
 use diem_types::{
     account_address::AccountAddress,
-    account_config::{self, diem_root_address},
+    account_config::{self, diem_test_root_address},
+    on_chain_config::{Features, TimedFeatures},
     transaction::{ChangeSet, Script, Version},
 };
-use diem_vm::{convert_changeset_and_events, data_cache::RemoteStorage};
+use diem_vm::{
+    data_cache::StorageAdapter,
+    move_vm_ext::{MoveVmExt, SessionExt, SessionId},
+};
 use move_core_types::{
     identifier::Identifier,
     language_storage::{ModuleId, TypeTag},
-    resolver::MoveResolver,
     transaction_argument::convert_txn_args,
     value::{serialize_values, MoveValue},
 };
-use move_vm_runtime::{move_vm::MoveVM, session::Session};
-use move_vm_types::gas_schedule::GasStatus;
+use move_vm_runtime::session::SerializedReturnValues;
+use move_vm_types::gas::UnmeteredGasMeter;
 
-pub struct GenesisSession<'r, 'l, S>(Session<'r, 'l, S>);
+pub struct GenesisSession<'r, 'l>(SessionExt<'r, 'l>);
 
-impl<'r, 'l, S: MoveResolver> GenesisSession<'r, 'l, S> {
+impl<'r, 'l> GenesisSession<'r, 'l> {
     pub fn exec_func(
         &mut self,
         module_name: &str,
@@ -30,7 +39,7 @@ impl<'r, 'l, S: MoveResolver> GenesisSession<'r, 'l, S> {
         args: Vec<Vec<u8>>,
     ) {
         self.0
-            .execute_function(
+            .execute_function_bypass_visibility(
                 &ModuleId::new(
                     account_config::CORE_CODE_ADDRESS,
                     Identifier::new(module_name).unwrap(),
@@ -38,7 +47,7 @@ impl<'r, 'l, S: MoveResolver> GenesisSession<'r, 'l, S> {
                 &Identifier::new(function_name).unwrap(),
                 ty_args,
                 args,
-                &mut GasStatus::new_unmetered(),
+                &mut UnmeteredGasMeter,
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -50,69 +59,92 @@ impl<'r, 'l, S: MoveResolver> GenesisSession<'r, 'l, S> {
             });
     }
 
-    pub fn exec_script(&mut self, sender: AccountAddress, script: &Script) {
+    pub fn exec_script(
+        &mut self,
+        sender: AccountAddress,
+        script: &Script,
+    ) -> SerializedReturnValues {
+        let mut temp = vec![sender.to_vec()];
+        temp.extend(convert_txn_args(script.args()));
         self.0
             .execute_script(
                 script.code().to_vec(),
                 script.ty_args().to_vec(),
-                convert_txn_args(script.args()),
-                vec![sender],
-                &mut GasStatus::new_unmetered(),
+                temp,
+                &mut UnmeteredGasMeter,
             )
             .unwrap()
     }
 
     fn disable_reconfiguration(&mut self) {
         self.exec_func(
-            "DiemConfig",
+            "Reconfiguration",
             "disable_reconfiguration",
             vec![],
-            serialize_values(&vec![MoveValue::Signer(diem_root_address())]),
+            serialize_values(&vec![MoveValue::Signer(diem_test_root_address())]),
         )
     }
 
     fn enable_reconfiguration(&mut self) {
         self.exec_func(
-            "DiemConfig",
+            "Reconfiguration",
             "enable_reconfiguration",
             vec![],
-            serialize_values(&vec![MoveValue::Signer(diem_root_address())]),
+            serialize_values(&vec![MoveValue::Signer(diem_test_root_address())]),
         )
     }
+
     pub fn set_diem_version(&mut self, version: Version) {
         self.exec_func(
             "DiemVersion",
-            "set",
+            "set_version",
             vec![],
             serialize_values(&vec![
-                MoveValue::Signer(diem_root_address()),
+                MoveValue::Signer(diem_test_root_address()),
                 MoveValue::U64(version),
             ]),
         )
     }
 }
 
-pub fn build_changeset<S: StateView, F>(state_view: &S, procedure: F) -> ChangeSet
+pub fn build_changeset<S: StateView, F>(state_view: &S, procedure: F, chain_id: u8) -> ChangeSet
 where
-    F: FnOnce(&mut GenesisSession<RemoteStorage<S>>),
+    F: FnOnce(&mut GenesisSession),
 {
-    let move_vm = MoveVM::new(diem_vm::natives::diem_natives()).unwrap();
-    let (changeset, events) = {
-        let state_view_storage = RemoteStorage::new(state_view);
-        let mut session = GenesisSession(move_vm.new_session(&state_view_storage));
+    let move_vm = MoveVmExt::new(
+        NativeGasParameters::zeros(),
+        AbstractValueSizeGasParameters::zeros(),
+        LATEST_GAS_FEATURE_VERSION,
+        chain_id,
+        Features::default(),
+        TimedFeatures::enable_all(),
+    )
+    .unwrap();
+    let state_view_storage = StorageAdapter::new(state_view);
+    let change_set = {
+        // TODO: specify an id by human and pass that in.
+        let genesis_id = HashValue::zero();
+        let mut session = GenesisSession(move_vm.new_session(
+            &state_view_storage,
+            SessionId::genesis(genesis_id),
+            true,
+        ));
         session.disable_reconfiguration();
         procedure(&mut session);
         session.enable_reconfiguration();
         session
             .0
-            .finish()
+            .finish(
+                &mut (),
+                &ChangeSetConfigs::unlimited_at_gas_feature_version(LATEST_GAS_FEATURE_VERSION),
+            )
             .map_err(|err| format_err!("Unexpected VM Error: {:?}", err))
             .unwrap()
     };
 
-    let (writeset, events) = convert_changeset_and_events(changeset, events)
-        .map_err(|err| format_err!("Unexpected VM Error: {:?}", err))
-        .unwrap();
+    // Genesis never produces the delta change set.
+    assert!(change_set.delta_change_set().is_empty());
 
-    ChangeSet::new(writeset, events)
+    let (write_set, _delta_change_set, events) = change_set.unpack();
+    ChangeSet::new(write_set, events)
 }

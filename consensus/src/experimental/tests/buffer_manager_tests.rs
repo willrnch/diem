@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -16,22 +17,30 @@ use crate::{
     },
     metrics_safety_rules::MetricsSafetyRules,
     network::NetworkSender,
-    network_interface::{ConsensusMsg, ConsensusNetworkSender},
+    network_interface::{ConsensusMsg, ConsensusNetworkClient, DIRECT_SEND, RPC},
     round_manager::{UnverifiedEvent, VerifiedEvent},
     test_utils::{
         consensus_runtime, timed_block_on, EmptyStateComputer, MockStorage,
         RandomComputeResultStateComputer,
     },
 };
-use channel::{diem_channel, message_queues::QueueStyle};
-use consensus_types::{
+use diem_channels::{diem_channel, message_queues::QueueStyle};
+use diem_config::network_id::NetworkId;
+use diem_consensus_types::{
     block::block_test_utils::certificate_for_genesis, executed_block::ExecutedBlock,
-    vote_proposal::MaybeSignedVoteProposal,
+    vote_proposal::VoteProposal,
 };
-use diem_crypto::{
-    ed25519::Ed25519PrivateKey, hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue, Uniform,
-};
+use diem_crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue};
 use diem_infallible::Mutex;
+use diem_network::{
+    application::{interface::NetworkClient, storage::PeersAndMetadata},
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::{
+        network,
+        network::{Event, NewNetworkSender},
+    },
+};
+use diem_safety_rules::{PersistentSafetyStorage, SafetyRulesManager};
 use diem_secure_storage::Storage;
 use diem_types::{
     account_address::AccountAddress,
@@ -42,12 +51,8 @@ use diem_types::{
 };
 use futures::{channel::oneshot, FutureExt, SinkExt, StreamExt};
 use itertools::enumerate;
-use network::{
-    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
-    protocols::network::{Event, NewNetworkSender},
-};
-use safety_rules::{PersistentSafetyStorage, SafetyRulesManager};
-use std::{sync::Arc, thread::sleep, time::Duration};
+use maplit::hashmap;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 pub fn prepare_buffer_manager() -> (
@@ -55,7 +60,7 @@ pub fn prepare_buffer_manager() -> (
     Sender<OrderedBlocks>,
     Sender<ResetRequest>,
     diem_channel::Sender<AccountAddress, VerifiedEvent>,
-    channel::Receiver<Event<ConsensusMsg>>,
+    diem_channels::Receiver<Event<ConsensusMsg>>,
     PipelinePhase<ExecutionPhase>,
     PipelinePhase<SigningPhase>,
     PipelinePhase<PersistingPhase>,
@@ -79,27 +84,37 @@ pub fn prepare_buffer_manager() -> (
         Storage::from(diem_secure_storage::InMemoryStorage::new()),
         signer.author(),
         signer.private_key().clone(),
-        Ed25519PrivateKey::generate_for_testing(),
         waypoint,
         true,
     );
     let (_, storage) = MockStorage::start_for_testing((&validators).into());
 
-    let safety_rules_manager = SafetyRulesManager::new_local(safety_storage, false, false);
+    let safety_rules_manager = SafetyRulesManager::new_local(safety_storage);
 
     let mut safety_rules = MetricsSafetyRules::new(safety_rules_manager.client(), storage);
     safety_rules.perform_initialize().unwrap();
 
     let (network_reqs_tx, _network_reqs_rx) = diem_channel::new(QueueStyle::FIFO, 8, None);
     let (connection_reqs_tx, _) = diem_channel::new(QueueStyle::FIFO, 8, None);
-
-    let network_sender = ConsensusNetworkSender::new(
+    let network_sender = network::NetworkSender::new(
         PeerManagerRequestSender::new(network_reqs_tx),
         ConnectionRequestSender::new(connection_reqs_tx),
     );
+    let network_client = NetworkClient::new(
+        DIRECT_SEND.into(),
+        RPC.into(),
+        hashmap! {NetworkId::Validator => network_sender},
+        PeersAndMetadata::new(&[NetworkId::Validator]),
+    );
+    let consensus_network_client = ConsensusNetworkClient::new(network_client);
 
-    let (self_loop_tx, self_loop_rx) = channel::new_test(1000);
-    let network = NetworkSender::new(author, network_sender, self_loop_tx, validators.clone());
+    let (self_loop_tx, self_loop_rx) = diem_channels::new_test(1000);
+    let network = NetworkSender::new(
+        author,
+        consensus_network_client,
+        self_loop_tx,
+        validators.clone(),
+    );
 
     let (msg_tx, msg_rx) =
         diem_channel::new::<AccountAddress, VerifiedEvent>(QueueStyle::FIFO, channel_size, None);
@@ -156,7 +171,7 @@ pub fn launch_buffer_manager() -> (
     Sender<OrderedBlocks>,
     Sender<ResetRequest>,
     diem_channel::Sender<AccountAddress, VerifiedEvent>,
-    channel::Receiver<Event<ConsensusMsg>>,
+    diem_channels::Receiver<Event<ConsensusMsg>>,
     HashValue,
     Runtime,
     Vec<ValidatorSigner>,
@@ -199,19 +214,26 @@ pub fn launch_buffer_manager() -> (
 }
 
 async fn loopback_commit_vote(
-    self_loop_rx: &mut channel::Receiver<Event<ConsensusMsg>>,
+    self_loop_rx: &mut diem_channels::Receiver<Event<ConsensusMsg>>,
     msg_tx: &diem_channel::Sender<AccountAddress, VerifiedEvent>,
     verifier: &ValidatorVerifier,
 ) {
     match self_loop_rx.next().await {
         Some(Event::Message(author, msg)) => {
-            let event: UnverifiedEvent = msg.into();
-            // verify the message and send the message into self loop
-            msg_tx.push(author, event.verify(verifier).unwrap()).ok();
-        }
+            if matches!(msg, ConsensusMsg::CommitVoteMsg(_)) {
+                let event: UnverifiedEvent = msg.into();
+                // verify the message and send the message into self loop
+                msg_tx
+                    .push(
+                        author,
+                        event.verify(author, verifier, false, false, 100).unwrap(),
+                    )
+                    .ok();
+            }
+        },
         _ => {
             panic!("We are expecting a commit vote message.");
-        }
+        },
     };
 }
 
@@ -238,7 +260,7 @@ fn buffer_manager_happy_path_test() {
         msg_tx,
         mut self_loop_rx,
         _hash_val,
-        mut runtime,
+        runtime,
         signers,
         mut result_rx,
         verifier,
@@ -251,7 +273,7 @@ fn buffer_manager_happy_path_test() {
 
     let mut batches = vec![];
     let mut proofs = vec![];
-    let mut last_proposal: Option<MaybeSignedVoteProposal> = None;
+    let mut last_proposal: Option<VoteProposal> = None;
 
     for _ in 0..num_batches {
         let (vecblocks, li_sig, proposal) = prepare_executed_blocks_with_ledger_info(
@@ -269,7 +291,7 @@ fn buffer_manager_happy_path_test() {
         last_proposal = Some(proposal.last().unwrap().clone());
     }
 
-    timed_block_on(&mut runtime, async move {
+    timed_block_on(&runtime, async move {
         for i in 0..num_batches {
             block_tx
                 .send(OrderedBlocks {
@@ -281,7 +303,8 @@ fn buffer_manager_happy_path_test() {
                 .ok();
         }
 
-        for _ in 0..3 {
+        // commit decision will be sent too, so 3 * 2
+        for _ in 0..6 {
             loopback_commit_vote(&mut self_loop_rx, &msg_tx, &verifier).await;
         }
 
@@ -299,20 +322,20 @@ fn buffer_manager_sync_test() {
         msg_tx,
         mut self_loop_rx,
         _hash_val,
-        mut runtime,
+        runtime,
         signers,
         mut result_rx,
         verifier,
     ) = launch_buffer_manager();
 
     let genesis_qc = certificate_for_genesis();
-    let num_batches = 5;
+    let num_batches = 100;
     let blocks_per_batch = 5;
     let mut init_round = 0;
 
     let mut batches = vec![];
     let mut proofs = vec![];
-    let mut last_proposal: Option<MaybeSignedVoteProposal> = None;
+    let mut last_proposal: Option<VoteProposal> = None;
 
     for _ in 0..num_batches {
         let (vecblocks, li_sig, proposal) = prepare_executed_blocks_with_ledger_info(
@@ -330,15 +353,10 @@ fn buffer_manager_sync_test() {
         last_proposal = Some(proposal.last().unwrap().clone());
     }
 
-    // message proxy
-    runtime.spawn(async move {
-        loop {
-            loopback_commit_vote(&mut self_loop_rx, &msg_tx, &verifier).await;
-        }
-    });
+    let dropped_batches = 42;
 
-    timed_block_on(&mut runtime, async move {
-        for i in 0..2 {
+    timed_block_on(&runtime, async move {
+        for i in 0..dropped_batches {
             block_tx
                 .send(OrderedBlocks {
                     ordered_blocks: batches[i].clone(),
@@ -348,9 +366,6 @@ fn buffer_manager_sync_test() {
                 .await
                 .ok();
         }
-
-        // make sure the messages are processed
-        sleep(Duration::from_millis(100));
 
         // reset
         let (tx, rx) = oneshot::channel::<ResetAck>();
@@ -358,7 +373,14 @@ fn buffer_manager_sync_test() {
         reset_tx.send(ResetRequest { tx, stop: false }).await.ok();
         rx.await.ok();
 
-        for i in 2..num_batches {
+        // start sending back commit vote after reset, to avoid [0..dropped_batches] being sent to result_rx
+        tokio::spawn(async move {
+            loop {
+                loopback_commit_vote(&mut self_loop_rx, &msg_tx, &verifier).await;
+            }
+        });
+
+        for i in dropped_batches..num_batches {
             block_tx
                 .send(OrderedBlocks {
                     ordered_blocks: batches[i].clone(),
@@ -369,8 +391,8 @@ fn buffer_manager_sync_test() {
                 .ok();
         }
 
-        // we should only see batches[0..num_batches]
-        assert_results(batches.drain(..2).collect(), &mut result_rx).await;
+        // we should only see batches[dropped_batches..num_batches]
+        assert_results(batches.drain(dropped_batches..).collect(), &mut result_rx).await;
 
         assert!(matches!(result_rx.next().now_or_never(), None));
     });

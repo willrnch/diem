@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -59,15 +60,17 @@
 mod tests;
 pub use shared_mempool::{
     bootstrap, network,
+    network::MempoolSyncMsg,
     types::{
-        ConsensusRequest, ConsensusResponse, MempoolClientRequest, MempoolClientSender,
-        MempoolEventsReceiver, SubmissionStatus, TransactionSummary,
+        MempoolClientRequest, MempoolClientSender, MempoolEventsReceiver, QuorumStoreRequest,
+        QuorumStoreResponse, SubmissionStatus,
     },
 };
 #[cfg(any(test, feature = "fuzzing"))]
 pub use tests::{fuzzing, mocks};
 
 mod core_mempool;
-mod counters;
+pub mod counters;
 mod logging;
 mod shared_mempool;
+pub(crate) mod thread_pool;

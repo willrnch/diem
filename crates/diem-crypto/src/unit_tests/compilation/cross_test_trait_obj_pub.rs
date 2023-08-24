@@ -1,4 +1,4 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_crypto::traits::*;

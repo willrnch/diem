@@ -1,45 +1,45 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{MempoolError, StateSyncError};
+use crate::{
+    error::{QuorumStoreError, StateSyncError},
+    payload_manager::PayloadManager,
+    transaction_deduper::TransactionDeduper,
+    transaction_shuffler::TransactionShuffler,
+};
 use anyhow::Result;
-use consensus_types::{block::Block, common::Payload, executed_block::ExecutedBlock};
+use diem_consensus_types::{
+    block::Block,
+    common::{Payload, PayloadFilter},
+    executed_block::ExecutedBlock,
+};
 use diem_crypto::HashValue;
-use diem_types::ledger_info::LedgerInfoWithSignatures;
-use executor_types::{Error as ExecutionError, StateComputeResult};
+use diem_executor_types::{Error as ExecutionError, StateComputeResult};
+use diem_types::{epoch_state::EpochState, ledger_info::LedgerInfoWithSignatures};
 use futures::future::BoxFuture;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 pub type StateComputerCommitCallBackType =
     Box<dyn FnOnce(&[Arc<ExecutedBlock>], LedgerInfoWithSignatures) + Send + Sync>;
 
-/// Retrieves and updates the status of transactions on demand (e.g., via talking with Mempool)
+/// Clients can pull information about transactions from the mempool and return
+/// the retrieved information as a `Payload`.
 #[async_trait::async_trait]
-pub trait TxnManager: Send + Sync {
-    /// Brings new transactions to be applied.
-    /// The `exclude_txns` list includes the transactions that are already pending in the
-    /// branch of blocks consensus is trying to extend.
-    ///
-    /// wait_callback is executed when there's no transactions available and it decides to wait.
-    /// pending_ordering indicates if we should long poll mempool or propose empty blocks to help commit pending txns
-    async fn pull_txns(
+pub trait PayloadClient: Send + Sync {
+    async fn pull_payload(
         &self,
-        max_size: u64,
-        exclude: Vec<&Payload>,
+        max_poll_time: Duration,
+        max_items: u64,
+        max_bytes: u64,
+        exclude: PayloadFilter,
         wait_callback: BoxFuture<'static, ()>,
         pending_ordering: bool,
-    ) -> Result<Payload, MempoolError>;
+        pending_uncommitted_blocks: usize,
+        recent_max_fill_fraction: f32,
+    ) -> Result<Payload, QuorumStoreError>;
 
-    /// Notifies TxnManager about the txns which failed execution. (Committed txns is notified by
-    /// state sync.)
-    async fn notify_failed_txn(
-        &self,
-        block: &Block,
-        compute_result: &StateComputeResult,
-    ) -> Result<(), MempoolError>;
-
-    /// Helper to trace transactions after block is generated
-    fn trace_transactions(&self, _block: &Block) {}
+    fn trace_payloads(&self) {}
 }
 
 /// While Consensus is managing proposed blocks, `StateComputer` is managing the results of the
@@ -71,4 +71,17 @@ pub trait StateComputer: Send + Sync {
     /// In case of failure (`Result::Error`) the LI of storage remains unchanged, and the validator
     /// can assume there were no modifications to the storage made.
     async fn sync_to(&self, target: LedgerInfoWithSignatures) -> Result<(), StateSyncError>;
+
+    // Reconfigure to execute transactions for a new epoch.
+    fn new_epoch(
+        &self,
+        epoch_state: &EpochState,
+        payload_manager: Arc<PayloadManager>,
+        transaction_shuffler: Arc<dyn TransactionShuffler>,
+        block_gas_limit: Option<u64>,
+        transaction_deduper: Arc<dyn TransactionDeduper>,
+    );
+
+    // Reconfigure to clear epoch state at end of epoch.
+    fn end_epoch(&self);
 }

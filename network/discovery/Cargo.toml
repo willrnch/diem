@@ -1,39 +1,40 @@
 [package]
-name = "network-discovery"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-network-discovery"
 description = "Diem Network Peer Discovery"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-futures = "0.3.12"
-once_cell = "1.7.2"
-serde_yaml = "0.8.17"
-tokio = { version = "1.8.1", features = ["full"] }
-
-channel = {path = "../../crates/channel"}
-bcs = "0.1.2"
-event-notifications = { path = "../../state-sync/inter-component/event-notifications" }
-diem-config = { path = "../../config"}
-diem-crypto = {path = "../../crates/diem-crypto"}
-diem-logger = {path = "../../crates/diem-logger"}
-diem-metrics = {path = "../../crates/diem-metrics"}
-diem-time-service = {path = "../../crates/diem-time-service"}
-diem-secure-storage = { path = "../../secure/storage" }
-diem-network-address-encryption = {path = "../../config/management/network-address-encryption"}
-diem-types = {path = "../../types"}
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
-network = {path = "../../network"}
-short-hex-str = { path = "../../crates/short-hex-str" }
+anyhow = { workspace = true }
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-event-notifications = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-network = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-secure-storage = { workspace = true }
+diem-short-hex-str = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-diem-config = { path = "../../config", features = ["testing"]}
-diem-temppath = { path = "../../crates/diem-temppath" }
-netcore = { path = "../netcore", features = ["fuzzing"] }
-rand = "0.8.3"
+diem-config = { workspace = true, features = ["testing"] }
+diem-netcore = { workspace = true, features = ["fuzzing"] }
+diem-temppath = { workspace = true }
+rand = { workspace = true }

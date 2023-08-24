@@ -1,8 +1,25 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_metrics::{register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec};
+use diem_metrics_core::{
+    exponential_buckets, register_histogram_vec, register_int_counter_vec, HistogramVec,
+    IntCounterVec,
+};
 use once_cell::sync::Lazy;
+
+pub static DIEM_SCHEMADB_SEEK_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        // metric name
+        "diem_schemadb_seek_latency_seconds",
+        // metric description
+        "Diem schemadb seek latency in seconds",
+        // metric labels (dimensions)
+        &["cf_name", "tag"],
+        exponential_buckets(/*start=*/ 1e-6, /*factor=*/ 2.0, /*count=*/ 22).unwrap(),
+    )
+    .unwrap()
+});
 
 pub static DIEM_SCHEMADB_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
@@ -11,7 +28,8 @@ pub static DIEM_SCHEMADB_ITER_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(||
         // metric description
         "Diem schemadb iter latency in seconds",
         // metric labels (dimensions)
-        &["cf_name"]
+        &["cf_name"],
+        exponential_buckets(/*start=*/ 1e-6, /*factor=*/ 2.0, /*count=*/ 22).unwrap(),
     )
     .unwrap()
 });
@@ -21,7 +39,7 @@ pub static DIEM_SCHEMADB_ITER_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
         // metric name
         "diem_schemadb_iter_bytes",
         // metric description
-        "Diem schemadb iter size in bytess",
+        "Diem schemadb iter size in bytes",
         // metric labels (dimensions)
         &["cf_name"]
     )
@@ -35,7 +53,8 @@ pub static DIEM_SCHEMADB_GET_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::new(|| 
         // metric description
         "Diem schemadb get latency in seconds",
         // metric labels (dimensions)
-        &["cf_name"]
+        &["cf_name"],
+        exponential_buckets(/*start=*/ 1e-6, /*factor=*/ 2.0, /*count=*/ 22).unwrap(),
     )
     .unwrap()
 });
@@ -59,7 +78,8 @@ pub static DIEM_SCHEMADB_BATCH_COMMIT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy
         // metric description
         "Diem schemadb schema batch commit latency in seconds",
         // metric labels (dimensions)
-        &["db_name"]
+        &["db_name"],
+        exponential_buckets(/*start=*/ 1e-3, /*factor=*/ 2.0, /*count=*/ 20).unwrap(),
     )
     .unwrap()
 });
@@ -89,11 +109,9 @@ pub static DIEM_SCHEMADB_PUT_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
 });
 
 pub static DIEM_SCHEMADB_DELETES: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "diem_storage_deletes",
-        "Diem storage delete calls",
-        &["cf_name"]
-    )
+    register_int_counter_vec!("diem_storage_deletes", "Diem storage delete calls", &[
+        "cf_name"
+    ])
     .unwrap()
 });
 
@@ -104,7 +122,8 @@ pub static DIEM_SCHEMADB_BATCH_PUT_LATENCY_SECONDS: Lazy<HistogramVec> = Lazy::n
         // metric description
         "Diem schemadb schema batch put latency in seconds",
         // metric labels (dimensions)
-        &["db_name"]
+        &["db_name"],
+        exponential_buckets(/*start=*/ 1e-3, /*factor=*/ 2.0, /*count=*/ 20).unwrap(),
     )
     .unwrap()
 });

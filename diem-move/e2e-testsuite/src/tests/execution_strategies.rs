@@ -1,8 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_types::{account_config, transaction::SignedTransaction, vm_status::VMStatus};
-use language_e2e_tests::{
+use diem_language_e2e_tests::{
     account::Account,
     common_transactions::create_account_txn,
     execution_strategies::{
@@ -16,17 +16,12 @@ use language_e2e_tests::{
         types::Executor,
     },
 };
+use diem_types::{transaction::SignedTransaction, vm_status::VMStatus};
 
 fn txn(seq_num: u64) -> SignedTransaction {
     let account = Account::new();
     let diem_root = Account::new_diem_root();
-    create_account_txn(
-        &diem_root,
-        &account,
-        seq_num + 1,
-        0,
-        account_config::xus_tag(),
-    )
+    create_account_txn(&diem_root, &account, seq_num + 1)
 }
 
 #[test]

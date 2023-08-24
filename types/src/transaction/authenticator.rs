@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -11,7 +12,6 @@ use diem_crypto::{
     hash::CryptoHash,
     multi_ed25519::{MultiEd25519PublicKey, MultiEd25519Signature},
     traits::Signature,
-    validatable::Validatable,
     CryptoMaterialError, HashValue, ValidCryptoMaterial, ValidCryptoMaterialStringExt,
 };
 use diem_crypto_derive::{CryptoHasher, DeserializeKey, SerializeKey};
@@ -39,12 +39,11 @@ pub enum AuthenticationError {
 /// the transaction hash is well-formed and whether the sha3 hash of the
 /// `AccountAuthenticator`'s `AuthenticationKeyPreimage` matches the `AuthenticationKey` stored
 /// under the participating signer's account address.
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum TransactionAuthenticator {
     /// Single signature
     Ed25519 {
-        public_key: Validatable<Ed25519PublicKey>,
+        public_key: Ed25519PublicKey,
         signature: Ed25519Signature,
     },
     /// K-of-N multisignature
@@ -58,14 +57,39 @@ pub enum TransactionAuthenticator {
         secondary_signer_addresses: Vec<AccountAddress>,
         secondary_signers: Vec<AccountAuthenticator>,
     },
+    /// Optional Multi-agent transaction with a fee payer.
+    FeePayer {
+        sender: AccountAuthenticator,
+        secondary_signer_addresses: Vec<AccountAddress>,
+        secondary_signers: Vec<AccountAuthenticator>,
+        fee_payer_address: AccountAddress,
+        fee_payer_signer: AccountAuthenticator,
+    },
 }
 
 impl TransactionAuthenticator {
     /// Create a single-signature ed25519 authenticator
     pub fn ed25519(public_key: Ed25519PublicKey, signature: Ed25519Signature) -> Self {
         Self::Ed25519 {
-            public_key: Validatable::new_valid(public_key),
+            public_key,
             signature,
+        }
+    }
+
+    /// Create a (optional) multi-agent fee payer authenticator
+    pub fn fee_payer(
+        sender: AccountAuthenticator,
+        secondary_signer_addresses: Vec<AccountAddress>,
+        secondary_signers: Vec<AccountAuthenticator>,
+        fee_payer_address: AccountAddress,
+        fee_payer_signer: AccountAuthenticator,
+    ) -> Self {
+        Self::FeePayer {
+            sender,
+            secondary_signer_addresses,
+            secondary_signers,
+            fee_payer_address,
+            fee_payer_signer,
         }
     }
 
@@ -108,7 +132,28 @@ impl TransactionAuthenticator {
             Self::Ed25519 {
                 public_key,
                 signature,
-            } => signature.verify(raw_txn, public_key.validate()?),
+            } => signature.verify(raw_txn, public_key),
+            Self::FeePayer {
+                sender,
+                secondary_signer_addresses,
+                secondary_signers,
+                fee_payer_address,
+                fee_payer_signer,
+            } => {
+                // We need to include the fee payer and other signer addresses in the payload data
+                // to sign.
+                let message = RawTransactionWithData::new_fee_payer(
+                    raw_txn.clone(),
+                    secondary_signer_addresses.clone(),
+                    *fee_payer_address,
+                );
+                sender.verify(&message)?;
+                for signer in secondary_signers {
+                    signer.verify(&message)?;
+                }
+                fee_payer_signer.verify(&message)?;
+                Ok(())
+            },
             Self::MultiEd25519 {
                 public_key,
                 signature,
@@ -127,7 +172,7 @@ impl TransactionAuthenticator {
                     signer.verify(&message)?;
                 }
                 Ok(())
-            }
+            },
         }
     }
 
@@ -140,6 +185,7 @@ impl TransactionAuthenticator {
                 public_key: public_key.clone(),
                 signature: signature.clone(),
             },
+            Self::FeePayer { sender, .. } => sender.clone(),
             Self::MultiEd25519 {
                 public_key,
                 signature,
@@ -155,6 +201,11 @@ impl TransactionAuthenticator {
                 public_key: _,
                 signature: _,
             } => vec![],
+            Self::FeePayer {
+                sender: _,
+                secondary_signer_addresses,
+                ..
+            } => secondary_signer_addresses.to_vec(),
             Self::MultiAgent {
                 sender: _,
                 secondary_signer_addresses,
@@ -170,11 +221,43 @@ impl TransactionAuthenticator {
                 public_key: _,
                 signature: _,
             } => vec![],
+            Self::FeePayer {
+                sender: _,
+                secondary_signer_addresses: _,
+                secondary_signers,
+                ..
+            } => secondary_signers.to_vec(),
             Self::MultiAgent {
                 sender: _,
                 secondary_signer_addresses: _,
                 secondary_signers,
             } => secondary_signers.to_vec(),
+        }
+    }
+
+    pub fn fee_payer_address(&self) -> Option<AccountAddress> {
+        match self {
+            Self::Ed25519 { .. } | Self::MultiEd25519 { .. } | Self::MultiAgent { .. } => None,
+            Self::FeePayer {
+                sender: _,
+                secondary_signer_addresses: _,
+                secondary_signers: _,
+                fee_payer_address,
+                ..
+            } => Some(*fee_payer_address),
+        }
+    }
+
+    pub fn fee_payer_signer(&self) -> Option<AccountAuthenticator> {
+        match self {
+            Self::Ed25519 { .. } | Self::MultiEd25519 { .. } | Self::MultiAgent { .. } => None,
+            Self::FeePayer {
+                sender: _,
+                secondary_signer_addresses: _,
+                secondary_signers: _,
+                fee_payer_address: _,
+                fee_payer_signer,
+            } => Some(fee_payer_signer.clone()),
         }
     }
 }
@@ -191,7 +274,34 @@ impl fmt::Display for TransactionAuthenticator {
                     "TransactionAuthenticator[scheme: Ed25519, sender: {}]",
                     self.sender()
                 )
-            }
+            },
+            Self::FeePayer {
+                sender,
+                secondary_signer_addresses,
+                secondary_signers,
+                fee_payer_address,
+                fee_payer_signer,
+            } => {
+                let mut sec_addrs: String = "".to_string();
+                for sec_addr in secondary_signer_addresses {
+                    sec_addrs = format!("{}\n\t\t\t{:#?},", sec_addrs, sec_addr);
+                }
+                let mut sec_signers: String = "".to_string();
+                for sec_signer in secondary_signers {
+                    sec_signers = format!("{}\n\t\t\t{:#?},", sec_signers, sec_signer);
+                }
+                write!(
+                    f,
+                    "TransactionAuthenticator[\n\
+                        \tscheme: MultiAgent, \n\
+                        \tsender: {}\n\
+                        \tsecondary signer addresses: {}\n\
+                        \tsecondary signers: {}\n\n
+                        \tfee payer address: {}\n\n
+                        \tfee payer signer: {}]",
+                    sender, sec_addrs, sec_signers, fee_payer_address, fee_payer_signer,
+                )
+            },
             Self::MultiEd25519 {
                 public_key: _,
                 signature: _,
@@ -201,7 +311,7 @@ impl fmt::Display for TransactionAuthenticator {
                     "TransactionAuthenticator[scheme: MultiEd25519, sender: {}]",
                     self.sender()
                 )
-            }
+            },
             Self::MultiAgent {
                 sender,
                 secondary_signer_addresses,
@@ -224,7 +334,7 @@ impl fmt::Display for TransactionAuthenticator {
                         \tsecondary signers: {}]",
                     sender, sec_addrs, sec_signers,
                 )
-            }
+            },
         }
     }
 }
@@ -233,7 +343,7 @@ impl fmt::Display for TransactionAuthenticator {
 /// (1) How to check its signature against a message and public key
 /// (2) How to convert its public key into an `AuthenticationKeyPreimage` structured as
 /// (public_key | signaure_scheme_id).
-/// Each on-chain `DiemAccount` must store an `AuthenticationKey` (computed via a sha3 hash of an
+/// Each on-chain `Account` must store an `AuthenticationKey` (computed via a sha3 hash of an
 /// `AuthenticationKeyPreimage`).
 
 // TODO: in the future, can tie these to the AccountAuthenticator enum directly with https://github.com/rust-lang/rust/issues/60553
@@ -243,6 +353,15 @@ pub enum Scheme {
     Ed25519 = 0,
     MultiEd25519 = 1,
     // ... add more schemes here
+    /// Scheme identifier used to derive addresses (not the authentication key) of objects and
+    /// resources accounts. This application serves to domain separate hashes. Without such
+    /// separation, an adversary could create (and get a signer for) a these accounts
+    /// when a their address matches matches an existing address of a MultiEd25519 wallet.
+    DeriveAuid = 251,
+    DeriveObjectAddressFromObject = 252,
+    DeriveObjectAddressFromGuid = 253,
+    DeriveObjectAddressFromSeed = 254,
+    DeriveResourceAccountAddress = 255,
 }
 
 impl fmt::Display for Scheme {
@@ -250,6 +369,11 @@ impl fmt::Display for Scheme {
         let display = match self {
             Scheme::Ed25519 => "Ed25519",
             Scheme::MultiEd25519 => "MultiEd25519",
+            Scheme::DeriveAuid => "DeriveAuid",
+            Scheme::DeriveObjectAddressFromObject => "DeriveObjectAddressFromObject",
+            Scheme::DeriveObjectAddressFromGuid => "DeriveObjectAddressFromGuid",
+            Scheme::DeriveObjectAddressFromSeed => "DeriveObjectAddressFromSeed",
+            Scheme::DeriveResourceAccountAddress => "DeriveResourceAccountAddress",
         };
         write!(f, "Scheme::{}", display)
     }
@@ -259,7 +383,7 @@ impl fmt::Display for Scheme {
 pub enum AccountAuthenticator {
     /// Single signature
     Ed25519 {
-        public_key: Validatable<Ed25519PublicKey>,
+        public_key: Ed25519PublicKey,
         signature: Ed25519Signature,
     },
     /// K-of-N multisignature
@@ -282,7 +406,7 @@ impl AccountAuthenticator {
     /// Create a single-signature ed25519 authenticator
     pub fn ed25519(public_key: Ed25519PublicKey, signature: Ed25519Signature) -> Self {
         Self::Ed25519 {
-            public_key: Validatable::new_valid(public_key),
+            public_key,
             signature,
         }
     }
@@ -304,7 +428,7 @@ impl AccountAuthenticator {
             Self::Ed25519 {
                 public_key,
                 signature,
-            } => signature.verify(message, public_key.validate()?),
+            } => signature.verify(message, public_key),
             Self::MultiEd25519 {
                 public_key,
                 signature,
@@ -315,7 +439,7 @@ impl AccountAuthenticator {
     /// Return the raw bytes of `self.public_key`
     pub fn public_key_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Ed25519 { public_key, .. } => public_key.unvalidated().to_bytes().to_vec(),
+            Self::Ed25519 { public_key, .. } => public_key.to_bytes().to_vec(),
             Self::MultiEd25519 { public_key, .. } => public_key.to_bytes().to_vec(),
         }
     }
@@ -347,7 +471,7 @@ impl AccountAuthenticator {
     }
 }
 
-/// A struct that represents an account authentication key. An account's address is the last 16
+/// A struct that represents an account authentication key. An account's address is the last 32
 /// bytes of authentication key used to create it
 #[derive(
     Clone,
@@ -366,6 +490,9 @@ impl AccountAuthenticator {
 pub struct AuthenticationKey([u8; AuthenticationKey::LENGTH]);
 
 impl AuthenticationKey {
+    /// The number of bytes in an authentication key.
+    pub const LENGTH: usize = 32;
+
     /// Create an authentication key from `bytes`
     pub const fn new(bytes: [u8; Self::LENGTH]) -> Self {
         Self(bytes)
@@ -376,9 +503,6 @@ impl AuthenticationKey {
     pub const fn zero() -> Self {
         Self([0; 32])
     }
-
-    /// The number of bytes in an authentication key.
-    pub const LENGTH: usize = 32;
 
     /// Create an authentication key from a preimage by taking its sha3 hash
     pub fn from_preimage(preimage: &AuthenticationKeyPreimage) -> AuthenticationKey {
@@ -398,16 +522,16 @@ impl AuthenticationKey {
     /// Return an address derived from the last `AccountAddress::LENGTH` bytes of this
     /// authentication key.
     pub fn derived_address(&self) -> AccountAddress {
-        // keep only last 16 bytes
+        // keep only last AccountAddress::LENGTH bytes
         let mut array = [0u8; AccountAddress::LENGTH];
-        array.copy_from_slice(&self.0[Self::LENGTH - AccountAddress::LENGTH..]);
+        array.copy_from_slice(&self.0[AuthenticationKey::LENGTH - AccountAddress::LENGTH..]);
         AccountAddress::new(array)
     }
 
-    /// Return the first AccountAddress::LENGTH bytes of this authentication key
-    pub fn prefix(&self) -> [u8; AccountAddress::LENGTH] {
-        let mut array = [0u8; AccountAddress::LENGTH];
-        array.copy_from_slice(&self.0[..AccountAddress::LENGTH]);
+    /// Return the first self::LENGTH - AccountAddress::LENGTH bytes of this authentication key
+    pub fn prefix(&self) -> [u8; AuthenticationKey::LENGTH - AccountAddress::LENGTH] {
+        let mut array = [0u8; AuthenticationKey::LENGTH - AccountAddress::LENGTH];
+        array.copy_from_slice(&self.0[..(AuthenticationKey::LENGTH - AccountAddress::LENGTH)]);
         array
     }
 
@@ -450,6 +574,15 @@ impl AuthenticationKeyPreimage {
         Self::new(public_key.to_bytes(), Scheme::MultiEd25519)
     }
 
+    /// Construct a preimage from a transaction-derived AUID as (txn_hash || auid_scheme_id)
+    pub fn auid(txn_hash: Vec<u8>, auid_counter: u64) -> AuthenticationKeyPreimage {
+        let mut hash_arg = Vec::new();
+        hash_arg.extend(txn_hash);
+        hash_arg.extend(auid_counter.to_le_bytes().to_vec());
+        hash_arg.push(Scheme::DeriveAuid as u8);
+        Self(hash_arg)
+    }
+
     /// Construct a vector from this authentication key
     pub fn into_vec(self) -> Vec<u8> {
         self.0
@@ -462,8 +595,8 @@ impl fmt::Display for AccountAuthenticator {
             f,
             "AccountAuthenticator[scheme id: {:?}, public key: {}, signature: {}]",
             self.scheme(),
-            hex::encode(&self.public_key_bytes()),
-            hex::encode(&self.signature_bytes())
+            hex::encode(self.public_key_bytes()),
+            hex::encode(self.signature_bytes())
         )
     }
 }
@@ -511,7 +644,7 @@ impl AsRef<[u8]> for AuthenticationKey {
 
 impl fmt::LowerHex for AuthenticationKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 

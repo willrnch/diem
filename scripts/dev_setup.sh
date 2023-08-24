@@ -1,7 +1,9 @@
 #!/bin/bash
-# Copyright (c) The Diem Core Contributors
+# Copyright © Diem Foundation
+# Parts of the project are originally copyright © Meta Platforms, Inc.
 # SPDX-License-Identifier: Apache-2.0
-# This script sets up the environment for the Diem build by installing necessary dependencies.
+
+# This script sets up the environment for the build by installing necessary dependencies.
 #
 # Usage ./dev_setup.sh <options>
 #   v - verbose, print all statements
@@ -9,48 +11,47 @@
 # Assumptions for nix systems:
 # 1 The running user is the user who will execute the builds.
 # 2 .profile will be used to configure the shell
-# 3 ${HOME}/bin/, or ${INSTALL_DIR} is expected to be on the path - hashicorp tools/hadolint/etc.  will be installed there on linux systems.
+# 3 ${HOME}/bin/, or ${INSTALL_DIR} is expected to be on the path - hashicorp tools/etc.  will be installed there on linux systems.
 
 # fast fail.
 set -eo pipefail
 
 SHELLCHECK_VERSION=0.7.1
-HADOLINT_VERSION=1.17.4
-SCCACHE_VERSION=0.2.16-alpha.0
-#If installing sccache from a git repp set url@revision.
-SCCACHE_GIT='https://github.com/diem/sccache.git@ef50d87a58260c30767520045e242ccdbdb965af'
 GRCOV_VERSION=0.8.2
-GUPPY_GIT='https://github.com/facebookincubator/cargo-guppy@39ec940f36b0a0df96a330243d127cbe2db9f919'
 KUBECTL_VERSION=1.18.6
 TERRAFORM_VERSION=0.12.26
 HELM_VERSION=3.2.4
 VAULT_VERSION=1.5.0
-Z3_VERSION=4.8.13
+Z3_VERSION=4.11.2
 CVC5_VERSION=0.0.3
-DOTNET_VERSION=5.0
-BOOGIE_VERSION=2.9.6
-PYRE_CHECK_VERSION=0.0.59
-NUMPY_VERSION=1.20.1
+DOTNET_VERSION=6.0
+BOOGIE_VERSION=2.15.8
 ALLURE_VERSION=2.15.pr1135
+# this is 3.21.4; the "3" is silent
+PROTOC_VERSION=21.4
+SOLC_VERSION="v0.8.11+commit.d7f03943"
 
 SCRIPT_PATH="$( cd "$( dirname "$0" )" >/dev/null 2>&1 && pwd )"
 cd "$SCRIPT_PATH/.." || exit
 
 function usage {
   echo "Usage:"
-  echo "Installs or updates necessary dev tools for diem/diem."
-  echo "-b batch mode, no user interactions and miminal output"
+  echo "Installs or updates necessary dev tools for diemlabs/diem-core."
+  echo "-b batch mode, no user interactions and minimal output"
   echo "-p update ${HOME}/.profile"
+  echo "-r install protoc and related tools"
   echo "-t install build tools"
-  echo "-o install operations tooling as well: helm, terraform, hadolint, yamllint, vault, docker, kubectl, python3"
-  echo "-y installs or updates Move prover tools: z3, cvc5, dotnet, boogie"
-  echo "-s installs or updates requirements to test code-generation for Move SDKs"
+  echo "-o install operations tooling as well: helm, terraform, yamllint, vault, docker, kubectl, python3"
+  echo "-y install or update Move Prover tools: z3, cvc5, dotnet, boogie"
+  echo "-d install tools for the Move documentation generator: graphviz"
   echo "-a install tools for build and test api"
+  echo "-P install PostgreSQL"
+  echo "-J install js/ts tools"
   echo "-v verbose mode"
   echo "-i installs an individual tool by name"
   echo "-n will target the /opt/ dir rather than the $HOME dir.  /opt/bin/, /opt/rustup/, and /opt/dotnet/ rather than $HOME/bin/, $HOME/.rustup/, and $HOME/.dotnet/"
-  echo "If no toolchain component is selected with -t, -o, -y, or -p, the behavior is as if -t had been provided."
-  echo "This command must be called from the root folder of the Diem project."
+  echo "If no toolchain component is selected with -t, -o, -y, -d, or -p, the behavior is as if -t had been provided."
+  echo "This command must be called from the root folder of the Diem-core project."
 }
 
 function add_to_profile {
@@ -85,6 +86,9 @@ function update_path_and_profile {
   else
     add_to_profile "export PATH=\"${BIN_DIR}:${C_HOME}/bin:\$PATH\""
   fi
+  if [[ "$INSTALL_PROTOC" == "true" ]]; then
+    add_to_profile "export PATH=\$PATH:/usr/local/include"
+  fi
   if [[ "$INSTALL_PROVER" == "true" ]]; then
     add_to_profile "export DOTNET_ROOT=\"${DOTNET_ROOT}\""
     add_to_profile "export PATH=\"${DOTNET_ROOT}/tools:\$PATH\""
@@ -92,14 +96,7 @@ function update_path_and_profile {
     add_to_profile "export CVC5_EXE=\"${BIN_DIR}/cvc5\""
     add_to_profile "export BOOGIE_EXE=\"${DOTNET_ROOT}/tools/boogie\""
   fi
-  if [[ "$INSTALL_CODEGEN" == "true" ]] && [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-    add_to_profile "export PATH=\$PATH:${INSTALL_DIR}swift/usr/bin"
-    if [[ -n "${GOBIN}" ]]; then
-      add_to_profile "export PATH=\$PATH:/usr/lib/golang/bin"
-    else
-      add_to_profile "export PATH=\$PATH:$GOBIN"
-    fi
-  fi
+  add_to_profile "export SOLC_EXE=\"${BIN_DIR}/solc\""
 }
 
 function install_build_essentials {
@@ -123,6 +120,48 @@ function install_build_essentials {
   #if [[ "$PACKAGE_MANAGER" == "brew" ]]; then
   #  install_pkg pkgconfig "$PACKAGE_MANAGER"
   #fi
+}
+
+function install_protoc {
+  INSTALL_PROTOC="true"
+  echo "Installing protoc and plugins"
+
+  if command -v "${INSTALL_DIR}protoc" &>/dev/null && [[ "$("${INSTALL_DIR}protoc" --version || true)" =~ .*${PROTOC_VERSION}.* ]]; then
+     echo "protoc 3.${PROTOC_VERSION} already installed"
+     return
+  fi
+
+  if [[ "$(uname)" == "Linux" ]]; then
+    PROTOC_PKG="protoc-$PROTOC_VERSION-linux-x86_64"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    PROTOC_PKG="protoc-$PROTOC_VERSION-osx-universal_binary"
+  else
+    echo "protoc support not configured for this platform (uname=$(uname))"
+    return
+  fi
+
+  TMPFILE=$(mktemp)
+  rm "$TMPFILE"
+  mkdir -p "$TMPFILE"/
+  (
+    cd "$TMPFILE" || exit
+    curl -LOs "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_PKG.zip" --retry 3
+    sudo unzip -o "$PROTOC_PKG.zip" -d /usr/local bin/protoc
+    sudo unzip -o "$PROTOC_PKG.zip" -d /usr/local 'include/*'
+    sudo chmod +x "/usr/local/bin/protoc"
+  )
+  rm -rf "$TMPFILE"
+
+  # Install the cargo plugins
+  if ! command -v protoc-gen-prost &> /dev/null; then
+    cargo install protoc-gen-prost --locked
+  fi
+  if ! command -v protoc-gen-prost-serde &> /dev/null; then
+    cargo install protoc-gen-prost-serde --locked
+  fi
+  if ! command -v protoc-gen-prost-crate &> /dev/null; then
+    cargo install protoc-gen-prost-crate --locked
+  fi
 }
 
 function install_rustup {
@@ -152,14 +191,6 @@ function install_rustup {
       PATH="${HOME}/.cargo/bin:${PATH}"
     fi
   fi
-}
-
-function install_hadolint {
-  if ! command -v hadolint &> /dev/null; then
-    export HADOLINT=${INSTALL_DIR}/hadolint
-    curl -sL -o "$HADOLINT" "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-$(uname -s)-$(uname -m)" && chmod 700 "$HADOLINT"
-  fi
-  hadolint -v
 }
 
 function install_vault {
@@ -372,20 +403,6 @@ function install_tidy {
   fi
 }
 
-function install_gcc_powerpc_linux_gnu {
-  PACKAGE_MANAGER=$1
-  #Differently named packages for gcc-powerpc-linux-gnu
-  if [[ "$PACKAGE_MANAGER" == "apt-get" ]] || [[ "$PACKAGE_MANAGER" == "yum" ]]; then
-    install_pkg gcc-powerpc-linux-gnu "$PACKAGE_MANAGER"
-  fi
-  #if [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
-  #  install_pkg powerpc-linux-gnu-gcc "$PACKAGE_MANAGER"
-  #fi
-  #if [[ "$PACKAGE_MANAGER" == "apk" ]] || [[ "$PACKAGE_MANAGER" == "brew" ]]; then
-  #  TODO
-  #fi
-}
-
 function install_toolchain {
   version=$1
   FOUND=$(rustup show | grep -c "$version" || true )
@@ -397,24 +414,49 @@ function install_toolchain {
   fi
 }
 
-function install_sccache {
-  VERSION="$(sccache --version || true)"
-  if [[ "$VERSION" != "sccache ""${SCCACHE_VERSION}" ]]; then
-    if [[ -n "${SCCACHE_GIT}" ]]; then
-      git_repo=$( echo "$SCCACHE_GIT" | cut -d "@" -f 1 );
-      git_hash=$( echo "$SCCACHE_GIT" | cut -d "@" -f 2 );
-      cargo install sccache --git "$git_repo" --rev "$git_hash" --features s3 --locked
-    else
-      cargo install sccache --version="${SCCACHE_VERSION}" --features s3 --locked
+function install_rustup_components_and_nightly {
+    echo "Printing the rustup version and toolchain list"
+    rustup --version
+    rustup show
+    rustup toolchain list -v
+
+    echo "Updating rustup and installing rustfmt & clippy"
+    rustup update
+    rustup component add rustfmt
+    rustup component add clippy
+
+    # We require nightly for strict rust formatting
+    echo "Installing the nightly toolchain and rustfmt nightly"
+    if ! rustup toolchain install nightly
+    then
+      if [[ "$(uname)" == "Linux" ]]; then
+        # TODO: remove this once we have an answer: https://github.com/rust-lang/rustup/issues/3390
+        echo "Failed to install the nightly toolchain using rustup! Falling back to an older linux build at 2023-06-01."
+        rustup toolchain install nightly-2023-06-01 # Fix the date to avoid flakiness
+
+        # Rename the toolchain to nightly (crazy... see: https://github.com/rust-lang/rustup/issues/1299).
+        # Note: this only works for linux. The primary purpose is to unblock CI/CD on flakes.
+        mv ~/.rustup/toolchains/nightly-2023-06-01-x86_64-unknown-linux-gnu ~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu
+      else
+        echo "Failed to install the nightly toolchain using rustup! Manual installation is required!"
+      fi
     fi
+
+    if ! rustup component add rustfmt --toolchain nightly
+    then
+      echo "Failed to install rustfmt nightly using rustup."
+    fi
+}
+
+function install_cargo_sort {
+  if ! command -v cargo-sort &> /dev/null; then
+    cargo install cargo-sort --locked
   fi
 }
 
-function install_cargo_guppy {
-  if ! command -v cargo-guppy &> /dev/null; then
-    git_repo=$( echo "$GUPPY_GIT" | cut -d "@" -f 1 );
-    git_hash=$( echo "$GUPPY_GIT" | cut -d "@" -f 2 );
-    cargo install cargo-guppy --git "$git_repo" --rev "$git_hash" --locked
+function install_cargo_nextest {
+  if ! command -v cargo-nextest &> /dev/null; then
+    cargo install cargo-nextest --locked
   fi
 }
 
@@ -450,8 +492,11 @@ function install_dotnet {
     fi
     # Below we need to (a) set TERM variable because the .net installer expects it and it is not set
     # in some environments (b) use bash not sh because the installer uses bash features.
-    curl -sSL https://dot.net/v1/dotnet-install.sh \
-        | TERM=linux /bin/bash -s -- --channel $DOTNET_VERSION --install-dir "${DOTNET_INSTALL_DIR}" --version latest
+    # NOTE: use wget to better follow the redirect
+    wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+    chmod +x dotnet-install.sh
+    ./dotnet-install.sh --channel $DOTNET_VERSION --install-dir "${DOTNET_INSTALL_DIR}" --version latest
+    rm dotnet-install.sh
   else
     echo Dotnet already installed.
   fi
@@ -479,9 +524,13 @@ function install_z3 {
      return
   fi
   if [[ "$(uname)" == "Linux" ]]; then
-    Z3_PKG="z3-$Z3_VERSION-x64-glibc-2.28"
+    Z3_PKG="z3-$Z3_VERSION-x64-glibc-2.31"
   elif [[ "$(uname)" == "Darwin" ]]; then
-    Z3_PKG="z3-$Z3_VERSION-x64-osx-10.16"
+    if [[ "$(uname -m)" == "arm64" ]]; then
+      Z3_PKG="z3-$Z3_VERSION-arm64-osx-11.0"
+    else
+      Z3_PKG="z3-$Z3_VERSION-x64-osx-10.16"
+    fi
   else
     echo "Z3 support not configured for this platform (uname=$(uname))"
     return
@@ -491,7 +540,7 @@ function install_z3 {
   mkdir -p "$TMPFILE"/
   (
     cd "$TMPFILE" || exit
-    curl -LOs "https://github.com/junkil-park/z3/releases/download/z3-$Z3_VERSION/$Z3_PKG.zip"
+    curl -LOs "https://github.com/Z3Prover/z3/releases/download/z3-$Z3_VERSION/$Z3_PKG.zip"
     unzip -q "$Z3_PKG.zip"
     cp "$Z3_PKG/bin/z3" "${INSTALL_DIR}"
     chmod +x "${INSTALL_DIR}z3"
@@ -523,62 +572,11 @@ function install_cvc5 {
   mkdir -p "$TMPFILE"/
   (
     cd "$TMPFILE" || exit
-    curl -LOs "https://github.com/cvc5/cvc5/releases/download/cvc5-$CVC5_VERSION/$CVC5_PKG"
-    cp "$CVC5_PKG" "${INSTALL_DIR}cvc5"
-    chmod +x "${INSTALL_DIR}cvc5"
+    curl -LOs "https://github.com/cvc5/cvc5/releases/download/cvc5-$CVC5_VERSION/$CVC5_PKG" || true
+    cp "$CVC5_PKG" "${INSTALL_DIR}cvc5" || true
+    chmod +x "${INSTALL_DIR}cvc5" || true
   )
   rm -rf "$TMPFILE"
-}
-
-function install_golang {
-    if [[ $(go version | grep -c "go1.14" || true) == "0" ]]; then
-      if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-        curl -LO https://golang.org/dl/go1.14.15.linux-amd64.tar.gz
-        "${PRE_COMMAND[@]}" rm -rf /usr/local/go
-        "${PRE_COMMAND[@]}" tar -C /usr/local -xzf go1.14.15.linux-amd64.tar.gz
-        "${PRE_COMMAND[@]}" ln -sf /usr/local/go /usr/lib/golang
-        rm go1.14.15.linux-amd64.tar.gz
-      elif [[ "$PACKAGE_MANAGER" == "apk" ]]; then
-        apk --update add --no-cache git make musl-dev go
-      elif [[ "$PACKAGE_MANAGER" == "brew" ]]; then
-        failed=$(brew install go || echo "failed")
-        if [[ "$failed" == "failed" ]]; then
-          brew link --overwrite go
-        fi
-      else
-        install_pkg golang "$PACKAGE_MANAGER"
-      fi
-    fi
-}
-
-function install_deno {
-  curl -fsSL https://deno.land/x/install/install.sh | sh
-  cp "${HOME}/.deno/bin/deno" "${INSTALL_DIR}"
-  chmod +x "${INSTALL_DIR}deno"
-}
-
-function install_swift {
-    echo Installing Swift.
-    install_pkg wget "$PACKAGE_MANAGER"
-    install_pkg libncurses5 "$PACKAGE_MANAGER"
-    install_pkg clang "$PACKAGE_MANAGER"
-    install_pkg libcurl4 "$PACKAGE_MANAGER"
-    install_pkg libpython2.7 "$PACKAGE_MANAGER"
-    install_pkg libpython2.7-dev "$PACKAGE_MANAGER"
-    wget -q https://swift.org/builds/swift-5.3.3-release/ubuntu1804/swift-5.3.3-RELEASE/swift-5.3.3-RELEASE-ubuntu18.04.tar.gz
-    tar xzf swift-5.3.3-RELEASE-ubuntu18.04.tar.gz
-    rm -rf swift-5.3.3-RELEASE-ubuntu18.04.tar.gz
-    mv swift-5.3.3-RELEASE-ubuntu18.04 "${INSTALL_DIR}swift"
-}
-
-function install_java {
-    if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-      "${PRE_COMMAND[@]}" apt-get install -y default-jdk
-    elif [[ "$PACKAGE_MANAGER" == "apk" ]]; then
-      apk --update add --no-cache  -X http://dl-cdn.alpinelinux.org/alpine/edge/community openjdk11
-    else
-      install_pkg java "$PACKAGE_MANAGER"
-    fi
 }
 
 function install_allure {
@@ -614,6 +612,35 @@ function install_nodejs {
     install_pkg npm "$PACKAGE_MANAGER"
 }
 
+function install_solidity {
+  echo "Installing Solidity compiler"
+  if [ -f "${INSTALL_DIR}solc" ]; then
+    echo "Solidity already installed at ${INSTALL_DIR}solc"
+    return
+  fi
+  # We fetch the binary from  https://binaries.soliditylang.org
+  if [[ "$(uname)" == "Linux" ]]; then
+    SOLC_BIN="linux-amd64/solc-linux-amd64-${SOLC_VERSION}"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    if [[ "$(uname -m)" == "arm64" ]]; then
+      # no native binary supplied, but brew can build one
+      brew install solidity
+      return
+    else
+      SOLC_BIN="macosx-amd64/solc-macosx-amd64-${SOLC_VERSION}"
+    fi
+  else
+    echo "Solidity support not configured for this platform (uname=$(uname))"
+    return
+  fi
+  curl -o "${INSTALL_DIR}solc" "https://binaries.soliditylang.org/${SOLC_BIN}"
+  chmod +x "${INSTALL_DIR}solc"
+}
+
+function install_pnpm {
+    curl -fsSL https://get.pnpm.io/install.sh | "${PRE_COMMAND[@]}" env PNPM_VERSION=8.2.0 SHELL="$(which bash)" bash -
+}
+
 function install_python3 {
   if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
     install_pkg python3-all-dev "$PACKAGE_MANAGER"
@@ -623,6 +650,36 @@ function install_python3 {
     install_pkg python3-dev "$PACKAGE_MANAGER"
   else
     install_pkg python3 "$PACKAGE_MANAGER"
+  fi
+}
+
+function install_postgres {
+  if [[ "$PACKAGE_MANAGER" == "apt-get" ]] || [[ "$PACKAGE_MANAGER" == "apk" ]]; then
+    install_pkg libpq-dev "$PACKAGE_MANAGER"
+  fi
+  if [[ "$PACKAGE_MANAGER" == "pacman" ]] || [[ "$PACKAGE_MANAGER" == "yum" ]]; then
+    install_pkg postgresql-libs "$PACKAGE_MANAGER"
+  fi
+  if [[ "$PACKAGE_MANAGER" == "dnf" ]]; then
+    install_pkg libpq-devel "$PACKAGE_MANAGER"
+  fi
+  if [[ "$PACKAGE_MANAGER" == "brew" ]]; then
+    install_pkg postgresql "$PACKAGE_MANAGER"
+  fi
+}
+
+function install_lld {
+  # Right now, only install lld for linux
+  if [[ "$(uname)" == "Linux" ]]; then
+    install_pkg lld "$PACKAGE_MANAGER"
+  fi
+}
+
+# this is needed for hdpi crate from diem-ledger
+function install_libudev-dev {
+  # Need to install libudev-dev for linux
+  if [[ "$(uname)" == "Linux" ]]; then
+    install_pkg libudev-dev "$PACKAGE_MANAGER"
   fi
 }
 
@@ -646,9 +703,8 @@ Build tools (since -t or no option was provided):
   * lcov
   * pkg-config
   * libssl-dev
-  * sccache
-  * if linux, gcc-powerpc-linux-gnu
-  * NodeJS / NPM
+  * protoc (and related tools)
+  * lld (only for Linux)
 EOF
   fi
 
@@ -677,15 +733,17 @@ Move prover tools (since -y was provided):
 EOF
   fi
 
-  if [[ "$INSTALL_CODEGEN" == "true" ]]; then
+if [[ "$INSTALL_DOC" == "true" ]]; then
 cat <<EOF
-Codegen tools (since -s was provided):
-  * Clang
-  * Python3 (numpy, pyre-check)
-  * Golang
-  * Java
-  * Deno
-  * Swift
+tools for the Move documentation generator (since -d was provided):
+  * graphviz
+EOF
+  fi
+
+  if [[ "$INSTALL_PROTOC" == "true" ]]; then
+cat <<EOF
+protoc and related plugins (since -r was provided):
+  * protoc
 EOF
   fi
 
@@ -693,6 +751,21 @@ EOF
 cat <<EOF
 API build and testing tools (since -a was provided):
   * Python3 (schemathesis)
+EOF
+  fi
+
+  if [[ "$INSTALL_POSTGRES" == "true" ]]; then
+cat <<EOF
+PostgreSQL database (since -P was provided):
+EOF
+  fi
+
+  if [[ "$INSTALL_JSTS" == "true" ]]; then
+cat <<EOF
+Javascript/TypeScript tools (since -J was provided):
+  * node.js
+  * pnpm
+  * solidity
 EOF
   fi
 
@@ -709,20 +782,28 @@ EOF
 }
 
 BATCH_MODE=false;
+# set verbose if not interactive.
+if [[ ! ( -t 2 ) ]]; then
+    VERBOSE=true;
+else
 VERBOSE=false;
+fi
 INSTALL_BUILD_TOOLS=false;
 OPERATIONS=false;
 INSTALL_PROFILE=false;
 INSTALL_PROVER=false;
-INSTALL_CODEGEN=false;
+INSTALL_DOC=false;
+INSTALL_PROTOC=false;
 INSTALL_API_BUILD_TOOLS=false;
+INSTALL_POSTGRES=false;
+INSTALL_JSTS=false;
 INSTALL_INDIVIDUAL=false;
 INSTALL_PACKAGES=();
 INSTALL_DIR="${HOME}/bin/"
 OPT_DIR="false"
 
 #parse args
-while getopts "btopvysah:i:n" arg; do
+while getopts "btoprvydaPJh:i:n" arg; do
   case "$arg" in
     b)
       BATCH_MODE="true"
@@ -736,17 +817,26 @@ while getopts "btopvysah:i:n" arg; do
     p)
       INSTALL_PROFILE="true"
       ;;
+    r)
+      INSTALL_PROTOC="true"
+      ;;
     v)
       VERBOSE=true
       ;;
     y)
       INSTALL_PROVER="true"
       ;;
-    s)
-      INSTALL_CODEGEN="true"
+    d)
+      INSTALL_DOC="true"
       ;;
     a)
       INSTALL_API_BUILD_TOOLS="true"
+      ;;
+    P)
+      INSTALL_POSTGRES="true"
+      ;;
+    J)
+      INSTALL_JSTS="true"
       ;;
     i)
       INSTALL_INDIVIDUAL="true"
@@ -771,14 +861,16 @@ if [[ "$INSTALL_BUILD_TOOLS" == "false" ]] && \
    [[ "$OPERATIONS" == "false" ]] && \
    [[ "$INSTALL_PROFILE" == "false" ]] && \
    [[ "$INSTALL_PROVER" == "false" ]] && \
-   [[ "$INSTALL_CODEGEN" == "false" ]] && \
+   [[ "$INSTALL_DOC" == "false" ]] && \
    [[ "$INSTALL_API_BUILD_TOOLS" == "false" ]] && \
+   [[ "$INSTALL_POSTGRES" == "false" ]] && \
+   [[ "$INSTALL_JSTS" == "false" ]] && \
    [[ "$INSTALL_INDIVIDUAL" == "false" ]]; then
    INSTALL_BUILD_TOOLS="true"
 fi
 
 if [ ! -f rust-toolchain ]; then
-	echo "Unknown location. Please run this from the diem repository. Abort."
+	echo "Unknown location. Please run this from the diem-core repository. Abort."
 	exit 1
 fi
 
@@ -847,7 +939,7 @@ if [[ "$INSTALL_PROFILE" == "true" ]]; then
 fi
 
 install_pkg curl "$PACKAGE_MANAGER"
-
+install_pkg unzip "$PACKAGE_MANAGER"
 
 if [[ "$INSTALL_BUILD_TOOLS" == "true" ]]; then
   install_build_essentials "$PACKAGE_MANAGER"
@@ -855,22 +947,29 @@ if [[ "$INSTALL_BUILD_TOOLS" == "true" ]]; then
   install_pkg clang "$PACKAGE_MANAGER"
   install_pkg llvm "$PACKAGE_MANAGER"
 
-  install_gcc_powerpc_linux_gnu "$PACKAGE_MANAGER"
   install_openssl_dev "$PACKAGE_MANAGER"
   install_pkg_config "$PACKAGE_MANAGER"
 
+  install_lld
+
   install_rustup "$BATCH_MODE"
   install_toolchain "$(cat ./rust-toolchain)"
-  # Add all the components that we need
-  rustup component add rustfmt
-  rustup component add clippy
+  install_rustup_components_and_nightly
 
-  install_cargo_guppy
-  install_sccache
+  install_cargo_sort
+  install_cargo_nextest
   install_grcov
   install_pkg git "$PACKAGE_MANAGER"
   install_lcov "$PACKAGE_MANAGER"
-  install_nodejs "$PACKAGE_MANAGER"
+  install_pkg unzip "$PACKAGE_MANAGER"
+  install_protoc
+fi
+
+if [[ "$INSTALL_PROTOC" == "true" ]]; then
+  if [[ "$INSTALL_BUILD_TOOLS" == "false" ]]; then
+    install_pkg unzip "$PACKAGE_MANAGER"
+    install_protoc
+  fi
 fi
 
 if [[ "$OPERATIONS" == "true" ]]; then
@@ -886,7 +985,6 @@ if [[ "$OPERATIONS" == "true" ]]; then
     install_pkg coreutils "$PACKAGE_MANAGER"
   fi
   install_shellcheck
-  install_hadolint
   install_vault
   install_helm
   install_terraform
@@ -913,38 +1011,44 @@ if [[ "$INSTALL_PROVER" == "true" ]]; then
     export DOTNET_INSTALL_DIR="/opt/dotnet/"
     mkdir -p "$DOTNET_INSTALL_DIR" || true
   fi
+  install_pkg unzip "$PACKAGE_MANAGER"
   install_z3
   install_cvc5
   install_dotnet
   install_boogie
 fi
 
-if [[ "$INSTALL_CODEGEN" == "true" ]]; then
-  install_pkg clang "$PACKAGE_MANAGER"
-  install_pkg llvm "$PACKAGE_MANAGER"
-  install_python3
-  install_deno
-  install_java
-  install_golang
-  if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-    # Only looked at this for a little while, but depends on glibc so alpine
-    # support isn't easily added. On Mac it requires XCode to be installed,
-    # which is quite largs, so probably something we don't want to download in
-    # this script.
-    install_swift
-  fi
-  if [[ "$PACKAGE_MANAGER" != "apk" ]]; then
-    # depends on wheels which needs glibc which doesn't work on alpine's python.
-    # Only invested a hour or so in this, a work around may exist.
-    "${PRE_COMMAND[@]}" python3 -m pip install pyre-check=="${PYRE_CHECK_VERSION}"
-  fi
-  "${PRE_COMMAND[@]}" python3 -m pip install numpy=="${NUMPY_VERSION}"
+if [[ "$INSTALL_DOC" == "true" ]]; then
+  install_pkg graphviz "$PACKAGE_MANAGER"
 fi
 
 if [[ "$INSTALL_API_BUILD_TOOLS" == "true" ]]; then
   # python and tools
   install_python3
   "${PRE_COMMAND[@]}" python3 -m pip install schemathesis
+fi
+
+if [[ "$INSTALL_POSTGRES" == "true" ]]; then
+  install_postgres
+fi
+
+if [[ "$INSTALL_JSTS" == "true" ]]; then
+  # javascript and typescript tools
+  install_nodejs "$PACKAGE_MANAGER"
+  install_pnpm "$PACKAGE_MANAGER"
+  install_solidity
+fi
+
+install_python3
+pip3 install pre-commit
+
+install_libudev-dev
+
+# For now best effort install, will need to improve later
+if command -v pre-commit; then
+  pre-commit install
+else
+  ~/.local/bin/pre-commit install
 fi
 
 if [[ "${BATCH_MODE}" == "false" ]]; then

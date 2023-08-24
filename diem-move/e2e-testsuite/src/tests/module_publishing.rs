@@ -1,21 +1,21 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_types::{
-    account_config::{self},
-    on_chain_config::VMPublishingOption,
-    transaction::TransactionStatus,
-    vm_status::{KeptVMStatus, StatusCode},
+use diem_language_e2e_tests::{
+    account::Account, compile::compile_module, current_function_name, executor::FakeExecutor,
+    transaction_status_eq,
 };
-use language_e2e_tests::{
-    account::Account, assert_prologue_parity, compile::compile_module, current_function_name,
-    executor::FakeExecutor, transaction_status_eq,
-};
+use diem_types::transaction::{ExecutionStatus, TransactionStatus};
+use move_core_types::vm_status::StatusCode;
+
+// TODO: ignoring most tests for now as bundle publishing is no longer available. Want to resurrect
+// or rewrite for new publishin approach
 
 // A module with an address different from the sender's address should be rejected
 #[test]
 fn bad_module_address() {
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
 
     // create a transaction trying to publish a new module.
@@ -54,18 +54,23 @@ fn bad_module_address() {
     let output = executor.execute_transaction(txn);
     match output.status() {
         TransactionStatus::Keep(status) => {
-            assert!(status == &KeptVMStatus::MiscellaneousError);
+            assert!(
+                status
+                    == &ExecutionStatus::MiscellaneousError(Some(
+                        StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER
+                    ))
+            );
             // assert!(status.status_code() == StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER);
-        }
+        },
         vm_status => panic!("Unexpected verification status: {:?}", vm_status),
     };
 }
 
 macro_rules! module_republish_test {
-    ($name:ident, $prog1:literal, $prog2:literal, $result:ident) => {
+    ($name:ident, $prog1:literal, $prog2:literal) => {
         #[test]
         fn $name() {
-            let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
+            let mut executor = FakeExecutor::from_head_genesis();
             executor.set_golden_file(current_function_name!());
 
             let sequence_number = 2;
@@ -97,14 +102,17 @@ macro_rules! module_republish_test {
             // first tx should allways succeed
             assert!(transaction_status_eq(
                 &output1.status(),
-                &TransactionStatus::Keep(KeptVMStatus::Executed),
+                &TransactionStatus::Keep(ExecutionStatus::Success),
             ));
 
             let output2 = executor.execute_transaction(txn2);
-            // second tx should yield the expected result
+            println!("{:?}", output2.status());
+            // second tx should always fail, module republish is not allowed
             assert!(transaction_status_eq(
                 &output2.status(),
-                &TransactionStatus::Keep(KeptVMStatus::$result),
+                &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+                    StatusCode::DUPLICATE_MODULE_NAME
+                ))),
             ));
         }
     };
@@ -124,8 +132,7 @@ module_republish_test!(
         struct T { f: u64 }
         public f() { label b0: return; }
     }
-    ",
-    Executed
+    " // ExecutionStatus::Success
 );
 
 // Republishing a module named M under the same address with a superset of the structs is OK
@@ -139,8 +146,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         struct T { f: u64 }
     }
-    ",
-    Executed
+    " // ExecutionStatus::Success
 );
 
 // Republishing a module named M under the same address with a superset of public functions is OK
@@ -154,8 +160,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         public f() { label b0: return; }
     }
-    ",
-    Executed
+    " // ExecutionStatus::Success
 );
 
 // Republishing a module named M under the same address that breaks data layout should be rejected
@@ -170,8 +175,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         struct T { f: u64, g: bool }
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 module_republish_test!(
@@ -185,8 +189,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         struct T { f: bool }
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 module_republish_test!(
@@ -200,8 +203,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         struct T {}
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 module_republish_test!(
@@ -214,8 +216,7 @@ module_republish_test!(
     "
     module 0x##ADDRESS##.M {
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 // Republishing a module named M under the same address that breaks linking should be rejected
@@ -230,8 +231,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         public f(_a: u64) { label b0: return; }
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 module_republish_test!(
@@ -245,8 +245,7 @@ module_republish_test!(
     module 0x##ADDRESS##.M {
         public f(_a: bool) { label b0: return; }
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 module_republish_test!(
@@ -259,143 +258,17 @@ module_republish_test!(
     "
     module 0x##ADDRESS##.M {
     }
-    ",
-    MiscellaneousError
+    " // ExecutionStatus::MiscellaneousError(Some(StatusCode::BACKWARD_INCOMPATIBLE_MODULE_UPDATE))
 );
 
 #[test]
-pub fn test_publishing_no_modules_non_allowlist_script() {
+pub fn test_publishing_modules_proper_sender() {
     // create a FakeExecutor with a genesis from file
-    let mut executor =
-        FakeExecutor::from_genesis_with_options(VMPublishingOption::custom_scripts());
-    executor.set_golden_file(current_function_name!());
-
-    // create a transaction trying to publish a new module.
-    let sender = executor.create_raw_account_data(1_000_000, 10);
-    executor.add_account_data(&sender);
-
-    let program = format!(
-        "
-        module 0x{}.M {{
-        }}
-        ",
-        sender.address(),
-    );
-
-    let random_module = compile_module(&program).1;
-    let txn = sender
-        .account()
-        .transaction()
-        .module(random_module)
-        .sequence_number(10)
-        .gas_unit_price(1)
-        .sign();
-
-    assert_prologue_parity!(
-        executor.verify_transaction(txn.clone()).status(),
-        executor.execute_transaction(txn).status(),
-        StatusCode::INVALID_MODULE_PUBLISHER
-    );
-}
-
-#[test]
-pub fn test_publishing_no_modules_non_allowlist_script_proper_sender() {
-    // create a FakeExecutor with a genesis from file
-    let mut executor =
-        FakeExecutor::from_genesis_with_options(VMPublishingOption::custom_scripts());
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
 
     // create a transaction trying to publish a new module.
     let sender = Account::new_diem_root();
-
-    let program = String::from(
-        "
-        module 0x1.M {
-        }
-        ",
-    );
-
-    let random_module = compile_module(&program).1;
-    let txn = sender
-        .transaction()
-        .module(random_module)
-        .sequence_number(0)
-        .sign();
-    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
-    assert_eq!(
-        executor.execute_transaction(txn).status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
-    );
-}
-
-#[test]
-pub fn test_publishing_no_modules_proper_sender() {
-    // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::allowlist_genesis();
-    executor.set_golden_file(current_function_name!());
-
-    // create a transaction trying to publish a new module.
-    let sender = Account::new_diem_root();
-
-    let program = String::from(
-        "
-        module 0x1.M {
-        }
-        ",
-    );
-
-    let random_script = compile_module(&program).1;
-    let txn = sender
-        .transaction()
-        .module(random_script)
-        .sequence_number(0)
-        .sign();
-    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
-    assert_eq!(
-        executor.execute_transaction(txn).status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
-    );
-}
-
-#[test]
-pub fn test_publishing_no_modules_core_code_sender() {
-    // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::allowlist_genesis();
-    executor.set_golden_file(current_function_name!());
-
-    // create a transaction trying to publish a new module.
-    let sender = Account::new_genesis_account(account_config::CORE_CODE_ADDRESS);
-
-    let program = String::from(
-        "
-        module 0x1.M {
-        }
-        ",
-    );
-
-    let random_script = compile_module(&program).1;
-    let txn = sender
-        .transaction()
-        .module(random_script)
-        .sequence_number(1)
-        .sign();
-    // Doesn't work because the core code address doesn't exist
-    assert_prologue_parity!(
-        executor.verify_transaction(txn.clone()).status(),
-        executor.execute_transaction(txn).status(),
-        StatusCode::INVALID_MODULE_PUBLISHER
-    );
-}
-
-#[test]
-pub fn test_publishing_no_modules_invalid_sender() {
-    // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::allowlist_genesis();
-    executor.set_golden_file(current_function_name!());
-
-    // create a transaction trying to publish a new module.
-    let sender = executor.create_raw_account_data(1_000_000, 10);
-    executor.add_account_data(&sender);
 
     let program = format!(
         "
@@ -407,22 +280,54 @@ pub fn test_publishing_no_modules_invalid_sender() {
 
     let random_script = compile_module(&program).1;
     let txn = sender
+        .transaction()
+        .module(random_script)
+        .sequence_number(0)
+        .sign();
+    assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
+    assert_eq!(
+        executor.execute_transaction(txn).status(),
+        &TransactionStatus::Keep(ExecutionStatus::Success)
+    );
+}
+
+#[test]
+pub fn test_publishing_modules_invalid_sender() {
+    // create a FakeExecutor with a genesis from file
+    let mut executor = FakeExecutor::from_head_genesis();
+    executor.set_golden_file(current_function_name!());
+
+    // create a transaction trying to publish a new module.
+    let sender = executor.create_raw_account_data(1_000_000, 10);
+    executor.add_account_data(&sender);
+
+    let program = String::from(
+        "
+        module 0x1.M {
+        }
+        ",
+    );
+
+    let random_script = compile_module(&program).1;
+    let txn = sender
         .account()
         .transaction()
         .module(random_script)
         .sequence_number(10)
         .sign();
-    assert_prologue_parity!(
-        executor.verify_transaction(txn.clone()).status(),
+    assert_eq!(
         executor.execute_transaction(txn).status(),
-        StatusCode::INVALID_MODULE_PUBLISHER
+        // this should be MODULE_ADDRESS_DOES_NOT_MATCH_SENDER but we don't do this check in prologue now
+        &TransactionStatus::Keep(ExecutionStatus::MiscellaneousError(Some(
+            StatusCode::MODULE_ADDRESS_DOES_NOT_MATCH_SENDER
+        ))),
     );
 }
 
 #[test]
 pub fn test_publishing_allow_modules() {
     // create a FakeExecutor with a genesis from file
-    let mut executor = FakeExecutor::from_genesis_with_options(VMPublishingOption::open());
+    let mut executor = FakeExecutor::from_head_genesis();
     executor.set_golden_file(current_function_name!());
 
     // create a transaction trying to publish a new module.
@@ -447,6 +352,6 @@ pub fn test_publishing_allow_modules() {
     assert_eq!(executor.verify_transaction(txn.clone()).status(), None);
     assert_eq!(
         executor.execute_transaction(txn).status(),
-        &TransactionStatus::Keep(KeptVMStatus::Executed)
+        &TransactionStatus::Keep(ExecutionStatus::Success)
     );
 }

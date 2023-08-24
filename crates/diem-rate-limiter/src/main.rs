@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_infallible::Mutex;
@@ -12,7 +13,6 @@ use futures::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     Future, SinkExt, StreamExt,
 };
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -49,7 +49,7 @@ struct RunStats {
 
 /// A main function for testing rate limiting throughput and backpressure
 fn main() {
-    diem_logger::DiemLogger::init_for_testing();
+    diem_logger::Logger::init_for_testing();
     println!("Starting experiments");
     println!(
         "Bytes to test: {}, Expected Throughput(actions/s): {}, Expected Throughput(bytes/s): {}",

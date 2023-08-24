@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     thread::ThreadService,
     SafetyRules, TSafetyRules,
 };
-use diem_config::config::{SafetyRulesConfig, SafetyRulesService};
+use diem_config::config::{InitialSafetyRulesConfig, SafetyRulesConfig, SafetyRulesService};
 use diem_infallible::RwLock;
 use diem_secure_storage::{KVStorage, Storage};
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
@@ -29,23 +30,47 @@ pub fn storage(config: &SafetyRulesConfig) -> PersistentSafetyStorage {
             .as_ref()
             .expect("Missing consensus key in test config")
             .private_key();
-        let execution_private_key = test_config
-            .execution_key
-            .as_ref()
-            .expect("Missing execution key in test config")
-            .private_key();
         let waypoint = test_config.waypoint.expect("No waypoint in config");
 
         PersistentSafetyStorage::initialize(
             internal_storage,
             author,
             consensus_private_key,
-            execution_private_key,
             waypoint,
             config.enable_cached_safety_data,
         )
     } else {
-        PersistentSafetyStorage::new(internal_storage, config.enable_cached_safety_data)
+        let storage =
+            PersistentSafetyStorage::new(internal_storage, config.enable_cached_safety_data);
+        // If it's initialized, then we can continue
+        if storage.author().is_ok() {
+            storage
+        } else if !matches!(
+            config.initial_safety_rules_config,
+            InitialSafetyRulesConfig::None
+        ) {
+            let identity_blob = config.initial_safety_rules_config.identity_blob();
+            let waypoint = config.initial_safety_rules_config.waypoint();
+
+            let backend = &config.backend;
+            let internal_storage: Storage =
+                backend.try_into().expect("Unable to initialize storage");
+            PersistentSafetyStorage::initialize(
+                internal_storage,
+                identity_blob
+                    .account_address
+                    .expect("AccountAddress needed for safety rules"),
+                identity_blob
+                    .consensus_private_key
+                    .expect("Consensus key needed for safety rules"),
+                waypoint,
+                config.enable_cached_safety_data,
+            )
+        } else {
+            panic!(
+                "Safety rules storage is not initialized, provide an initial safety rules config"
+            )
+        }
     }
 }
 
@@ -67,39 +92,16 @@ impl SafetyRulesManager {
         }
 
         let storage = storage(config);
-        let verify_vote_proposal_signature = config.verify_vote_proposal_signature;
-        let export_consensus_key = config.export_consensus_key;
         match config.service {
-            SafetyRulesService::Local => Self::new_local(
-                storage,
-                verify_vote_proposal_signature,
-                export_consensus_key,
-            ),
-            SafetyRulesService::Serializer => Self::new_serializer(
-                storage,
-                verify_vote_proposal_signature,
-                export_consensus_key,
-            ),
-            SafetyRulesService::Thread => Self::new_thread(
-                storage,
-                verify_vote_proposal_signature,
-                export_consensus_key,
-                config.network_timeout_ms,
-            ),
+            SafetyRulesService::Local => Self::new_local(storage),
+            SafetyRulesService::Serializer => Self::new_serializer(storage),
+            SafetyRulesService::Thread => Self::new_thread(storage, config.network_timeout_ms),
             _ => panic!("Unimplemented SafetyRulesService: {:?}", config.service),
         }
     }
 
-    pub fn new_local(
-        storage: PersistentSafetyStorage,
-        verify_vote_proposal_signature: bool,
-        export_consensus_key: bool,
-    ) -> Self {
-        let safety_rules = SafetyRules::new(
-            storage,
-            verify_vote_proposal_signature,
-            export_consensus_key,
-        );
+    pub fn new_local(storage: PersistentSafetyStorage) -> Self {
+        let safety_rules = SafetyRules::new(storage);
         Self {
             internal_safety_rules: SafetyRulesWrapper::Local(Arc::new(RwLock::new(safety_rules))),
         }
@@ -112,16 +114,8 @@ impl SafetyRulesManager {
         }
     }
 
-    pub fn new_serializer(
-        storage: PersistentSafetyStorage,
-        verify_vote_proposal_signature: bool,
-        export_consensus_key: bool,
-    ) -> Self {
-        let safety_rules = SafetyRules::new(
-            storage,
-            verify_vote_proposal_signature,
-            export_consensus_key,
-        );
+    pub fn new_serializer(storage: PersistentSafetyStorage) -> Self {
+        let safety_rules = SafetyRules::new(storage);
         let serializer_service = SerializerService::new(safety_rules);
         Self {
             internal_safety_rules: SafetyRulesWrapper::Serializer(Arc::new(RwLock::new(
@@ -130,18 +124,8 @@ impl SafetyRulesManager {
         }
     }
 
-    pub fn new_thread(
-        storage: PersistentSafetyStorage,
-        verify_vote_proposal_signature: bool,
-        export_consensus_key: bool,
-        timeout_ms: u64,
-    ) -> Self {
-        let thread = ThreadService::new(
-            storage,
-            verify_vote_proposal_signature,
-            export_consensus_key,
-            timeout_ms,
-        );
+    pub fn new_thread(storage: PersistentSafetyStorage, timeout_ms: u64) -> Self {
+        let thread = ThreadService::new(storage, timeout_ms);
         Self {
             internal_safety_rules: SafetyRulesWrapper::Thread(thread),
         }
@@ -151,11 +135,11 @@ impl SafetyRulesManager {
         match &self.internal_safety_rules {
             SafetyRulesWrapper::Local(safety_rules) => {
                 Box::new(LocalClient::new(safety_rules.clone()))
-            }
+            },
             SafetyRulesWrapper::Process(process) => Box::new(process.client()),
             SafetyRulesWrapper::Serializer(serializer_service) => {
                 Box::new(SerializerClient::new(serializer_service.clone()))
-            }
+            },
             SafetyRulesWrapper::Thread(thread) => Box::new(thread.client()),
         }
     }

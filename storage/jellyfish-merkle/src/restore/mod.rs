@@ -1,24 +1,23 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module implements the functionality to restore a `JellyfishMerkleTree` from small chunks
 //! of accounts.
-
-#[cfg(test)]
-mod restore_test;
 
 use crate::{
     node_type::{
         get_child_and_sibling_half_start, Child, Children, InternalNode, LeafNode, Node, NodeKey,
         NodeType,
     },
-    NibbleExt, NodeBatch, TreeReader, TreeWriter, ROOT_NIBBLE_HEIGHT,
+    NibbleExt, TreeReader, TreeWriter, IO_POOL, ROOT_NIBBLE_HEIGHT,
 };
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use diem_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
+use diem_logger::info;
 use diem_types::{
     nibble::{
         nibble_path::{NibbleIterator, NibblePath},
@@ -27,12 +26,18 @@ use diem_types::{
     proof::{SparseMerkleInternalNode, SparseMerkleLeafNode, SparseMerkleRangeProof},
     transaction::Version,
 };
-use mirai_annotations::*;
-use std::sync::Arc;
-use storage_interface::StateSnapshotReceiver;
+use itertools::Itertools;
+use std::{
+    cmp::Eq,
+    collections::HashMap,
+    sync::{
+        mpsc::{channel, Receiver},
+        Arc,
+    },
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ChildInfo<V> {
+enum ChildInfo<K> {
     /// This child is an internal node. The hash of the internal node is stored here if it is
     /// known, otherwise it is `None`. In the process of restoring a tree, we will only know the
     /// hash of an internal node after we see all the keys that share the same prefix.
@@ -42,12 +47,12 @@ enum ChildInfo<V> {
     },
 
     /// This child is a leaf node.
-    Leaf { node: LeafNode<V> },
+    Leaf(LeafNode<K>),
 }
 
-impl<V> ChildInfo<V>
+impl<K> ChildInfo<K>
 where
-    V: crate::Value,
+    K: crate::Key + CryptoHash,
 {
     /// Converts `self` to a child, assuming the hash is known if it's an internal node.
     fn into_child(self, version: Version) -> Child {
@@ -55,28 +60,28 @@ where
             Self::Internal { hash, leaf_count } => Child::new(
                 hash.expect("Must have been initialized."),
                 version,
-                leaf_count
-                    .map(|n| NodeType::Internal { leaf_count: n })
-                    .unwrap_or(NodeType::InternalLegacy),
+                NodeType::Internal {
+                    leaf_count: leaf_count.expect("Must be complete already."),
+                },
             ),
-            Self::Leaf { node } => Child::new(node.hash(), version, NodeType::Leaf),
+            Self::Leaf(node) => Child::new(node.hash(), version, NodeType::Leaf),
         }
     }
 }
 
 #[derive(Clone, Debug)]
-struct InternalInfo<V> {
+struct InternalInfo<K> {
     /// The node key of this internal node.
     node_key: NodeKey,
 
     /// The existing children. Every time a child appears, the corresponding position will be set
     /// to `Some`.
-    children: [Option<ChildInfo<V>>; 16],
+    children: [Option<ChildInfo<K>>; 16],
 }
 
-impl<V> InternalInfo<V>
+impl<K> InternalInfo<K>
 where
-    V: crate::Value,
+    K: crate::Key + CryptoHash,
 {
     /// Creates an empty internal node with no children.
     fn new_empty(node_key: NodeKey) -> Self {
@@ -86,18 +91,13 @@ where
         }
     }
 
-    fn set_child(&mut self, index: usize, child_info: ChildInfo<V>) {
-        precondition!(index < 16);
+    fn set_child(&mut self, index: usize, child_info: ChildInfo<K>) {
         self.children[index] = Some(child_info);
     }
 
     /// Converts `self` to an internal node, assuming all of its children are already known and
     /// fully initialized.
-    fn into_internal_node(
-        mut self,
-        version: Version,
-        leaf_count_migration: bool,
-    ) -> (NodeKey, InternalNode) {
+    fn into_internal_node(mut self, version: Version) -> (NodeKey, InternalNode) {
         let mut children = Children::new();
 
         // Calling `into_iter` on an array is equivalent to calling `iter`:
@@ -108,16 +108,13 @@ where
             }
         }
 
-        (
-            self.node_key,
-            InternalNode::new_migration(children, leaf_count_migration),
-        )
+        (self.node_key, InternalNode::new(children))
     }
 }
 
-pub struct JellyfishMerkleRestore<V> {
+pub struct JellyfishMerkleRestore<K> {
     /// The underlying storage.
-    store: Arc<dyn TreeWriter<V>>,
+    store: Arc<dyn TreeWriter<K>>,
 
     /// The version of the tree we are restoring.
     version: Version,
@@ -152,14 +149,14 @@ pub struct JellyfishMerkleRestore<V> {
     /// might cause a few internal nodes to be created additionally. If it appears at position `C`,
     /// it will also cause `partial_nodes[1]` to be added to `frozen_nodes` as an internal node and
     /// be removed from `partial_nodes`.
-    partial_nodes: Vec<InternalInfo<V>>,
+    partial_nodes: Vec<InternalInfo<K>>,
 
     /// The nodes that have been fully restored and are ready to be written to storage.
-    frozen_nodes: NodeBatch<V>,
+    frozen_nodes: HashMap<NodeKey, Node<K>>,
 
-    /// The most recently added leaf. This is used to ensure the keys come in increasing order and
-    /// do proof verification.
-    previous_leaf: Option<LeafNode<V>>,
+    /// The most recently added leaf. This is used to ensure the keys come in increasing
+    /// order and do proof verification.
+    previous_leaf: Option<LeafNode<K>>,
 
     /// The number of keys we have received since the most recent restart.
     num_keys_received: u64,
@@ -167,74 +164,100 @@ pub struct JellyfishMerkleRestore<V> {
     /// When the restoration process finishes, we expect the tree to have this root hash.
     expected_root_hash: HashValue,
 
-    /// Whether to use the new internal node format where leaf counts are written.
-    leaf_count_migration: bool,
+    /// Already finished, deem all chunks overlap.
+    finished: bool,
+
+    async_commit: bool,
+    async_commit_result: Option<Receiver<Result<()>>>,
 }
 
-impl<V> JellyfishMerkleRestore<V>
+impl<K> JellyfishMerkleRestore<K>
 where
-    V: crate::Value,
+    K: crate::Key + CryptoHash + 'static,
 {
-    pub fn new<D: 'static + TreeReader<V> + TreeWriter<V>>(
+    pub fn new<D: 'static + TreeReader<K> + TreeWriter<K>>(
         store: Arc<D>,
         version: Version,
         expected_root_hash: HashValue,
-        leaf_count_migration: bool,
+        async_commit: bool,
     ) -> Result<Self> {
         let tree_reader = Arc::clone(&store);
-        let (partial_nodes, previous_leaf) =
-            if let Some((node_key, leaf_node)) = tree_reader.get_rightmost_leaf()? {
-                // TODO: confirm rightmost leaf is at the desired version
-                // If the system crashed in the middle of the previous restoration attempt, we need
-                // to recover the partial nodes to the state right before the crash.
-                (
-                    Self::recover_partial_nodes(tree_reader.as_ref(), version, node_key)?,
-                    Some(leaf_node),
-                )
-            } else {
-                (
-                    vec![InternalInfo::new_empty(NodeKey::new_empty_path(version))],
-                    None,
-                )
-            };
+        let (finished, partial_nodes, previous_leaf) = if let Some(root_node) =
+            tree_reader.get_node_option(&NodeKey::new_empty_path(version), "restore")?
+        {
+            info!("Previous restore is complete, checking root hash.");
+            ensure!(
+                root_node.hash() == expected_root_hash,
+                "Previous completed restore has root hash {}, expecting {}",
+                root_node.hash(),
+                expected_root_hash,
+            );
+            (true, vec![], None)
+        } else if let Some((node_key, leaf_node)) = tree_reader.get_rightmost_leaf(version)? {
+            // If the system crashed in the middle of the previous restoration attempt, we need
+            // to recover the partial nodes to the state right before the crash.
+            (
+                false,
+                Self::recover_partial_nodes(tree_reader.as_ref(), version, node_key)?,
+                Some(leaf_node),
+            )
+        } else {
+            (
+                false,
+                vec![InternalInfo::new_empty(NodeKey::new_empty_path(version))],
+                None,
+            )
+        };
 
         Ok(Self {
             store,
             version,
             partial_nodes,
-            frozen_nodes: NodeBatch::new(),
+            frozen_nodes: HashMap::new(),
             previous_leaf,
             num_keys_received: 0,
             expected_root_hash,
-            leaf_count_migration,
+            finished,
+            async_commit,
+            async_commit_result: None,
         })
     }
 
-    pub fn new_overwrite<D: 'static + TreeWriter<V>>(
+    pub fn new_overwrite<D: 'static + TreeWriter<K>>(
         store: Arc<D>,
         version: Version,
         expected_root_hash: HashValue,
-        leaf_count_migration: bool,
     ) -> Result<Self> {
         Ok(Self {
             store,
             version,
             partial_nodes: vec![InternalInfo::new_empty(NodeKey::new_empty_path(version))],
-            frozen_nodes: NodeBatch::new(),
+            frozen_nodes: HashMap::new(),
             previous_leaf: None,
             num_keys_received: 0,
             expected_root_hash,
-            leaf_count_migration,
+            finished: false,
+            async_commit: false,
+            async_commit_result: None,
         })
+    }
+
+    pub fn previous_key_hash(&self) -> Option<HashValue> {
+        if self.finished {
+            // Hack: prevent any chunk to be added.
+            Some(HashValue::new([0xFF; HashValue::LENGTH]))
+        } else {
+            self.previous_leaf.as_ref().map(|leaf| leaf.account_key())
+        }
     }
 
     /// Recovers partial nodes from storage. We do this by looking at all the ancestors of the
     /// rightmost leaf. The ones do not exist in storage are the partial nodes.
     fn recover_partial_nodes(
-        store: &dyn TreeReader<V>,
+        store: &dyn TreeReader<K>,
         version: Version,
         rightmost_leaf_node_key: NodeKey,
-    ) -> Result<Vec<InternalInfo<V>>> {
+    ) -> Result<Vec<InternalInfo<K>>> {
         ensure!(
             !rightmost_leaf_node_key.nibble_path().is_empty(),
             "Root node would not be written until entire restoration process has completed \
@@ -245,7 +268,7 @@ where
         // is not a partial node. Go to the parent node and repeat until we see a node that does
         // not exist. This node and all its ancestors will be the partial nodes.
         let mut node_key = rightmost_leaf_node_key.gen_parent_node_key();
-        while store.get_node_option(&node_key)?.is_some() {
+        while store.get_node_option(&node_key, "restore")?.is_some() {
             node_key = node_key.gen_parent_node_key();
         }
 
@@ -263,14 +286,14 @@ where
 
             for i in 0..previous_child_index.unwrap_or(16) {
                 let child_node_key = node_key.gen_child_node_key(version, (i as u8).into());
-                if let Some(node) = store.get_node_option(&child_node_key)? {
+                if let Some(node) = store.get_node_option(&child_node_key, "restore")? {
                     let child_info = match node {
                         Node::Internal(internal_node) => ChildInfo::Internal {
                             hash: Some(internal_node.hash()),
-                            leaf_count: internal_node.leaf_count(),
+                            leaf_count: Some(internal_node.leaf_count()),
                         },
-                        Node::Leaf(leaf_node) => ChildInfo::Leaf { node: leaf_node },
-                        Node::Null => bail!("Null node should not appear in storage."),
+                        Node::Leaf(leaf_node) => ChildInfo::Leaf(leaf_node),
+                        Node::Null => unreachable!("Child cannot be Null"),
                     };
                     internal_info.set_child(i, child_info);
                 }
@@ -281,13 +304,10 @@ where
             // partial node and we do not know its hash yet. For the lowest partial node, we just
             // find all its known children from storage in the loop above.
             if let Some(index) = previous_child_index {
-                internal_info.set_child(
-                    index,
-                    ChildInfo::Internal {
-                        hash: None,
-                        leaf_count: None,
-                    },
-                );
+                internal_info.set_child(index, ChildInfo::Internal {
+                    hash: None,
+                    leaf_count: None,
+                });
             }
 
             partial_nodes.push(internal_info);
@@ -305,22 +325,54 @@ where
     /// Restores a chunk of accounts. This function will verify that the given chunk is correct
     /// using the proof and root hash, then write things to storage. If the chunk is invalid, an
     /// error will be returned and nothing will be written to storage.
-    fn add_chunk_impl(
+    pub fn add_chunk_impl(
         &mut self,
-        chunk: Vec<(HashValue, V)>,
+        mut chunk: Vec<(&K, HashValue)>,
         proof: SparseMerkleRangeProof,
     ) -> Result<()> {
-        ensure!(!chunk.is_empty(), "Should not add empty chunks.");
+        if self.finished {
+            info!("State snapshot restore already finished, ignoring entire chunk.");
+            return Ok(());
+        }
 
-        for (key, value) in chunk {
+        if let Some(prev_leaf) = &self.previous_leaf {
+            let skip_until = chunk
+                .iter()
+                .find_position(|(key, _hash)| key.hash() > prev_leaf.account_key());
+            chunk = match skip_until {
+                None => {
+                    info!("Skipping entire chunk.");
+                    return Ok(());
+                },
+                Some((0, _)) => chunk,
+                Some((num_to_skip, next_leaf)) => {
+                    info!(
+                        num_to_skip = num_to_skip,
+                        next_leaf = next_leaf,
+                        "Skipping leaves."
+                    );
+                    chunk.split_off(num_to_skip)
+                },
+            }
+        };
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        for (key, value_hash) in chunk {
+            let hashed_key = key.hash();
             if let Some(ref prev_leaf) = self.previous_leaf {
                 ensure!(
-                    key > prev_leaf.account_key(),
+                    hashed_key > prev_leaf.account_key(),
                     "Account keys must come in increasing order.",
                 )
             }
-            self.add_one(key, value.clone());
-            self.previous_leaf.replace(LeafNode::new(key, value));
+            self.previous_leaf.replace(LeafNode::new(
+                hashed_key,
+                value_hash,
+                (key.clone(), self.version),
+            ));
+            self.add_one(key, value_hash);
             self.num_keys_received += 1;
         }
 
@@ -328,15 +380,31 @@ where
         self.verify(proof)?;
 
         // Write the frozen nodes to storage.
-        self.store.write_node_batch(&self.frozen_nodes)?;
-        self.frozen_nodes.clear();
+        if self.async_commit {
+            self.wait_for_async_commit()?;
+            let (tx, rx) = channel();
+            self.async_commit_result = Some(rx);
+
+            let mut frozen_nodes = HashMap::new();
+            std::mem::swap(&mut frozen_nodes, &mut self.frozen_nodes);
+            let store = self.store.clone();
+
+            IO_POOL.spawn(move || {
+                let res = store.write_node_batch(&frozen_nodes);
+                tx.send(res).unwrap();
+            });
+        } else {
+            self.store.write_node_batch(&self.frozen_nodes)?;
+            self.frozen_nodes.clear();
+        }
 
         Ok(())
     }
 
     /// Restores one account.
-    fn add_one(&mut self, new_key: HashValue, new_value: V) {
-        let nibble_path = NibblePath::new(new_key.to_vec());
+    fn add_one(&mut self, new_key: &K, new_value_hash: HashValue) {
+        let new_hashed_key = new_key.hash();
+        let nibble_path = NibblePath::new_even(new_hashed_key.to_vec());
         let mut nibbles = nibble_path.nibbles();
 
         for i in 0..ROOT_NIBBLE_HEIGHT {
@@ -347,7 +415,7 @@ where
                 Some(ref child_info) => {
                     // If there exists an internal node at this position, we just continue the loop
                     // with the next nibble. Here we deal with the leaf case.
-                    if let ChildInfo::Leaf { node } = child_info {
+                    if let ChildInfo::Leaf(node) = child_info {
                         assert_eq!(
                             i,
                             self.partial_nodes.len() - 1,
@@ -360,12 +428,12 @@ where
                             child_index,
                             existing_leaf,
                             new_key,
-                            new_value,
+                            new_value_hash,
                             nibbles,
                         );
                         break;
                     }
-                }
+                },
                 None => {
                     // This means that we are going to put a leaf in this position. For all the
                     // descendants on the left, they are now frozen.
@@ -374,15 +442,17 @@ where
                     // Mark this position as a leaf child.
                     self.partial_nodes[i].set_child(
                         child_index,
-                        ChildInfo::Leaf {
-                            node: LeafNode::new(new_key, new_value),
-                        },
+                        ChildInfo::Leaf(LeafNode::new(
+                            new_hashed_key,
+                            new_value_hash,
+                            (new_key.clone(), self.version),
+                        )),
                     );
 
                     // We do not add this leaf node to self.frozen_nodes because we don't know its
                     // node key yet. We will know its node key when the next account comes.
                     break;
-                }
+                },
             }
         }
     }
@@ -393,9 +463,9 @@ where
     fn insert_at_leaf(
         &mut self,
         child_index: usize,
-        existing_leaf: LeafNode<V>,
-        new_key: HashValue,
-        new_value: V,
+        existing_leaf: LeafNode<K>,
+        new_key: &K,
+        new_value_hash: HashValue,
         mut remaining_nibbles: NibbleIterator,
     ) {
         let num_existing_partial_nodes = self.partial_nodes.len();
@@ -412,22 +482,20 @@ where
 
         // Next we build the new internal nodes from top to bottom. All these internal node except
         // the bottom one will now have a single internal node child.
+        let new_hashed_key = CryptoHash::hash(new_key);
         let common_prefix_len = existing_leaf
             .account_key()
-            .common_prefix_nibbles_len(new_key);
+            .common_prefix_nibbles_len(new_hashed_key);
         for _ in num_existing_partial_nodes..common_prefix_len {
             let visited_nibbles = remaining_nibbles.visited_nibbles().collect();
             let next_nibble = remaining_nibbles.next().expect("This nibble must exist.");
             let new_node_key = NodeKey::new(self.version, visited_nibbles);
 
             let mut internal_info = InternalInfo::new_empty(new_node_key);
-            internal_info.set_child(
-                u8::from(next_nibble) as usize,
-                ChildInfo::Internal {
-                    hash: None,
-                    leaf_count: None,
-                },
-            );
+            internal_info.set_child(u8::from(next_nibble) as usize, ChildInfo::Internal {
+                hash: None,
+                leaf_count: None,
+            });
             self.partial_nodes.push(internal_info);
         }
 
@@ -440,9 +508,7 @@ where
         let existing_child_index = existing_leaf.account_key().get_nibble(common_prefix_len);
         internal_info.set_child(
             u8::from(existing_child_index) as usize,
-            ChildInfo::Leaf {
-                node: existing_leaf,
-            },
+            ChildInfo::Leaf(existing_leaf),
         );
 
         // Do not set the new child for now. We always call `freeze` first, then set the new child
@@ -452,7 +518,7 @@ where
         self.freeze(self.partial_nodes.len());
 
         // Now we set the new child.
-        let new_child_index = new_key.get_nibble(common_prefix_len);
+        let new_child_index = new_hashed_key.get_nibble(common_prefix_len);
         assert!(
             new_child_index > existing_child_index,
             "New leaf must be on the right.",
@@ -462,9 +528,11 @@ where
             .expect("This node must exist.")
             .set_child(
                 u8::from(new_child_index) as usize,
-                ChildInfo::Leaf {
-                    node: LeafNode::new(new_key, new_value),
-                },
+                ChildInfo::Leaf(LeafNode::new(
+                    new_hashed_key,
+                    new_value_hash,
+                    (new_key.clone(), self.version),
+                )),
             );
     }
 
@@ -493,13 +561,13 @@ where
             .expect("Must have at least one child.");
 
         match last_node.children[rightmost_child_index] {
-            Some(ChildInfo::Leaf { ref node }) => {
+            Some(ChildInfo::Leaf(ref node)) => {
                 let child_node_key = last_node
                     .node_key
                     .gen_child_node_key(self.version, (rightmost_child_index as u8).into());
                 self.frozen_nodes
                     .insert(child_node_key, node.clone().into());
-            }
+            },
             _ => panic!("Must have at least one child and must not have further internal nodes."),
         }
     }
@@ -509,8 +577,7 @@ where
     fn freeze_internal_nodes(&mut self, num_remaining_nodes: usize) {
         while self.partial_nodes.len() > num_remaining_nodes {
             let last_node = self.partial_nodes.pop().expect("This node must exist.");
-            let (node_key, internal_node) =
-                last_node.into_internal_node(self.version, self.leaf_count_migration);
+            let (node_key, internal_node) = last_node.into_internal_node(self.version);
             // Keep the hash of this node before moving it into `frozen_nodes`, so we can update
             // its parent later.
             let node_hash = internal_node.hash();
@@ -533,9 +600,8 @@ where
                         ref mut leaf_count,
                     }) => {
                         assert_eq!(hash.replace(node_hash), None);
-                        assert!(leaf_count.is_none());
-                        node_leaf_count.map(|n| leaf_count.replace(n));
-                    }
+                        assert_eq!(leaf_count.replace(node_leaf_count), None);
+                    },
                     _ => panic!(
                         "Must have at least one child and the rightmost child must not be a leaf."
                     ),
@@ -553,8 +619,8 @@ where
             .previous_leaf
             .as_ref()
             .expect("The previous leaf must exist.");
-        let previous_key = previous_leaf.account_key();
 
+        let previous_key = previous_leaf.account_key();
         // If we have all siblings on the path from root to `previous_key`, we should be able to
         // compute the root hash. The siblings on the right are already in the proof. Now we
         // compute the siblings on the left side, which represent all the accounts that have ever
@@ -618,7 +684,7 @@ where
     }
 
     /// Computes the sibling on the left for the `n`-th child.
-    fn compute_left_sibling(partial_node: &InternalInfo<V>, n: Nibble, height: u8) -> HashValue {
+    fn compute_left_sibling(partial_node: &InternalInfo<K>, n: Nibble, height: u8) -> HashValue {
         assert!(height < 4);
         let width = 1usize << height;
         let start = get_child_and_sibling_half_start(n, height).1 as usize;
@@ -626,7 +692,7 @@ where
     }
 
     /// Returns the hash for given portion of the subtree and whether this part is a leaf node.
-    fn compute_left_sibling_impl(children: &[Option<ChildInfo<V>>]) -> (HashValue, bool) {
+    fn compute_left_sibling_impl(children: &[Option<ChildInfo<K>>]) -> (HashValue, bool) {
         assert!(!children.is_empty());
 
         let num_children = children.len();
@@ -636,8 +702,8 @@ where
             match &children[0] {
                 Some(ChildInfo::Internal { hash, .. }) => {
                     (*hash.as_ref().expect("The hash must be known."), false)
-                }
-                Some(ChildInfo::Leaf { node }) => (node.hash(), true),
+                },
+                Some(ChildInfo::Leaf(node)) => (node.hash(), true),
                 None => (*SPARSE_MERKLE_PLACEHOLDER_HASH, true),
             }
         } else {
@@ -659,52 +725,61 @@ where
         }
     }
 
+    pub fn wait_for_async_commit(&mut self) -> Result<()> {
+        if let Some(rx) = self.async_commit_result.take() {
+            rx.recv()??;
+        }
+        Ok(())
+    }
+
     /// Finishes the restoration process. This tells the code that there is no more account,
     /// otherwise we can not freeze the rightmost leaf and its ancestors.
-    fn finish_impl(mut self) -> Result<()> {
-        // Deal with the special case when the entire tree has a single leaf.
+    pub fn finish_impl(mut self) -> Result<()> {
+        self.wait_for_async_commit()?;
+        // Deal with the special case when the entire tree has a single leaf or null node.
         if self.partial_nodes.len() == 1 {
             let mut num_children = 0;
             let mut leaf = None;
             for i in 0..16 {
                 if let Some(ref child_info) = self.partial_nodes[0].children[i] {
                     num_children += 1;
-                    if let ChildInfo::Leaf { node } = child_info {
+                    if let ChildInfo::Leaf(node) = child_info {
                         leaf = Some(node.clone());
                     }
                 }
             }
 
-            if num_children == 1 {
-                if let Some(node) = leaf {
+            match num_children {
+                0 => {
                     let node_key = NodeKey::new_empty_path(self.version);
                     assert!(self.frozen_nodes.is_empty());
-                    self.frozen_nodes.insert(node_key, node.into());
+                    self.frozen_nodes.insert(node_key, Node::Null);
                     self.store.write_node_batch(&self.frozen_nodes)?;
                     return Ok(());
-                }
+                },
+                1 => {
+                    if let Some(node) = leaf {
+                        let node_key = NodeKey::new_empty_path(self.version);
+                        assert!(self.frozen_nodes.is_empty());
+                        self.frozen_nodes.insert(node_key, node.into());
+                        self.store.write_node_batch(&self.frozen_nodes)?;
+                        return Ok(());
+                    }
+                },
+                _ => (),
             }
         }
 
         self.freeze(0);
-        self.store.write_node_batch(&self.frozen_nodes)
+        self.store.write_node_batch(&self.frozen_nodes)?;
+        Ok(())
     }
 }
 
-impl<V: crate::Value> StateSnapshotReceiver<V> for JellyfishMerkleRestore<V> {
-    fn add_chunk(
-        &mut self,
-        chunk: Vec<(HashValue, V)>,
-        proof: SparseMerkleRangeProof,
-    ) -> Result<()> {
-        self.add_chunk_impl(chunk, proof)
-    }
-
-    fn finish(self) -> Result<()> {
-        self.finish_impl()
-    }
-
-    fn finish_box(self: Box<Self>) -> Result<()> {
-        self.finish_impl()
+impl<K> Drop for JellyfishMerkleRestore<K> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.async_commit_result.take() {
+            rx.recv().unwrap().unwrap();
+        }
     }
 }

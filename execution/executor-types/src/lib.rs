@@ -1,47 +1,47 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
 #![forbid(unsafe_code)]
-
-mod error;
-mod executed_chunk;
-
-pub use error::Error;
 
 use anyhow::Result;
 use diem_crypto::{
-    ed25519::Ed25519Signature,
-    hash::{
-        EventAccumulatorHasher, TransactionAccumulatorHasher, ACCUMULATOR_PLACEHOLDER_HASH,
-        SPARSE_MERKLE_PLACEHOLDER_HASH,
-    },
+    hash::{EventAccumulatorHasher, TransactionAccumulatorHasher, ACCUMULATOR_PLACEHOLDER_HASH},
     HashValue,
 };
-use diem_state_view::StateViewId;
+use diem_scratchpad::{ProofRead, SparseMerkleTree};
 use diem_types::{
-    account_address::AccountAddress,
-    account_state_blob::AccountStateBlob,
+    block_executor::partitioner::ExecutableBlock,
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    nibble::nibble_path::NibblePath,
-    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof},
+    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof, SparseMerkleProofExt},
+    state_store::{state_key::StateKey, state_value::StateValue},
     transaction::{
         Transaction, TransactionInfo, TransactionListWithProof, TransactionOutputListWithProof,
         TransactionStatus, Version,
     },
     write_set::WriteSet,
 };
-use scratchpad::ProofRead;
-use serde::{Deserialize, Serialize};
-use std::{cmp::max, collections::HashMap, sync::Arc};
-use storage_interface::DbReader;
-
+pub use error::Error;
+pub use executed_block::ExecutedBlock;
 pub use executed_chunk::ExecutedChunk;
-use storage_interface::state_view::VerifiedStateView;
+pub use parsed_transaction_output::ParsedTransactionOutput;
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::max,
+    collections::{BTreeSet, HashMap},
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-type SparseMerkleProof = diem_types::proof::SparseMerkleProof<AccountStateBlob>;
-type SparseMerkleTree = scratchpad::SparseMerkleTree<AccountStateBlob>;
+mod error;
+mod executed_block;
+mod executed_chunk;
+pub mod in_memory_state_calculator;
+mod parsed_transaction_output;
 
 pub trait ChunkExecutorTrait: Send + Sync {
     /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
@@ -62,25 +62,22 @@ pub trait ChunkExecutorTrait: Send + Sync {
         // Target LI that has been verified independently: the proofs are relative to this version.
         verified_target_li: &LedgerInfoWithSignatures,
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<()>;
 
-    /// Commit a previously executed chunk. Returns a vector of reconfiguration
-    /// events in the chunk and the transactions that were committed.
-    fn commit_chunk(&self) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
+    /// Commit a previously executed chunk. Returns a chunk commit notification.
+    fn commit_chunk(&self) -> Result<ChunkCommitNotification>;
 
-    fn execute_and_commit_chunk(
-        &self,
-        txn_list_with_proof: TransactionListWithProof,
-        verified_target_li: &LedgerInfoWithSignatures,
-        epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
+    /// Resets the chunk executor by synchronizing state with storage.
+    fn reset(&self) -> Result<()>;
 
-    fn apply_and_commit_chunk(
-        &self,
-        txn_output_list_with_proof: TransactionOutputListWithProof,
-        verified_target_li: &LedgerInfoWithSignatures,
-        epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
+    /// Finishes the chunk executor by releasing memory held by inner data structures(SMT).
+    fn finish(&self);
+}
+
+pub struct StateSnapshotDelta {
+    pub version: Version,
+    pub smt: SparseMerkleTree<StateValue>,
+    pub jmt_updates: Vec<(HashValue, (HashValue, StateKey))>,
 }
 
 pub trait BlockExecutorTrait: Send + Sync {
@@ -88,13 +85,14 @@ pub trait BlockExecutorTrait: Send + Sync {
     fn committed_block_id(&self) -> HashValue;
 
     /// Reset the internal state including cache with newly fetched latest committed block from storage.
-    fn reset(&self) -> Result<(), Error>;
+    fn reset(&self) -> Result<()>;
 
     /// Executes a block.
     fn execute_block(
         &self,
-        block: (HashValue, Vec<Transaction>),
+        block: ExecutableBlock<Transaction>,
         parent_block_id: HashValue,
+        maybe_block_gas_limit: Option<u64>,
     ) -> Result<StateComputeResult, Error>;
 
     /// Saves eligible blocks to persistent storage.
@@ -106,11 +104,99 @@ pub trait BlockExecutorTrait: Send + Sync {
     /// and only `C` and `E` have signatures, we will send `A`, `B` and `C` in the first batch,
     /// then `D` and `E` later in the another batch.
     /// Commits a block and all its ancestors in a batch manner.
+    fn commit_blocks_ext(
+        &self,
+        block_ids: Vec<HashValue>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        save_state_snapshots: bool,
+    ) -> Result<(), Error>;
+
     fn commit_blocks(
         &self,
         block_ids: Vec<HashValue>,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
-    ) -> Result<(), Error>;
+    ) -> Result<(), Error> {
+        self.commit_blocks_ext(
+            block_ids,
+            ledger_info_with_sigs,
+            true, /* save_state_snapshots */
+        )
+    }
+
+    /// Finishes the block executor by releasing memory held by inner data structures(SMT).
+    fn finish(&self);
+}
+
+#[derive(Clone)]
+pub enum VerifyExecutionMode {
+    NoVerify,
+    Verify {
+        txns_to_skip: Arc<BTreeSet<Version>>,
+        lazy_quit: bool,
+        seen_error: Arc<AtomicBool>,
+    },
+}
+
+impl VerifyExecutionMode {
+    pub fn verify_all() -> Self {
+        Self::Verify {
+            txns_to_skip: Arc::new(BTreeSet::new()),
+            lazy_quit: false,
+            seen_error: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn verify_except(txns_to_skip: Vec<Version>) -> Self {
+        Self::Verify {
+            txns_to_skip: Arc::new(txns_to_skip.into_iter().collect()),
+            lazy_quit: false,
+            seen_error: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn txns_to_skip(&self) -> Arc<BTreeSet<Version>> {
+        match self {
+            VerifyExecutionMode::NoVerify => Arc::new(BTreeSet::new()),
+            VerifyExecutionMode::Verify { txns_to_skip, .. } => txns_to_skip.clone(),
+        }
+    }
+
+    pub fn set_lazy_quit(mut self, is_lazy_quit: bool) -> Self {
+        if let Self::Verify {
+            ref mut lazy_quit, ..
+        } = self
+        {
+            *lazy_quit = is_lazy_quit
+        }
+        self
+    }
+
+    pub fn is_lazy_quit(&self) -> bool {
+        match self {
+            VerifyExecutionMode::NoVerify => false,
+            VerifyExecutionMode::Verify { lazy_quit, .. } => *lazy_quit,
+        }
+    }
+
+    pub fn mark_seen_error(&self) {
+        match self {
+            VerifyExecutionMode::NoVerify => unreachable!("Should not call in no-verify mode."),
+            VerifyExecutionMode::Verify { seen_error, .. } => {
+                seen_error.store(true, Ordering::Relaxed)
+            },
+        }
+    }
+
+    pub fn should_verify(&self) -> bool {
+        !matches!(self, Self::NoVerify)
+    }
+
+    pub fn seen_error(&self) -> bool {
+        match self {
+            VerifyExecutionMode::NoVerify => false,
+            VerifyExecutionMode::Verify { seen_error, .. } => seen_error.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub trait TransactionReplayer: Send {
@@ -118,9 +204,19 @@ pub trait TransactionReplayer: Send {
         &self,
         transactions: Vec<Transaction>,
         transaction_infos: Vec<TransactionInfo>,
+        write_sets: Vec<WriteSet>,
+        event_vecs: Vec<Vec<ContractEvent>>,
+        verify_execution_mode: &VerifyExecutionMode,
     ) -> Result<()>;
 
     fn commit(&self) -> Result<Arc<ExecutedChunk>>;
+}
+
+/// A structure that holds relevant information about a chunk that was committed.
+pub struct ChunkCommitNotification {
+    pub committed_events: Vec<ContractEvent>,
+    pub committed_transactions: Vec<Transaction>,
+    pub reconfiguration_occurred: bool,
 }
 
 /// A structure that summarizes the result of the execution needed for consensus to agree on.
@@ -130,13 +226,13 @@ pub trait TransactionReplayer: Send {
 /// Not every transaction in the payload succeeds: the returned vector keeps the boolean status
 /// of success / failure of the transactions.
 /// Note that the specific details of compute_status are opaque to StateMachineReplication,
-/// which is going to simply pass the results between StateComputer and TxnManager.
+/// which is going to simply pass the results between StateComputer and PayloadClient.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct StateComputeResult {
     /// transaction accumulator root hash is identified as `state_id` in Consensus.
     root_hash: HashValue,
     /// Represents the roots of all the full subtrees from left to right in this accumulator
-    /// after the execution. For details, please see [`InMemoryAccumulator`](accumulator::InMemoryAccumulator).
+    /// after the execution. For details, please see [`InMemoryAccumulator`](diem_types::proof::accumulator::InMemoryAccumulator).
     frozen_subtree_roots: Vec<HashValue>,
 
     /// The frozen subtrees roots of the parent block,
@@ -153,14 +249,11 @@ pub struct StateComputeResult {
     epoch_state: Option<EpochState>,
     /// The compute status (success/failure) of the given payload. The specific details are opaque
     /// for StateMachineReplication, which is merely passing it between StateComputer and
-    /// TxnManager.
+    /// PayloadClient.
     compute_status: Vec<TransactionStatus>,
 
     /// The transaction info hashes of all success txns.
     transaction_info_hashes: Vec<HashValue>,
-
-    /// The signature of the VoteProposal corresponding to this block.
-    signature: Option<Ed25519Signature>,
 
     reconfig_events: Vec<ContractEvent>,
 }
@@ -187,7 +280,6 @@ impl StateComputeResult {
             compute_status,
             transaction_info_hashes,
             reconfig_events,
-            signature: None,
         }
     }
 
@@ -205,7 +297,6 @@ impl StateComputeResult {
             compute_status: vec![],
             transaction_info_hashes: vec![],
             reconfig_events: vec![],
-            signature: None,
         }
     }
 
@@ -272,114 +363,15 @@ impl StateComputeResult {
     pub fn reconfig_events(&self) -> &[ContractEvent] {
         &self.reconfig_events
     }
-
-    pub fn signature(&self) -> &Option<Ed25519Signature> {
-        &self.signature
-    }
-
-    pub fn set_signature(&mut self, sig: Ed25519Signature) {
-        self.signature = Some(sig);
-    }
-}
-
-/// A wrapper of the in-memory state sparse merkle tree and the transaction accumulator that
-/// represent a specific state collectively. Usually it is a state after executing a block.
-#[derive(Clone, Debug)]
-pub struct ExecutedTrees {
-    /// The in-memory Sparse Merkle Tree representing a specific state after execution. If this
-    /// tree is presenting the latest commited state, it will have a single Subtree node (or
-    /// Empty node) whose hash equals the root hash of the newest Sparse Merkle Tree in
-    /// storage.
-    state_tree: SparseMerkleTree,
-
-    /// The in-memory Merkle Accumulator representing a blockchain state consistent with the
-    /// `state_tree`.
-    transaction_accumulator: Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
-}
-
-impl ExecutedTrees {
-    pub fn new_copy(
-        state_tree: SparseMerkleTree,
-        transaction_accumulator: Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
-    ) -> Self {
-        Self {
-            state_tree,
-            transaction_accumulator,
-        }
-    }
-
-    pub fn state_tree(&self) -> &SparseMerkleTree {
-        &self.state_tree
-    }
-
-    pub fn txn_accumulator(&self) -> &Arc<InMemoryAccumulator<TransactionAccumulatorHasher>> {
-        &self.transaction_accumulator
-    }
-
-    pub fn version(&self) -> Option<Version> {
-        let num_elements = self.txn_accumulator().num_leaves() as u64;
-        num_elements.checked_sub(1)
-    }
-
-    pub fn state_id(&self) -> HashValue {
-        self.txn_accumulator().root_hash()
-    }
-
-    pub fn state_root(&self) -> HashValue {
-        self.state_tree().root_hash()
-    }
-
-    pub fn new(
-        state_root_hash: HashValue,
-        frozen_subtrees_in_accumulator: Vec<HashValue>,
-        num_leaves_in_accumulator: u64,
-    ) -> ExecutedTrees {
-        ExecutedTrees {
-            state_tree: SparseMerkleTree::new(state_root_hash),
-            transaction_accumulator: Arc::new(
-                InMemoryAccumulator::new(frozen_subtrees_in_accumulator, num_leaves_in_accumulator)
-                    .expect("The startup info read from storage should be valid."),
-            ),
-        }
-    }
-
-    pub fn new_empty() -> ExecutedTrees {
-        Self::new(*SPARSE_MERKLE_PLACEHOLDER_HASH, vec![], 0)
-    }
-
-    pub fn is_same_view(&self, rhs: &Self) -> bool {
-        self.transaction_accumulator.root_hash() == rhs.transaction_accumulator.root_hash()
-    }
-
-    pub fn state_view(
-        &self,
-        persisted_view: &Self,
-        id: StateViewId,
-        reader: Arc<dyn DbReader>,
-    ) -> VerifiedStateView {
-        VerifiedStateView::new(
-            id,
-            reader.clone(),
-            persisted_view.version(),
-            persisted_view.state_tree.root_hash(),
-            self.state_tree.clone(),
-        )
-    }
-}
-
-impl Default for ExecutedTrees {
-    fn default() -> Self {
-        Self::new_empty()
-    }
 }
 
 pub struct ProofReader {
-    account_to_proof: HashMap<HashValue, SparseMerkleProof>,
+    proofs: HashMap<HashValue, SparseMerkleProofExt>,
 }
 
 impl ProofReader {
-    pub fn new(account_to_proof: HashMap<HashValue, SparseMerkleProof>) -> Self {
-        ProofReader { account_to_proof }
+    pub fn new(proofs: HashMap<HashValue, SparseMerkleProofExt>) -> Self {
+        ProofReader { proofs }
     }
 
     pub fn new_empty() -> Self {
@@ -387,9 +379,9 @@ impl ProofReader {
     }
 }
 
-impl ProofRead<AccountStateBlob> for ProofReader {
-    fn get_proof(&self, key: HashValue) -> Option<&SparseMerkleProof> {
-        self.account_to_proof.get(&key)
+impl ProofRead for ProofReader {
+    fn get_proof(&self, key: HashValue) -> Option<&SparseMerkleProofExt> {
+        self.proofs.get(&key)
     }
 }
 
@@ -397,15 +389,9 @@ impl ProofRead<AccountStateBlob> for ProofReader {
 /// which includes the write set and events, this also has the in-memory trees.
 #[derive(Clone, Debug)]
 pub struct TransactionData {
-    /// Each entry in this map represents the new blob value of an account touched by this
-    /// transaction. The blob is obtained by deserializing the previous blob into a BTreeMap,
-    /// applying relevant portion of write set on the map and serializing the updated map into a
-    /// new blob.
-    account_blobs: HashMap<AccountAddress, AccountStateBlob>,
-
-    /// Each entry in this map represents the the hash of a newly generated jellyfish node
-    /// and its corresponding nibble path.
-    jf_node_hashes: HashMap<NibblePath, HashValue>,
+    /// Each entry in this map represents the new value of a store store object touched by this
+    /// transaction.
+    state_updates: HashMap<StateKey, Option<StateValue>>,
 
     /// The writeset generated from this transaction.
     write_set: WriteSet,
@@ -434,8 +420,7 @@ pub struct TransactionData {
 
 impl TransactionData {
     pub fn new(
-        account_blobs: HashMap<AccountAddress, AccountStateBlob>,
-        jf_node_hashes: HashMap<NibblePath, HashValue>,
+        state_updates: HashMap<StateKey, Option<StateValue>>,
         write_set: WriteSet,
         events: Vec<ContractEvent>,
         reconfig_events: Vec<ContractEvent>,
@@ -446,8 +431,7 @@ impl TransactionData {
         txn_info_hash: HashValue,
     ) -> Self {
         TransactionData {
-            account_blobs,
-            jf_node_hashes,
+            state_updates,
             write_set,
             events,
             reconfig_events,
@@ -459,12 +443,8 @@ impl TransactionData {
         }
     }
 
-    pub fn account_blobs(&self) -> &HashMap<AccountAddress, AccountStateBlob> {
-        &self.account_blobs
-    }
-
-    pub fn jf_node_hashes(&self) -> &HashMap<NibblePath, HashValue> {
-        &self.jf_node_hashes
+    pub fn state_updates(&self) -> &HashMap<StateKey, Option<StateValue>> {
+        &self.state_updates
     }
 
     pub fn write_set(&self) -> &WriteSet {
@@ -489,5 +469,9 @@ impl TransactionData {
 
     pub fn txn_info_hash(&self) -> HashValue {
         self.txn_info_hash
+    }
+
+    pub fn is_reconfig(&self) -> bool {
+        !self.reconfig_events.is_empty()
     }
 }

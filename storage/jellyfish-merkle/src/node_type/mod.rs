@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Node types of [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
@@ -7,23 +8,26 @@
 //! and [`LeafNode`] as building blocks of a 256-bit
 //! [`JellyfishMerkleTree`](crate::JellyfishMerkleTree). [`InternalNode`] represents a 4-level
 //! binary tree to optimize for IOPS: it compresses a tree with 31 nodes into one node with 16
-//! chidren at the lowest level. [`LeafNode`] stores the full key and the value associated.
+//! children at the lowest level. [`LeafNode`] stores the full key and the value associated.
 
 #[cfg(test)]
 mod node_type_test;
 
-use crate::metrics::{DIEM_JELLYFISH_INTERNAL_ENCODED_BYTES, DIEM_JELLYFISH_LEAF_ENCODED_BYTES};
+use crate::{
+    metrics::{DIEM_JELLYFISH_INTERNAL_ENCODED_BYTES, DIEM_JELLYFISH_LEAF_ENCODED_BYTES},
+    TreeReader,
+};
 use anyhow::{ensure, Context, Result};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use diem_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
 use diem_types::{
     nibble::{nibble_path::NibblePath, Nibble, ROOT_NIBBLE_HEIGHT},
-    proof::{SparseMerkleInternalNode, SparseMerkleLeafNode},
+    proof::{definition::NodeInProof, SparseMerkleInternalNode, SparseMerkleLeafNode},
     transaction::Version,
 };
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
@@ -60,7 +64,7 @@ impl NodeKey {
 
     /// A shortcut to generate a node key consisting of a version and an empty nibble path.
     pub fn new_empty_path(version: Version) -> Self {
-        Self::new(version, NibblePath::new(vec![]))
+        Self::new(version, NibblePath::new_even(vec![]))
     }
 
     /// Gets the version.
@@ -123,9 +127,9 @@ impl NodeKey {
             nibble_bytes
         );
         let nibble_path = if num_nibbles % 2 == 0 {
-            NibblePath::new(nibble_bytes)
+            NibblePath::new_even(nibble_bytes)
         } else {
-            let padding = nibble_bytes.last().unwrap() & 0x0f;
+            let padding = nibble_bytes.last().unwrap() & 0x0F;
             ensure!(
                 padding == 0,
                 "Padding nibble expected to be 0, got: {}",
@@ -135,14 +139,27 @@ impl NodeKey {
         };
         Ok(NodeKey::new(version, nibble_path))
     }
+
+    pub fn unpack(self) -> (Version, NibblePath) {
+        (self.version, self.nibble_path)
+    }
+
+    // Returns the shard_id of the NodeKey, or None if it is root.
+    pub fn get_shard_id(&self) -> Option<u8> {
+        if self.nibble_path().num_nibbles() > 0 {
+            Some(u8::from(self.nibble_path().get_nibble(0)))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NodeType {
     Leaf,
+    Null,
     /// A internal node that haven't been finished the leaf count migration, i.e. None or not all
     /// of the children leaf counts are known.
-    InternalLegacy,
     Internal {
         leaf_count: usize,
     },
@@ -156,7 +173,6 @@ impl Arbitrary for NodeType {
     fn arbitrary_with(_args: ()) -> Self::Strategy {
         prop_oneof![
             Just(NodeType::Leaf),
-            Just(NodeType::InternalLegacy),
             (2..100usize).prop_map(|leaf_count| NodeType::Internal { leaf_count })
         ]
         .boxed()
@@ -169,7 +185,7 @@ impl Arbitrary for NodeType {
 pub struct Child {
     /// The hash value of this child node.
     pub hash: HashValue,
-    /// `version`, the `nibble_path` of the ['NodeKey`] of this [`InternalNode`] the child belongs
+    /// `version`, the `nibble_path` of the [`NodeKey`] of this [`InternalNode`] the child belongs
     /// to and the child's index constitute the [`NodeKey`] to uniquely identify this child node
     /// from the storage. Used by `[`NodeKey::gen_child_node_key`].
     pub version: Version,
@@ -191,11 +207,11 @@ impl Child {
         matches!(self.node_type, NodeType::Leaf)
     }
 
-    pub fn leaf_count(&self) -> Option<usize> {
+    pub fn leaf_count(&self) -> usize {
         match self.node_type {
-            NodeType::Leaf => Some(1),
-            NodeType::InternalLegacy => None,
-            NodeType::Internal { leaf_count } => Some(leaf_count),
+            NodeType::Leaf => 1,
+            NodeType::Internal { leaf_count } => leaf_count,
+            NodeType::Null => unreachable!("Child cannot be Null"),
         }
     }
 }
@@ -214,12 +230,10 @@ pub struct InternalNode {
     /// Up to 16 children.
     children: Children,
     /// Total number of leaves under this internal node
-    leaf_count: Option<usize>,
-    /// serialize leaf counts
-    leaf_count_migration: bool,
+    leaf_count: usize,
 }
 
-/// Computes the hash of internal node according to [`JellyfishTree`](crate::JellyfishTree)
+/// Computes the hash of internal node according to [`JellyfishMerkleTree`](crate::JellyfishMerkleTree)
 /// data structure in the logical view. `start` and `nibble_height` determine a subtree whose
 /// root hash we want to get. For an internal node with 16 children at the bottom level, we compute
 /// the root hash of it as if a full binary Merkle tree with 16 leaves as below:
@@ -238,11 +252,11 @@ pub struct InternalNode {
 /// height
 /// ```
 ///
-/// As illustrated above, at nibble height 0, `0..F` in hex denote 16 chidren hashes.  Each `#`
+/// As illustrated above, at nibble height 0, `0..F` in hex denote 16 children hashes.  Each `#`
 /// means the hash of its two direct children, which will be used to generate the hash of its
 /// parent with the hash of its sibling. Finally, we can get the hash of this internal node.
 ///
-/// However, if an internal node doesn't have all 16 chidren exist at height 0 but just a few of
+/// However, if an internal node doesn't have all 16 children exist at height 0 but just a few of
 /// them, we have a modified hashing rule on top of what is stated above:
 /// 1. From top to bottom, a node will be replaced by a leaf child if the subtree rooted at this
 /// node has only one child at height 0 and it is a leaf child.
@@ -286,16 +300,11 @@ impl Arbitrary for InternalNode {
 
 impl InternalNode {
     /// Creates a new Internal node.
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn new(children: Children) -> Self {
-        Self::new_migration(children, true /* leaf_count_migration */)
+        Self::new_impl(children).expect("Input children are logical.")
     }
 
-    pub fn new_migration(children: Children, leaf_count_migration: bool) -> Self {
-        Self::new_impl(children, leaf_count_migration).expect("Input children are logical.")
-    }
-
-    pub fn new_impl(children: Children, leaf_count_migration: bool) -> Result<Self> {
+    pub fn new_impl(children: Children) -> Result<Self> {
         // Assert the internal node must have >= 1 children. If it only has one child, it cannot be
         // a leaf node. Otherwise, the leaf node should be a child of this internal node's parent.
         ensure!(!children.is_empty(), "Children must not be empty");
@@ -310,34 +319,20 @@ impl InternalNode {
             );
         }
 
-        let leaf_count = Self::sum_leaf_count(&children);
+        let leaf_count = children.values().map(Child::leaf_count).sum();
         Ok(Self {
             children,
             leaf_count,
-            leaf_count_migration,
         })
     }
 
-    fn sum_leaf_count(children: &Children) -> Option<usize> {
-        let mut leaf_count = 0;
-        for child in children.values() {
-            if let Some(n) = child.leaf_count() {
-                leaf_count += n;
-            } else {
-                return None;
-            }
-        }
-        Some(leaf_count)
-    }
-
-    pub fn leaf_count(&self) -> Option<usize> {
+    pub fn leaf_count(&self) -> usize {
         self.leaf_count
     }
 
     pub fn node_type(&self) -> NodeType {
-        match self.leaf_count {
-            Some(leaf_count) => NodeType::Internal { leaf_count },
-            None => NodeType::InternalLegacy,
+        NodeType::Internal {
+            leaf_count: self.leaf_count,
         }
     }
 
@@ -353,7 +348,7 @@ impl InternalNode {
         self.children.iter().sorted_by_key(|(nibble, _)| **nibble)
     }
 
-    pub fn serialize(&self, binary: &mut Vec<u8>, persist_leaf_counts: bool) -> Result<()> {
+    pub fn serialize(&self, binary: &mut Vec<u8>) -> Result<()> {
         let (mut existence_bitmap, leaf_bitmap) = self.generate_bitmaps();
         binary.write_u16::<LittleEndian>(existence_bitmap)?;
         binary.write_u16::<LittleEndian>(leaf_bitmap)?;
@@ -364,28 +359,17 @@ impl InternalNode {
             binary.extend(child.hash.to_vec());
             match child.node_type {
                 NodeType::Leaf => (),
-                NodeType::InternalLegacy => {
-                    if persist_leaf_counts {
-                        // It's impossible that a internal node has 0 leaves, use 0 to indicate
-                        // "known".
-                        // Also n.b., a not-fully-migrated internal is of `NodeType::InternalLegacy`
-                        // in memory, but serialized with `NodeTag::Internal` anyway once the
-                        // migration starts.
-                        serialize_u64_varint(0, binary);
-                    }
-                }
                 NodeType::Internal { leaf_count } => {
-                    if persist_leaf_counts {
-                        serialize_u64_varint(leaf_count as u64, binary);
-                    }
-                }
+                    serialize_u64_varint(leaf_count as u64, binary);
+                },
+                NodeType::Null => unreachable!("Child cannot be Null"),
             };
             existence_bitmap &= !(1 << next_child);
         }
         Ok(())
     }
 
-    pub fn deserialize(data: &[u8], read_leaf_counts: bool) -> Result<Self> {
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
         let mut reader = Cursor::new(data);
         let len = data.len();
 
@@ -400,7 +384,7 @@ impl InternalNode {
                     leaves: leaf_bitmap,
                 }
                 .into())
-            }
+            },
             _ => (),
         }
 
@@ -424,15 +408,9 @@ impl InternalNode {
             let child_bit = 1 << next_child;
             let node_type = if (leaf_bitmap & child_bit) != 0 {
                 NodeType::Leaf
-            } else if read_leaf_counts {
-                let leaf_count = deserialize_u64_varint(&mut reader)? as usize;
-                if leaf_count == 0 {
-                    NodeType::InternalLegacy
-                } else {
-                    NodeType::Internal { leaf_count }
-                }
             } else {
-                NodeType::InternalLegacy
+                let leaf_count = deserialize_u64_varint(&mut reader)? as usize;
+                NodeType::Internal { leaf_count }
             };
 
             children.insert(
@@ -443,9 +421,7 @@ impl InternalNode {
         }
         assert_eq!(existence_bitmap, 0);
 
-        // The "leaf_count_migration" flag doesn't matter here, since a deserialized node should
-        // not be persisted again to the DB.
-        Self::new_impl(children, read_leaf_counts /* leaf_count_migration */)
+        Self::new_impl(children)
     }
 
     /// Gets the `n`-th child.
@@ -522,6 +498,63 @@ impl InternalNode {
         }
     }
 
+    fn gen_node_in_proof<K: crate::Key, R: TreeReader<K>>(
+        &self,
+        start: u8,
+        width: u8,
+        (existence_bitmap, leaf_bitmap): (u16, u16),
+        (tree_reader, node_key): (&R, &NodeKey),
+    ) -> Result<NodeInProof> {
+        // Given a bit [start, 1 << nibble_height], return the value of that range.
+        let (range_existence_bitmap, range_leaf_bitmap) =
+            Self::range_bitmaps(start, width, (existence_bitmap, leaf_bitmap));
+        Ok(if range_existence_bitmap == 0 {
+            // No child under this subtree
+            NodeInProof::Other(*SPARSE_MERKLE_PLACEHOLDER_HASH)
+        } else if width == 1 || (range_existence_bitmap.count_ones() == 1 && range_leaf_bitmap != 0)
+        {
+            // Only 1 leaf child under this subtree or reach the lowest level
+            let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
+            let only_child = self
+                .child(only_child_index)
+                .with_context(|| {
+                    format!(
+                        "Corrupted internal node: existence_bitmap indicates \
+                         the existence of a non-exist child at index {:x}",
+                        only_child_index
+                    )
+                })
+                .unwrap();
+            if matches!(only_child.node_type, NodeType::Leaf) {
+                let only_child_node_key =
+                    node_key.gen_child_node_key(only_child.version, only_child_index);
+                match tree_reader.get_node_with_tag(&only_child_node_key, "get_proof")? {
+                    Node::Internal(_) => unreachable!(
+                        "Corrupted internal node: in-memory leaf child is internal node on disk"
+                    ),
+                    Node::Leaf(leaf_node) => {
+                        NodeInProof::Leaf(SparseMerkleLeafNode::from(leaf_node))
+                    },
+                    Node::Null => unreachable!("Child cannot be Null"),
+                }
+            } else {
+                NodeInProof::Other(only_child.hash)
+            }
+        } else {
+            let left_child = self.merkle_hash(
+                start,
+                width / 2,
+                (range_existence_bitmap, range_leaf_bitmap),
+            );
+            let right_child = self.merkle_hash(
+                start + width / 2,
+                width / 2,
+                (range_existence_bitmap, range_leaf_bitmap),
+            );
+            NodeInProof::Other(SparseMerkleInternalNode::new(left_child, right_child).hash())
+        })
+    }
+
     /// Gets the child and its corresponding siblings that are necessary to generate the proof for
     /// the `n`-th child. If it is an existence proof, the returned child must be the `n`-th
     /// child; otherwise, the returned child may be another child. See inline explanation for
@@ -542,11 +575,12 @@ impl InternalNode {
     ///     |   MSB|<---------------------- uint 16 ---------------------------->|LSB
     ///  height    chs: `child_half_start`         shs: `sibling_half_start`
     /// ```
-    pub fn get_child_with_siblings(
+    pub fn get_child_with_siblings<K: crate::Key, R: TreeReader<K>>(
         &self,
         node_key: &NodeKey,
         n: Nibble,
-    ) -> (Option<NodeKey>, Vec<HashValue>) {
+        reader: Option<&R>,
+    ) -> Result<(Option<NodeKey>, Vec<NodeInProof>)> {
         let mut siblings = vec![];
         let (existence_bitmap, leaf_bitmap) = self.generate_bitmaps();
 
@@ -557,18 +591,26 @@ impl InternalNode {
             let width = 1 << h;
             let (child_half_start, sibling_half_start) = get_child_and_sibling_half_start(n, h);
             // Compute the root hash of the subtree rooted at the sibling of `r`.
-            siblings.push(self.merkle_hash(
-                sibling_half_start,
-                width,
-                (existence_bitmap, leaf_bitmap),
-            ));
+            if let Some(reader) = reader {
+                siblings.push(self.gen_node_in_proof(
+                    sibling_half_start,
+                    width,
+                    (existence_bitmap, leaf_bitmap),
+                    (reader, node_key),
+                )?);
+            } else {
+                siblings.push(
+                    self.merkle_hash(sibling_half_start, width, (existence_bitmap, leaf_bitmap))
+                        .into(),
+                );
+            }
 
             let (range_existence_bitmap, range_leaf_bitmap) =
                 Self::range_bitmaps(child_half_start, width, (existence_bitmap, leaf_bitmap));
 
             if range_existence_bitmap == 0 {
                 // No child in this range.
-                return (None, siblings);
+                return Ok((None, siblings));
             } else if width == 1
                 || (range_existence_bitmap.count_ones() == 1 && range_leaf_bitmap != 0)
             {
@@ -577,7 +619,7 @@ impl InternalNode {
                 // `None` because it's existence indirectly proves the n-th child doesn't exist.
                 // Please read proof format for details.
                 let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
-                return (
+                return Ok((
                     {
                         let only_child_version = self
                             .child(only_child_index)
@@ -594,7 +636,7 @@ impl InternalNode {
                         Some(node_key.gen_child_node_key(only_child_version, only_child_index))
                     },
                     siblings,
-                );
+                ));
             }
         }
         unreachable!("Impossible to get here without returning even at the lowest level.")
@@ -607,7 +649,7 @@ pub(crate) fn get_child_and_sibling_half_start(n: Nibble, height: u8) -> (u8, u8
     // Get the index of the first child belonging to the same subtree whose root, let's say `r` is
     // at `height` that the n-th child belongs to.
     // Note: `child_half_start` will be always equal to `n` at height 0.
-    let child_half_start = (0xff << height) & u8::from(n);
+    let child_half_start = (0xFF << height) & u8::from(n);
 
     // Get the index of the first child belonging to the subtree whose root is the sibling of `r`
     // at `height`.
@@ -618,26 +660,25 @@ pub(crate) fn get_child_and_sibling_half_start(n: Nibble, height: u8) -> (u8, u8
 
 /// Represents an account.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LeafNode<V> {
-    // The hashed account address associated with this leaf node.
+pub struct LeafNode<K> {
+    // The hashed key associated with this leaf node.
     account_key: HashValue,
     // The hash of the value.
     value_hash: HashValue,
-    // The value stored in the leaf, associated with `account_key`.
-    value: V,
+    // The key and version that points to the value
+    value_index: (K, Version),
 }
 
-impl<V> LeafNode<V>
+impl<K> LeafNode<K>
 where
-    V: crate::Value,
+    K: crate::Key,
 {
     /// Creates a new leaf node.
-    pub fn new(account_key: HashValue, value: V) -> Self {
-        let value_hash = value.hash();
+    pub fn new(account_key: HashValue, value_hash: HashValue, value_index: (K, Version)) -> Self {
         Self {
             account_key,
             value_hash,
-            value,
+            value_index,
         }
     }
 
@@ -646,14 +687,14 @@ where
         self.account_key
     }
 
-    /// Gets the associated value itself.
-    pub fn value(&self) -> &V {
-        &self.value
-    }
-
     /// Gets the associated value hash.
     pub fn value_hash(&self) -> HashValue {
         self.value_hash
+    }
+
+    /// Get the index key to locate the value.
+    pub fn value_index(&self) -> &(K, Version) {
+        &self.value_index
     }
 
     pub fn hash(&self) -> HashValue {
@@ -661,8 +702,8 @@ where
     }
 }
 
-impl<V> From<LeafNode<V>> for SparseMerkleLeafNode {
-    fn from(leaf_node: LeafNode<V>) -> Self {
+impl<K> From<LeafNode<K>> for SparseMerkleLeafNode {
+    fn from(leaf_node: LeafNode<K>) -> Self {
         Self::new(leaf_node.account_key, leaf_node.value_hash)
     }
 }
@@ -670,24 +711,23 @@ impl<V> From<LeafNode<V>> for SparseMerkleLeafNode {
 #[repr(u8)]
 #[derive(FromPrimitive, ToPrimitive)]
 enum NodeTag {
-    Null = 0,
-    InternalLegacy = 1,
-    Leaf = 2,
-    Internal = 3,
+    Leaf = 1,
+    Internal = 2,
+    Null = 3,
 }
 
 /// The concrete node type of [`JellyfishMerkleTree`](crate::JellyfishMerkleTree).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Node<V> {
-    /// Represents `null`.
-    Null,
+pub enum Node<K> {
     /// A wrapper of [`InternalNode`].
     Internal(InternalNode),
     /// A wrapper of [`LeafNode`].
-    Leaf(LeafNode<V>),
+    Leaf(LeafNode<K>),
+    /// Represents empty tree only
+    Null,
 }
 
-impl<V> From<InternalNode> for Node<V> {
+impl<K> From<InternalNode> for Node<K> {
     fn from(node: InternalNode) -> Self {
         Node::Internal(node)
     }
@@ -699,21 +739,16 @@ impl From<InternalNode> for Children {
     }
 }
 
-impl<V> From<LeafNode<V>> for Node<V> {
-    fn from(node: LeafNode<V>) -> Self {
+impl<K> From<LeafNode<K>> for Node<K> {
+    fn from(node: LeafNode<K>) -> Self {
         Node::Leaf(node)
     }
 }
 
-impl<V> Node<V>
+impl<K> Node<K>
 where
-    V: crate::Value,
+    K: crate::Key,
 {
-    /// Creates the [`Null`](Node::Null) variant.
-    pub fn new_null() -> Self {
-        Node::Null
-    }
-
     /// Creates the [`Internal`](Node::Internal) variant.
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn new_internal(children: Children) -> Self {
@@ -721,8 +756,12 @@ where
     }
 
     /// Creates the [`Leaf`](Node::Leaf) variant.
-    pub fn new_leaf(account_key: HashValue, value: V) -> Self {
-        Node::Leaf(LeafNode::new(account_key, value))
+    pub fn new_leaf(
+        account_key: HashValue,
+        value_hash: HashValue,
+        value_index: (K, Version),
+    ) -> Self {
+        Node::Leaf(LeafNode::new(account_key, value_hash, value_index))
     }
 
     /// Returns `true` if the node is a leaf node.
@@ -735,18 +774,18 @@ where
         match self {
             // The returning value will be used to construct a `Child` of a internal node, while an
             // internal node will never have a child of Node::Null.
-            Self::Null => unreachable!(),
             Self::Leaf(_) => NodeType::Leaf,
             Self::Internal(n) => n.node_type(),
+            Self::Null => NodeType::Null,
         }
     }
 
     /// Returns leaf count if known
-    pub fn leaf_count(&self) -> Option<usize> {
+    pub fn leaf_count(&self) -> usize {
         match self {
-            Node::Null => Some(0),
-            Node::Leaf(_) => Some(1),
+            Node::Leaf(_) => 1,
             Node::Internal(internal_node) => internal_node.leaf_count,
+            Node::Null => 0,
         }
     }
 
@@ -755,25 +794,19 @@ where
         let mut out = vec![];
 
         match self {
-            Node::Null => {
-                out.push(NodeTag::Null as u8);
-            }
             Node::Internal(internal_node) => {
-                let persist_leaf_count = internal_node.leaf_count_migration;
-                let tag = if persist_leaf_count {
-                    NodeTag::Internal
-                } else {
-                    NodeTag::InternalLegacy
-                };
-                out.push(tag as u8);
-                internal_node.serialize(&mut out, persist_leaf_count)?;
+                out.push(NodeTag::Internal as u8);
+                internal_node.serialize(&mut out)?;
                 DIEM_JELLYFISH_INTERNAL_ENCODED_BYTES.inc_by(out.len() as u64);
-            }
+            },
             Node::Leaf(leaf_node) => {
                 out.push(NodeTag::Leaf as u8);
                 out.extend(bcs::to_bytes(&leaf_node)?);
                 DIEM_JELLYFISH_LEAF_ENCODED_BYTES.inc_by(out.len() as u64);
-            }
+            },
+            Node::Null => {
+                out.push(NodeTag::Null as u8);
+            },
         }
         Ok(out)
     }
@@ -781,28 +814,23 @@ where
     /// Computes the hash of nodes.
     pub fn hash(&self) -> HashValue {
         match self {
-            Node::Null => *SPARSE_MERKLE_PLACEHOLDER_HASH,
             Node::Internal(internal_node) => internal_node.hash(),
             Node::Leaf(leaf_node) => leaf_node.hash(),
+            Node::Null => *SPARSE_MERKLE_PLACEHOLDER_HASH,
         }
     }
 
     /// Recovers from serialized bytes in physical storage.
-    pub fn decode(val: &[u8]) -> Result<Node<V>> {
+    pub fn decode(val: &[u8]) -> Result<Node<K>> {
         if val.is_empty() {
             return Err(NodeDecodeError::EmptyInput.into());
         }
         let tag = val[0];
         let node_tag = NodeTag::from_u8(tag);
         match node_tag {
-            Some(NodeTag::Null) => Ok(Node::Null),
-            Some(NodeTag::InternalLegacy) => {
-                Ok(Node::Internal(InternalNode::deserialize(&val[1..], false)?))
-            }
-            Some(NodeTag::Internal) => {
-                Ok(Node::Internal(InternalNode::deserialize(&val[1..], true)?))
-            }
+            Some(NodeTag::Internal) => Ok(Node::Internal(InternalNode::deserialize(&val[1..])?)),
             Some(NodeTag::Leaf) => Ok(Node::Leaf(bcs::from_bytes(&val[1..])?)),
+            Some(NodeTag::Null) => Ok(Node::Null),
             None => Err(NodeDecodeError::UnknownTag { unknown_tag: tag }.into()),
         }
     }
@@ -837,7 +865,7 @@ pub enum NodeDecodeError {
 /// We use a super simple encoding - the high bit is set if more bytes follow.
 fn serialize_u64_varint(mut num: u64, binary: &mut Vec<u8>) {
     for _ in 0..8 {
-        let low_bits = num as u8 & 0x7f;
+        let low_bits = num as u8 & 0x7F;
         num >>= 7;
         let more = match num {
             0 => 0u8,
@@ -850,7 +878,7 @@ fn serialize_u64_varint(mut num: u64, binary: &mut Vec<u8>) {
     }
     // Last byte is encoded raw; this means there are no bad encodings.
     assert_ne!(num, 0);
-    assert!(num <= 0xff);
+    assert!(num <= 0xFF);
     binary.push(num as u8);
 }
 
@@ -862,7 +890,7 @@ where
     let mut num = 0u64;
     for i in 0..8 {
         let byte = reader.read_u8()?;
-        num |= u64::from(byte & 0x7f) << (i * 7);
+        num |= u64::from(byte & 0x7F) << (i * 7);
         if (byte & 0x80) == 0 {
             return Ok(num);
         }

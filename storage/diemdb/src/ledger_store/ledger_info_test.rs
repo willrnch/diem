@@ -1,52 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::{change_set::ChangeSet, DiemDB};
 use diem_temppath::TempPath;
-use diem_types::{
-    proptest_types::{AccountInfoUniverse, LedgerInfoWithSignaturesGen},
-    transaction::Version,
-};
-use proptest::{collection::vec, prelude::*};
-use std::path::Path;
-
-fn arb_ledger_infos_with_sigs() -> impl Strategy<Value = Vec<LedgerInfoWithSignatures>> {
-    (
-        any_with::<AccountInfoUniverse>(3),
-        vec((any::<LedgerInfoWithSignaturesGen>(), 1..10usize), 1..10),
-    )
-        .prop_map(|(mut universe, gens)| {
-            let ledger_infos_with_sigs: Vec<_> = gens
-                .into_iter()
-                .map(|(ledger_info_gen, block_size)| {
-                    ledger_info_gen.materialize(&mut universe, block_size)
-                })
-                .collect();
-            assert_eq!(get_first_epoch(&ledger_infos_with_sigs), 0);
-            ledger_infos_with_sigs
-        })
-}
-
-fn get_first_epoch(ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> u64 {
-    ledger_infos_with_sigs
-        .first()
-        .unwrap()
-        .ledger_info()
-        .epoch()
-}
-
-fn get_last_epoch(ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> u64 {
-    ledger_infos_with_sigs.last().unwrap().ledger_info().epoch()
-}
-
-fn get_last_version(ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> Version {
-    ledger_infos_with_sigs
-        .last()
-        .unwrap()
-        .ledger_info()
-        .version()
-}
+use ledger_info_test_utils::*;
+use proptest::prelude::*;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
@@ -134,69 +93,4 @@ proptest! {
 
         }
     }
-
-    #[test]
-    fn test_get_startup_info(
-        (ledger_infos_with_sigs, txn_infos) in arb_ledger_infos_with_sigs()
-            .prop_flat_map(|lis| {
-                let num_committed_txns = get_last_version(&lis) as usize + 1;
-                (
-                    Just(lis),
-                    vec(any::<TransactionInfo>(), num_committed_txns..num_committed_txns + 10),
-                )
-            })
-    ) {
-        let tmp_dir = TempPath::new();
-        let db = set_up(&tmp_dir, &ledger_infos_with_sigs);
-        put_transaction_infos(&db, &txn_infos);
-
-        let startup_info = db.ledger_store.get_startup_info().unwrap().unwrap();
-        let latest_li = ledger_infos_with_sigs.last().unwrap().ledger_info();
-        assert_eq!(startup_info.latest_ledger_info, *ledger_infos_with_sigs.last().unwrap());
-        let expected_epoch_state = if latest_li.next_epoch_state().is_none() {
-            Some(db.ledger_store.get_epoch_state(latest_li.epoch()).unwrap())
-        } else {
-            None
-        };
-        assert_eq!(startup_info.latest_epoch_state, expected_epoch_state);
-        let committed_version = get_last_version(&ledger_infos_with_sigs);
-        assert_eq!(
-            startup_info.committed_tree_state.account_state_root_hash,
-            txn_infos[committed_version as usize].state_change_hash(),
-        );
-        let synced_version = (txn_infos.len() - 1) as u64;
-        if synced_version > committed_version {
-            assert_eq!(
-                startup_info.synced_tree_state.unwrap().account_state_root_hash,
-                txn_infos.last().unwrap().state_change_hash(),
-            );
-        } else {
-            assert!(startup_info.synced_tree_state.is_none());
-        }
-    }
-}
-
-fn set_up(path: &impl AsRef<Path>, ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> DiemDB {
-    let db = DiemDB::new_for_test(path);
-    let store = &db.ledger_store;
-
-    // Write LIs to DB.
-    let mut cs = ChangeSet::new();
-    ledger_infos_with_sigs
-        .iter()
-        .map(|info| store.put_ledger_info(info, &mut cs))
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-    store.db.write_schemas(cs.batch).unwrap();
-    store.set_latest_ledger_info(ledger_infos_with_sigs.last().unwrap().clone());
-
-    db
-}
-
-fn put_transaction_infos(db: &DiemDB, txn_infos: &[TransactionInfo]) {
-    let mut cs = ChangeSet::new();
-    db.ledger_store
-        .put_transaction_infos(0, txn_infos, &mut cs)
-        .unwrap();
-    db.db.write_schemas(cs.batch).unwrap()
 }

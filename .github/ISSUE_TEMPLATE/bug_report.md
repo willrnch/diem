@@ -10,7 +10,7 @@ assignees: ''
 # 🐛 Bug
 
 <!-- A clear and concise description of what the bug is.
-To report a security issue, please email security@diem.com. -->
+To report a security issue, please email security@diemlabs.com. -->
 
 ## To reproduce
 
@@ -32,7 +32,7 @@ To report a security issue, please email security@diem.com. -->
 ## System information
 
 **Please complete the following information:**
-- <!-- Diem Version -->
+- <!-- Diem Core Version -->
 - <!-- Rust Version -->
 - <!-- Computer OS -->
 

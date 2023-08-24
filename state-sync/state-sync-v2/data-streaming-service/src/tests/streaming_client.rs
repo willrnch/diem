@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,16 +8,15 @@ use crate::{
     error::Error,
     streaming_client::{
         new_streaming_service_client_listener_pair, ContinuouslyStreamTransactionOutputsRequest,
-        ContinuouslyStreamTransactionsRequest, DataStreamingClient, GetAllAccountsRequest,
-        GetAllEpochEndingLedgerInfosRequest, GetAllTransactionOutputsRequest,
-        GetAllTransactionsRequest, NotificationFeedback, StreamRequest, StreamingServiceListener,
-        TerminateStreamRequest,
+        ContinuouslyStreamTransactionsRequest, DataStreamingClient,
+        GetAllEpochEndingLedgerInfosRequest, GetAllStatesRequest, GetAllTransactionOutputsRequest,
+        GetAllTransactionsRequest, NotificationAndFeedback, NotificationFeedback, StreamRequest,
+        StreamingServiceListener, TerminateStreamRequest,
     },
     tests::utils::{create_ledger_info, initialize_logger},
 };
-use channel::{diem_channel, message_queues::QueueStyle};
-use claim::assert_ok;
-use futures::{executor::block_on, FutureExt, StreamExt};
+use claims::assert_ok;
+use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use std::thread::JoinHandle;
 
 #[test]
@@ -36,23 +36,23 @@ fn test_client_service_error() {
 }
 
 #[test]
-fn test_get_all_accounts() {
+fn test_get_all_states() {
     // Create a new streaming service client and listener
     let (streaming_service_client, streaming_service_listener) =
         new_streaming_service_client_listener_pair();
 
     // Note the request we expect to receive on the streaming service side
     let request_version = 100;
-    let expected_request = StreamRequest::GetAllAccounts(GetAllAccountsRequest {
+    let expected_request = StreamRequest::GetAllStates(GetAllStatesRequest {
         version: request_version,
         start_index: 0,
     });
 
-    // Spawn a new server thread to handle any account stream requests
+    // Spawn a new server thread to handle any stream requests
     let _handler = spawn_service_and_expect_request(streaming_service_listener, expected_request);
 
-    // Send an account stream request and verify we get a data stream listener
-    let response = block_on(streaming_service_client.get_all_accounts(request_version, None));
+    // Send a state value stream request and verify we get a data stream listener
+    let response = block_on(streaming_service_client.get_all_state_values(request_version, None));
     assert_ok!(response);
 }
 
@@ -145,15 +145,15 @@ fn test_continuously_stream_transactions() {
         new_streaming_service_client_listener_pair();
 
     // Note the request we expect to receive on the streaming service side
-    let request_start_version = 101;
-    let request_start_epoch = 2;
-    let request_include_events = false;
+    let known_version = 101;
+    let known_epoch = 2;
+    let include_events = false;
     let target = None;
     let expected_request =
         StreamRequest::ContinuouslyStreamTransactions(ContinuouslyStreamTransactionsRequest {
-            start_version: request_start_version,
-            start_epoch: request_start_epoch,
-            include_events: request_include_events,
+            known_version,
+            known_epoch,
+            include_events,
             target: target.clone(),
         });
 
@@ -162,9 +162,9 @@ fn test_continuously_stream_transactions() {
 
     // Send a continuous transaction stream request and verify we get a data stream listener
     let response = block_on(streaming_service_client.continuously_stream_transactions(
-        request_start_version,
-        request_start_epoch,
-        request_include_events,
+        known_version,
+        known_epoch,
+        include_events,
         target,
     ));
     assert_ok!(response);
@@ -182,8 +182,8 @@ fn test_continuously_stream_transaction_outputs() {
     let target = Some(create_ledger_info(1000, 10, true));
     let expected_request = StreamRequest::ContinuouslyStreamTransactionOutputs(
         ContinuouslyStreamTransactionOutputsRequest {
-            start_version: request_start_version,
-            start_epoch: request_start_epoch,
+            known_version: request_start_version,
+            known_epoch: request_start_epoch,
             target: target.clone(),
         },
     );
@@ -209,11 +209,14 @@ fn test_terminate_stream() {
         new_streaming_service_client_listener_pair();
 
     // Note the request we expect to receive on the streaming service side
-    let request_notification_id = 19478;
-    let notification_feedback = NotificationFeedback::InvalidPayloadData;
+    let data_stream_id = 50505;
+    let notification_and_feedback = Some(NotificationAndFeedback::new(
+        19478,
+        NotificationFeedback::InvalidPayloadData,
+    ));
     let expected_request = StreamRequest::TerminateStream(TerminateStreamRequest {
-        notification_id: request_notification_id,
-        notification_feedback: notification_feedback.clone(),
+        data_stream_id,
+        notification_and_feedback: notification_and_feedback.clone(),
     });
 
     // Spawn a new server thread to handle any feedback requests
@@ -222,7 +225,7 @@ fn test_terminate_stream() {
     // Provide payload feedback and verify no error is returned
     let result = block_on(
         streaming_service_client
-            .terminate_stream_with_feedback(request_notification_id, notification_feedback),
+            .terminate_stream_with_feedback(data_stream_id, notification_and_feedback),
     );
     assert_ok!(result);
 }
@@ -280,13 +283,9 @@ fn spawn_service_and_respond_with_error(
 }
 
 /// Creates and returns a new data stream sender and listener pair.
-fn new_data_stream_sender_listener() -> (
-    channel::diem_channel::Sender<(), DataNotification>,
-    DataStreamListener,
-) {
-    let (notification_sender, notification_receiver) =
-        diem_channel::new(QueueStyle::KLAST, 1, None);
-    let data_stream_listener = DataStreamListener::new(notification_receiver);
+fn new_data_stream_sender_listener() -> (mpsc::Sender<DataNotification>, DataStreamListener) {
+    let (notification_sender, notification_receiver) = mpsc::channel(100);
+    let data_stream_listener = DataStreamListener::new(0, notification_receiver);
 
     (notification_sender, data_stream_listener)
 }

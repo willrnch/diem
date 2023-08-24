@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, Result};
@@ -6,15 +7,14 @@ use diem_types::{
     access_path::AccessPath, account_address::AccountAddress, account_state::AccountState,
     contract_event::ContractEvent,
 };
+use diem_vm::move_vm_ext::MoveResolverExt;
 use move_core_types::language_storage::StructTag;
 use move_resource_viewer::MoveValueAnnotator;
+pub use move_resource_viewer::{AnnotatedMoveStruct, AnnotatedMoveValue};
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
 };
-
-use move_core_types::resolver::MoveResolver;
-pub use move_resource_viewer::{AnnotatedMoveStruct, AnnotatedMoveValue};
 
 pub struct DiemValueAnnotator<'a, T>(MoveValueAnnotator<'a, T>);
 
@@ -22,7 +22,7 @@ pub struct DiemValueAnnotator<'a, T>(MoveValueAnnotator<'a, T>);
 #[derive(Debug)]
 pub struct AnnotatedAccountStateBlob(BTreeMap<StructTag, AnnotatedMoveStruct>);
 
-impl<'a, T: MoveResolver> DiemValueAnnotator<'a, T> {
+impl<'a, T: MoveResolverExt> DiemValueAnnotator<'a, T> {
     pub fn new(storage: &'a T) -> Self {
         Self(MoveValueAnnotator::new(storage))
     }
@@ -54,7 +54,7 @@ impl<'a, T: MoveResolver> DiemValueAnnotator<'a, T> {
                 None => {
                     println!("Uncached AccessPath: {:?}", k);
                     continue;
-                }
+                },
             };
             let value = self.view_resource(&tag, v)?;
             output.insert(tag, value);

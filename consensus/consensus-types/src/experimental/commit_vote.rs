@@ -1,22 +1,23 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::common::{Author, Round};
 use anyhow::Context;
-use diem_crypto::ed25519::Ed25519Signature;
+use diem_crypto::{bls12381, CryptoMaterialError};
+use diem_short_hex_str::AsShortHexStr;
 use diem_types::{
     block_info::BlockInfo, ledger_info::LedgerInfo, validator_signer::ValidatorSigner,
     validator_verifier::ValidatorVerifier,
 };
 use serde::{Deserialize, Serialize};
-use short_hex_str::AsShortHexStr;
 use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct CommitVote {
     author: Author,
     ledger_info: LedgerInfo,
-    signature: Ed25519Signature,
+    signature: bls12381::Signature,
 }
 
 // this is required by structured log
@@ -43,16 +44,20 @@ impl CommitVote {
         author: Author,
         ledger_info_placeholder: LedgerInfo,
         validator_signer: &ValidatorSigner,
-    ) -> Self {
-        let signature = validator_signer.sign(&ledger_info_placeholder);
-        Self::new_with_signature(author, ledger_info_placeholder, signature)
+    ) -> Result<Self, CryptoMaterialError> {
+        let signature = validator_signer.sign(&ledger_info_placeholder)?;
+        Ok(Self::new_with_signature(
+            author,
+            ledger_info_placeholder,
+            signature,
+        ))
     }
 
     /// Generates a new CommitProposal using a signature over the specified ledger_info
     pub fn new_with_signature(
         author: Author,
         ledger_info: LedgerInfo,
-        signature: Ed25519Signature,
+        signature: bls12381::Signature,
     ) -> Self {
         Self {
             author,
@@ -72,7 +77,7 @@ impl CommitVote {
     }
 
     /// Return the signature of the vote
-    pub fn signature(&self) -> &Ed25519Signature {
+    pub fn signature(&self) -> &bls12381::Signature {
         &self.signature
     }
 

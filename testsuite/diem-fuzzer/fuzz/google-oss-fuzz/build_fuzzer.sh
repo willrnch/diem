@@ -1,5 +1,6 @@
 #!/bin/bash -eux
-# Copyright (c) The Diem Core Contributors
+# Copyright © Diem Foundation
+# Parts of the project are originally copyright © Meta Platforms, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
 # this file builds a single fuzzer target
@@ -43,4 +44,4 @@ export RUSTFLAGS
 # build
 cargo build --manifest-path fuzz/Cargo.toml --bin fuzzer_builder --target $TARGET
 # move fuzzer to $OUT
-mv $SRC/diem/target/$TARGET/debug/fuzzer_builder $OUT_DIR/$SINGLE_FUZZ_TARGET
+mv $SRC/diem-core/target/$TARGET/debug/fuzzer_builder $OUT_DIR/$SINGLE_FUZZ_TARGET

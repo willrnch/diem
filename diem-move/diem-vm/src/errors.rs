@@ -1,9 +1,10 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::logging::AdapterLogSchema;
-use diem_logger::prelude::*;
-use diem_types::account_config::ChainSpecificAccountInfo;
+use crate::transaction_validation::DIEM_TRANSACTION_VALIDATION;
+use diem_logger::{enabled, Level};
+use diem_vm_logging::{log_schema::AdapterLogSchema, prelude::*};
 use move_binary_format::errors::VMError;
 use move_core_types::vm_status::{StatusCode, VMStatus};
 
@@ -12,29 +13,46 @@ use move_core_types::vm_status::{StatusCode, VMStatus};
 /// These errors are only expected from the module that is registered as the account module for the system.
 /// The prologue should not emit any other error codes or fail for any reason, doing so will result
 /// in the VM throwing an invariant violation
-pub const EACCOUNT_FROZEN: u64 = 1000; // sending account is frozen
-pub const EBAD_ACCOUNT_AUTHENTICATION_KEY: u64 = 1001; // auth key in transaction is invalid
-pub const ESEQUENCE_NUMBER_TOO_OLD: u64 = 1002; // transaction sequence number is too old
-pub const ESEQUENCE_NUMBER_TOO_NEW: u64 = 1003; // transaction sequence number is too new
-pub const EACCOUNT_DOES_NOT_EXIST: u64 = 1004; // transaction sender's account does not exist
-pub const ECANT_PAY_GAS_DEPOSIT: u64 = 1005; // insufficient balance (to pay for gas deposit)
-pub const ETRANSACTION_EXPIRED: u64 = 1006; // transaction expiration time exceeds block time.
-pub const EBAD_CHAIN_ID: u64 = 1007; // chain_id in transaction doesn't match the one on-chain
-pub const ESCRIPT_NOT_ALLOWED: u64 = 1008;
-pub const EMODULE_NOT_ALLOWED: u64 = 1009;
-pub const EINVALID_WRITESET_SENDER: u64 = 1010; // invalid sender (not diem root) for write set
-pub const ESEQUENCE_NUMBER_TOO_BIG: u64 = 1011;
-pub const EBAD_TRANSACTION_FEE_CURRENCY: u64 = 1012;
-pub const ESECONDARY_KEYS_ADDRESSES_COUNT_MISMATCH: u64 = 1013;
-pub const ESEQ_NONCE_NONCE_INVALID: u64 = 1014;
+// Auth key in transaction is invalid.
+pub const EBAD_ACCOUNT_AUTHENTICATION_KEY: u64 = 1001;
+// Transaction sequence number is too old.
+pub const ESEQUENCE_NUMBER_TOO_OLD: u64 = 1002;
+// Transaction sequence number is too new.
+pub const ESEQUENCE_NUMBER_TOO_NEW: u64 = 1003;
+// Transaction sender's account does not exist.
+pub const EACCOUNT_DOES_NOT_EXIST: u64 = 1004;
+// Insufficient balance (to pay for gas deposit).
+pub const ECANT_PAY_GAS_DEPOSIT: u64 = 1005;
+// Transaction expiration time exceeds block time.
+pub const ETRANSACTION_EXPIRED: u64 = 1006;
+// chain_id in transaction doesn't match the one on-chain.
+pub const EBAD_CHAIN_ID: u64 = 1007;
+// Transaction sequence number exceeds u64 max.
+pub const ESEQUENCE_NUMBER_TOO_BIG: u64 = 1008;
+// Counts of secondary keys and addresses don't match.
+pub const ESECONDARY_KEYS_ADDRESSES_COUNT_MISMATCH: u64 = 1009;
+// Gas payer account missing in gas payer tx
+pub const EGAS_PAYER_ACCOUNT_MISSING: u64 = 1010;
 
-const INVALID_STATE: u8 = 1;
-const INVALID_ARGUMENT: u8 = 7;
-const LIMIT_EXCEEDED: u8 = 8;
+// Specified account is not a multisig account.
+const EACCOUNT_NOT_MULTISIG: u64 = 2002;
+// Account executing this operation is not an owner of the multisig account.
+const ENOT_MULTISIG_OWNER: u64 = 2003;
+// Multisig transaction with specified id cannot be found.
+const EMULTISIG_TRANSACTION_NOT_FOUND: u64 = 2006;
+// Provided target function does not match the hash stored in the on-chain multisig transaction.
+const EMULTISIG_PAYLOAD_DOES_NOT_MATCH_HASH: u64 = 2008;
+// Multisig transaction has not received enough approvals to be executed.
+const EMULTISIG_NOT_ENOUGH_APPROVALS: u64 = 2009;
+
+const INVALID_ARGUMENT: u8 = 0x1;
+const LIMIT_EXCEEDED: u8 = 0x2;
+const INVALID_STATE: u8 = 0x3;
+const PERMISSION_DENIED: u8 = 0x5;
 
 fn error_split(code: u64) -> (u8, u64) {
-    let category = code as u8;
-    let reason = code >> 8;
+    let reason = code & 0xFFFF;
+    let category = ((code >> 16) & 0xFF) as u8;
     (category, reason)
 }
 
@@ -42,7 +60,6 @@ fn error_split(code: u64) -> (u8, u64) {
 /// Any non-abort non-execution code is considered an invariant violation, specifically
 /// `UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION`
 pub fn convert_prologue_error(
-    chain_specific_info: &ChainSpecificAccountInfo,
     error: VMError,
     log_context: &AdapterLogSchema,
 ) -> Result<(), VMStatus> {
@@ -50,20 +67,36 @@ pub fn convert_prologue_error(
     Err(match status {
         VMStatus::Executed => VMStatus::Executed,
         VMStatus::MoveAbort(location, code)
-            if !chain_specific_info.is_account_module_abort(&location) =>
+            if !DIEM_TRANSACTION_VALIDATION.is_account_module_abort(&location) =>
         {
-            let (category, reason) = error_split(code);
-            log_context.alert();
-            error!(
-                *log_context,
-                "[diem_vm] Unexpected prologue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
-                location, code, category, reason,
-            );
-            VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
-        }
+            let new_major_status = match error_split(code) {
+                // TODO: Update these after adding the appropriate error codes into StatusCode
+                // in the Move repo.
+                (INVALID_STATE, EACCOUNT_NOT_MULTISIG) => StatusCode::ACCOUNT_NOT_MULTISIG,
+                (PERMISSION_DENIED, ENOT_MULTISIG_OWNER) => StatusCode::NOT_MULTISIG_OWNER,
+                (INVALID_ARGUMENT, EMULTISIG_TRANSACTION_NOT_FOUND) => {
+                    StatusCode::MULTISIG_TRANSACTION_NOT_FOUND
+                },
+                (INVALID_ARGUMENT, EMULTISIG_NOT_ENOUGH_APPROVALS) => {
+                    StatusCode::MULTISIG_TRANSACTION_INSUFFICIENT_APPROVALS
+                },
+                (INVALID_ARGUMENT, EMULTISIG_PAYLOAD_DOES_NOT_MATCH_HASH) => {
+                    StatusCode::MULTISIG_TRANSACTION_PAYLOAD_DOES_NOT_MATCH_HASH
+                },
+                (category, reason) => {
+                    let err_msg = format!("[diem_vm] Unexpected prologue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
+                    location, code, category, reason);
+                    speculative_error!(log_context, err_msg.clone());
+                    return Err(VMStatus::error(
+                        StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                        Some(err_msg),
+                    ));
+                },
+            };
+            VMStatus::error(new_major_status, None)
+        },
         VMStatus::MoveAbort(location, code) => {
             let new_major_status = match error_split(code) {
-                (INVALID_STATE, EACCOUNT_FROZEN) => StatusCode::SENDING_ACCOUNT_FROZEN,
                 // Invalid authentication key
                 (INVALID_ARGUMENT, EBAD_ACCOUNT_AUTHENTICATION_KEY) => StatusCode::INVALID_AUTH_KEY,
                 // Sequence number too old
@@ -73,48 +106,45 @@ pub fn convert_prologue_error(
                 // Sequence number too new
                 (INVALID_ARGUMENT, EACCOUNT_DOES_NOT_EXIST) => {
                     StatusCode::SENDING_ACCOUNT_DOES_NOT_EXIST
-                }
+                },
                 // Can't pay for transaction gas deposit/fee
                 (INVALID_ARGUMENT, ECANT_PAY_GAS_DEPOSIT) => {
                     StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE
-                }
+                },
                 (INVALID_ARGUMENT, ETRANSACTION_EXPIRED) => StatusCode::TRANSACTION_EXPIRED,
                 (INVALID_ARGUMENT, EBAD_CHAIN_ID) => StatusCode::BAD_CHAIN_ID,
-                (INVALID_STATE, ESCRIPT_NOT_ALLOWED) => StatusCode::UNKNOWN_SCRIPT,
-                (INVALID_STATE, EMODULE_NOT_ALLOWED) => StatusCode::INVALID_MODULE_PUBLISHER,
-                (INVALID_ARGUMENT, EINVALID_WRITESET_SENDER) => StatusCode::REJECTED_WRITE_SET,
                 // Sequence number will overflow
                 (LIMIT_EXCEEDED, ESEQUENCE_NUMBER_TOO_BIG) => StatusCode::SEQUENCE_NUMBER_TOO_BIG,
-                // The gas currency is not registered as a TransactionFee currency
-                (INVALID_ARGUMENT, EBAD_TRANSACTION_FEE_CURRENCY) => {
-                    StatusCode::BAD_TRANSACTION_FEE_CURRENCY
-                }
                 (INVALID_ARGUMENT, ESECONDARY_KEYS_ADDRESSES_COUNT_MISMATCH) => {
                     StatusCode::SECONDARY_KEYS_ADDRESSES_COUNT_MISMATCH
-                }
-                (INVALID_ARGUMENT, ESEQ_NONCE_NONCE_INVALID) => StatusCode::SEQUENCE_NONCE_INVALID,
+                },
+                (INVALID_ARGUMENT, EGAS_PAYER_ACCOUNT_MISSING) => {
+                    StatusCode::GAS_PAYER_ACCOUNT_MISSING
+                },
                 (category, reason) => {
-                    log_context.alert();
-                    error!(
-                        *log_context,
-                        "[diem_vm] Unexpected prologue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
-                        location, code, category, reason,
-                    );
-                    return Err(VMStatus::Error(
-                        StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
-                    ));
-                }
+                    let err_msg = format!("[diem_vm] Unexpected prologue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
+                    location, code, category, reason);
+                    speculative_error!(log_context, err_msg.clone());
+                    return Err(VMStatus::Error {
+                        status_code: StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                        sub_status: None,
+                        message: Some(err_msg),
+                    });
+                },
             };
-            VMStatus::Error(new_major_status)
-        }
-        status @ VMStatus::ExecutionFailure { .. } | status @ VMStatus::Error(_) => {
-            log_context.alert();
-            error!(
-                *log_context,
-                "[diem_vm] Unexpected prologue error: {:?}", status
+            VMStatus::error(new_major_status, None)
+        },
+        status @ VMStatus::ExecutionFailure { .. } | status @ VMStatus::Error { .. } => {
+            speculative_error!(
+                log_context,
+                format!("[diem_vm] Unexpected prologue error: {:?}", status),
             );
-            VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
-        }
+            VMStatus::Error {
+                status_code: StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                sub_status: status.sub_status(),
+                message: None,
+            }
+        },
     })
 }
 
@@ -122,7 +152,6 @@ pub fn convert_prologue_error(
 /// Any other errors are mapped to the invariant violation
 /// `UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION`
 pub fn convert_epilogue_error(
-    chain_specific_info: &ChainSpecificAccountInfo,
     error: VMError,
     log_context: &AdapterLogSchema,
 ) -> Result<(), VMStatus> {
@@ -130,39 +159,39 @@ pub fn convert_epilogue_error(
     Err(match status {
         VMStatus::Executed => VMStatus::Executed,
         VMStatus::MoveAbort(location, code)
-            if !chain_specific_info.is_account_module_abort(&location) =>
+            if !DIEM_TRANSACTION_VALIDATION.is_account_module_abort(&location) =>
         {
             let (category, reason) = error_split(code);
-            log_context.alert();
-            error!(
-                *log_context,
-                "[diem_vm] Unexpected success epilogue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
-                location, code, category, reason,
-            );
-            VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
-        }
+            let err_msg = format!("[diem_vm] Unexpected success epilogue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
+			location, code, category, reason);
+            speculative_error!(log_context, err_msg.clone());
+            VMStatus::error(
+                StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                Some(err_msg),
+            )
+        },
 
         VMStatus::MoveAbort(location, code) => match error_split(code) {
             (LIMIT_EXCEEDED, ECANT_PAY_GAS_DEPOSIT) => VMStatus::MoveAbort(location, code),
             (category, reason) => {
-                log_context.alert();
-                error!(
-                    *log_context,
-                    "[diem_vm] Unexpected success epilogue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
-                    location, code, category, reason,
-                );
-                VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
+                let err_msg = format!("[diem_vm] Unexpected success epilogue Move abort: {:?}::{:?} (Category: {:?} Reason: {:?})",
+			    location, code, category, reason);
+                speculative_error!(log_context, err_msg.clone());
+                VMStatus::error(
+                    StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                    Some(err_msg),
+                )
+            },
+        },
+        status => {
+            let err_msg = format!("[diem_vm] Unexpected success epilogue error: {:?}", status);
+            speculative_error!(log_context, err_msg.clone());
+            VMStatus::Error {
+                status_code: StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                sub_status: status.sub_status(),
+                message: Some(err_msg),
             }
         },
-
-        status => {
-            log_context.alert();
-            error!(
-                *log_context,
-                "[diem_vm] Unexpected success epilogue error: {:?}", status,
-            );
-            VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
-        }
     })
 }
 
@@ -177,16 +206,24 @@ pub fn expect_only_successful_execution(
     let status = error.into_vm_status();
     Err(match status {
         VMStatus::Executed => VMStatus::Executed,
-
+        // Storage error can be a result of speculation failure so throw the error back for caller to handle.
+        e @ VMStatus::Error {
+            status_code: StatusCode::STORAGE_ERROR,
+            ..
+        } => e,
         status => {
-            log_context.alert();
-            error!(
-                *log_context,
+            // Only trigger a warning here as some errors could be a result of the speculative parallel execution.
+            // We will report the errors after we obtained the final transaction output in update_counters_for_processed_chunk
+            let err_msg = format!(
                 "[diem_vm] Unexpected error from known Move function, '{}'. Error: {:?}",
-                function_name,
-                status,
+                function_name, status
             );
-            VMStatus::Error(StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION)
-        }
+            speculative_warn!(log_context, err_msg.clone());
+            VMStatus::Error {
+                status_code: StatusCode::UNEXPECTED_ERROR_FROM_KNOWN_MOVE_FUNCTION,
+                sub_status: status.sub_status(),
+                message: Some(err_msg),
+            }
+        },
     })
 }

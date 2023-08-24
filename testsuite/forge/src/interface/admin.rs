@@ -1,10 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{ChainInfo, CoreContext, Test};
 use crate::{Result, TestReport};
 use diem_rest_client::Client as RestClient;
-use diem_sdk::{client::BlockingClient, types::LocalAccount};
+use diem_sdk::types::LocalAccount;
 use reqwest::Url;
 
 /// The testing interface which defines a test written from the perspective of the Admin of the
@@ -12,7 +13,7 @@ use reqwest::Url;
 /// of the validators or full nodes running on the network.
 pub trait AdminTest: Test {
     /// Executes the test against the given context.
-    fn run<'t>(&self, ctx: &mut AdminContext<'t>) -> Result<()>;
+    fn run(&self, ctx: &mut AdminContext<'_>) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -38,10 +39,6 @@ impl<'t> AdminContext<'t> {
 
     pub fn rng(&mut self) -> &mut ::rand::rngs::StdRng {
         self.core.rng()
-    }
-
-    pub fn client(&self) -> BlockingClient {
-        BlockingClient::new(&self.chain_info.json_rpc_url)
     }
 
     pub fn rest_client(&self) -> RestClient {

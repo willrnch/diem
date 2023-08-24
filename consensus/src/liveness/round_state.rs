@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,15 +7,21 @@ use crate::{
     pending_votes::{PendingVotes, VoteReceptionResult},
     util::time_service::{SendTask, TimeService},
 };
-use consensus_types::{common::Round, sync_info::SyncInfo, vote::Vote};
+use diem_consensus_types::{
+    common::Round, sync_info::SyncInfo, timeout_2chain::TwoChainTimeoutWithPartialSignatures,
+    vote::Vote,
+};
+use diem_crypto::HashValue;
 use diem_logger::{prelude::*, Schema};
-use diem_types::validator_verifier::ValidatorVerifier;
+use diem_types::{
+    ledger_info::LedgerInfoWithPartialSignatures, validator_verifier::ValidatorVerifier,
+};
 use futures::future::AbortHandle;
 use serde::Serialize;
 use std::{fmt, sync::Arc, time::Duration};
 
 /// A reason for starting a new round: introduced for monitoring / debug purposes.
-#[derive(Serialize, Eq, Debug, PartialEq)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub enum NewRoundReason {
     QCReady,
     Timeout,
@@ -33,11 +40,13 @@ impl fmt::Display for NewRoundReason {
 /// NewRoundEvents are consumed by the rest of the system: they can cause sending new proposals
 /// or voting for some proposals that wouldn't have been voted otherwise.
 /// The duration is populated for debugging and testing
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NewRoundEvent {
     pub round: Round,
     pub reason: NewRoundReason,
     pub timeout: Duration,
+    pub prev_round_votes: Vec<(HashValue, LedgerInfoWithPartialSignatures)>,
+    pub prev_round_timeout_votes: Option<TwoChainTimeoutWithPartialSignatures>,
 }
 
 impl fmt::Display for NewRoundEvent {
@@ -45,7 +54,7 @@ impl fmt::Display for NewRoundEvent {
         write!(
             f,
             "NewRoundEvent: [round: {}, reason: {}, timeout: {:?}]",
-            self.round, self.reason, self.timeout
+            self.round, self.reason, self.timeout,
         )
     }
 }
@@ -145,7 +154,7 @@ pub struct RoundState {
     // Service for timer
     time_service: Arc<dyn TimeService>,
     // To send local timeout events to the subscriber (e.g., SMR)
-    timeout_sender: channel::Sender<Round>,
+    timeout_sender: diem_channels::Sender<Round>,
     // Votes received fot the current round.
     pending_votes: PendingVotes,
     // Vote sent locally for the current round.
@@ -179,7 +188,7 @@ impl RoundState {
     pub fn new(
         time_interval: Box<dyn RoundTimeInterval>,
         time_service: Arc<dyn TimeService>,
-        timeout_sender: channel::Sender<Round>,
+        timeout_sender: diem_channels::Sender<Round>,
     ) -> Self {
         // Our counters are initialized lazily, so they're not going to appear in
         // Prometheus if some conditions never happen. Invoking get() function enforces creation.
@@ -200,6 +209,11 @@ impl RoundState {
         }
     }
 
+    /// Return if already voted for timeout
+    pub fn is_vote_timeout(&self) -> bool {
+        self.vote_sent.as_ref().map_or(false, |v| v.is_timeout())
+    }
+
     /// Return the current round.
     pub fn current_round(&self) -> Round {
         self.current_round
@@ -218,7 +232,7 @@ impl RoundState {
         }
         warn!(round = round, "Local timeout");
         counters::TIMEOUT_COUNT.inc();
-        self.setup_timeout();
+        self.setup_timeout(1);
         true
     }
 
@@ -230,11 +244,13 @@ impl RoundState {
         }
         let new_round = sync_info.highest_round() + 1;
         if new_round > self.current_round {
+            let (prev_round_votes, prev_round_timeout_votes) = self.pending_votes.drain_votes();
+
             // Start a new round.
             self.current_round = new_round;
             self.pending_votes = PendingVotes::new();
             self.vote_sent = None;
-            let timeout = self.setup_timeout();
+            let timeout = self.setup_timeout(1);
             // The new round reason is QCReady in case both QC.round + 1 == new_round, otherwise
             // it's Timeout and TC.round + 1 == new_round.
             let new_round_reason = if sync_info.highest_certified_round() + 1 == new_round {
@@ -246,8 +262,10 @@ impl RoundState {
                 round: self.current_round,
                 reason: new_round_reason,
                 timeout,
+                prev_round_votes,
+                prev_round_timeout_votes,
             };
-            debug!(round = new_round, "Starting new round: {}", new_round_event);
+            info!(round = new_round, "Starting new round: {}", new_round_event);
             return Some(new_round_event);
         }
         None
@@ -278,10 +296,15 @@ impl RoundState {
         self.vote_sent.clone()
     }
 
+    /// Setup a longer timeout task for leader because it enters the round earlier.
+    pub fn setup_leader_timeout(&mut self) {
+        self.setup_timeout(2);
+    }
+
     /// Setup the timeout task and return the duration of the current timeout
-    fn setup_timeout(&mut self) -> Duration {
+    fn setup_timeout(&mut self, multiplier: u32) -> Duration {
         let timeout_sender = self.timeout_sender.clone();
-        let timeout = self.setup_deadline();
+        let timeout = self.setup_deadline(multiplier);
         trace!(
             "Scheduling timeout of {} ms for round {}",
             timeout.as_millis(),
@@ -297,7 +320,7 @@ impl RoundState {
     }
 
     /// Setup the current round deadline and return the duration of the current round
-    fn setup_deadline(&mut self) -> Duration {
+    fn setup_deadline(&mut self, multiplier: u32) -> Duration {
         let round_index_after_committed_round = {
             if self.highest_committed_round == 0 {
                 // Genesis doesn't require the 3-chain rule for commit, hence start the index at
@@ -311,7 +334,8 @@ impl RoundState {
         } as usize;
         let timeout = self
             .time_interval
-            .get_round_duration(round_index_after_committed_round);
+            .get_round_duration(round_index_after_committed_round)
+            * multiplier;
         let now = self.time_service.get_current_timestamp();
         debug!(
             round = self.current_round,

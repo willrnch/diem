@@ -1,52 +1,78 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::Error;
-use consensus_notifications::{
+use crate::{
+    error::Error,
+    logging::{LogEntry, LogSchema},
+};
+use diem_consensus_notifications::{
     ConsensusCommitNotification, ConsensusNotification, ConsensusNotificationListener,
     ConsensusSyncNotification,
 };
-use data_streaming_service::data_notification::NotificationId;
+use diem_data_streaming_service::data_notification::NotificationId;
+use diem_event_notifications::{EventNotificationSender, EventSubscriptionService};
 use diem_infallible::Mutex;
 use diem_logger::prelude::*;
+use diem_mempool_notifications::MempoolNotificationSender;
 use diem_types::{
     contract_event::ContractEvent,
     ledger_info::LedgerInfoWithSignatures,
     transaction::{Transaction, Version},
 };
-use event_notifications::{EventNotificationSender, EventSubscriptionService};
 use futures::{channel::mpsc, stream::FusedStream, Stream};
-use mempool_notifications::MempoolNotificationSender;
+use serde::Serialize;
 use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, SystemTime},
 };
 
-// TODO(joshlind): make these configurable!
-const CONSENSUS_SYNC_REQUEST_TIMEOUT_MS: u64 = 60000; // 1 minute
-const MEMPOOL_COMMIT_ACK_TIMEOUT_MS: u64 = 5000; // 5 seconds
+/// A notification for new data that has been committed to storage
+#[derive(Clone, Debug)]
+pub enum CommitNotification {
+    CommittedStateSnapshot(CommittedStateSnapshot),
+}
 
-/// A notification for new transactions and events that have been committed to
-/// storage.
-pub struct CommitNotification {
+/// A commit notification for the new state snapshot
+#[derive(Clone, Debug)]
+pub struct CommittedStateSnapshot {
+    pub committed_transaction: CommittedTransactions,
+    pub last_committed_state_index: u64,
+    pub version: Version,
+}
+
+/// A commit notification for new transactions
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedTransactions {
     pub events: Vec<ContractEvent>,
     pub transactions: Vec<Transaction>,
 }
 
 impl CommitNotification {
-    pub fn new(events: Vec<ContractEvent>, transactions: Vec<Transaction>) -> Self {
-        Self {
+    pub fn new_committed_state_snapshot(
+        events: Vec<ContractEvent>,
+        transactions: Vec<Transaction>,
+        last_committed_state_index: u64,
+        version: Version,
+    ) -> Self {
+        let committed_transaction = CommittedTransactions {
             events,
             transactions,
-        }
+        };
+        let committed_states = CommittedStateSnapshot {
+            committed_transaction,
+            last_committed_state_index,
+            version,
+        };
+        CommitNotification::CommittedStateSnapshot(committed_states)
     }
 
     /// Handles the commit notification by notifying mempool and the event
     /// subscription service.
-    pub async fn handle_commit_notification<M: MempoolNotificationSender>(
-        &self,
+    pub async fn handle_transaction_notification<M: MempoolNotificationSender>(
+        events: Vec<ContractEvent>,
+        transactions: Vec<Transaction>,
         latest_synced_version: Version,
         latest_synced_ledger_info: LedgerInfoWithSignatures,
         mut mempool_notification_handler: MempoolNotificationHandler<M>,
@@ -54,25 +80,29 @@ impl CommitNotification {
     ) -> Result<(), Error> {
         // Notify mempool of the committed transactions
         debug!(
-            "Notifying mempool of transactions at version: {:?}",
-            latest_synced_version
+            LogSchema::new(LogEntry::NotificationHandler).message(&format!(
+                "Notifying mempool of transactions at version: {:?}",
+                latest_synced_version
+            ))
         );
         let blockchain_timestamp_usecs = latest_synced_ledger_info.ledger_info().timestamp_usecs();
         mempool_notification_handler
             .notify_mempool_of_committed_transactions(
-                self.transactions.clone(),
+                transactions.clone(),
                 blockchain_timestamp_usecs,
             )
             .await?;
 
         // Notify the event subscription service of the events
         debug!(
-            "Notifying the event subscription service of events at version: {:?}",
-            latest_synced_version
+            LogSchema::new(LogEntry::NotificationHandler).message(&format!(
+                "Notifying the event subscription service of events at version: {:?}",
+                latest_synced_version
+            ))
         );
         event_subscription_service
             .lock()
-            .notify_events(latest_synced_version, self.events.clone())
+            .notify_events(latest_synced_version, events.clone())
             .map_err(|error| error.into())
     }
 }
@@ -113,27 +143,24 @@ impl FusedStream for CommitNotificationListener {
 /// A consensus sync request for a specified target ledger info
 pub struct ConsensusSyncRequest {
     consensus_sync_notification: ConsensusSyncNotification,
-    last_commit_timestamp: SystemTime,
 }
 
 impl ConsensusSyncRequest {
     pub fn new(consensus_sync_notification: ConsensusSyncNotification) -> Self {
         Self {
             consensus_sync_notification,
-            last_commit_timestamp: SystemTime::now(),
         }
-    }
-
-    pub fn update_last_commit_timestamp(&mut self) {
-        self.last_commit_timestamp = SystemTime::now();
-    }
-
-    pub fn get_last_commit_timestamp(&self) -> SystemTime {
-        self.last_commit_timestamp
     }
 
     pub fn get_sync_target(&self) -> LedgerInfoWithSignatures {
         self.consensus_sync_notification.target.clone()
+    }
+
+    pub fn get_sync_target_version(&self) -> Version {
+        self.consensus_sync_notification
+            .target
+            .ledger_info()
+            .version()
     }
 }
 
@@ -160,7 +187,7 @@ impl ConsensusNotificationHandler {
     }
 
     /// Returns the active sync request that consensus is waiting on
-    pub fn get_consensus_sync_request(&self) -> Arc<Mutex<Option<ConsensusSyncRequest>>> {
+    pub fn get_sync_request(&self) -> Arc<Mutex<Option<ConsensusSyncRequest>>> {
         self.consensus_sync_request.clone()
     }
 
@@ -187,7 +214,8 @@ impl ConsensusNotificationHandler {
 
         // If we're now at the target, return successfully
         if sync_target_version == latest_committed_version {
-            info!("We're already at the requested sync target version! Returning early.");
+            info!(LogSchema::new(LogEntry::NotificationHandler)
+                .message("We're already at the requested sync target version! Returning early"));
             let result = Ok(());
             self.respond_to_sync_notification(sync_notification, result.clone())
                 .await?;
@@ -207,7 +235,7 @@ impl ConsensusNotificationHandler {
         latest_synced_ledger_info: LedgerInfoWithSignatures,
     ) -> Result<(), Error> {
         // Fetch the sync target version
-        let consensus_sync_request = self.get_consensus_sync_request();
+        let consensus_sync_request = self.get_sync_request();
         let sync_target_version = consensus_sync_request.lock().as_ref().map(|sync_request| {
             sync_request
                 .consensus_sync_notification
@@ -230,7 +258,7 @@ impl ConsensusNotificationHandler {
 
             // Check if we've hit the target
             if latest_committed_version == sync_target_version {
-                let consensus_sync_request = self.get_consensus_sync_request().lock().take();
+                let consensus_sync_request = self.get_sync_request().lock().take();
                 if let Some(consensus_sync_request) = consensus_sync_request {
                     self.respond_to_sync_notification(
                         consensus_sync_request.consensus_sync_notification,
@@ -239,39 +267,6 @@ impl ConsensusNotificationHandler {
                     .await?;
                 }
                 return Ok(());
-            }
-
-            // Check if the commit deadline has been exceeded (timed out since the last commit)
-            let max_time_between_commits = Duration::from_millis(CONSENSUS_SYNC_REQUEST_TIMEOUT_MS);
-            let last_commit_timestamp = self
-                .get_consensus_sync_request()
-                .lock()
-                .as_ref()
-                .expect("The sync request should exist!")
-                .get_last_commit_timestamp();
-            let next_commit_deadline = last_commit_timestamp
-                .checked_add(max_time_between_commits)
-                .ok_or_else(|| {
-                    Error::IntegerOverflow("The new commit deadline has overflown!".into())
-                })?;
-            if SystemTime::now()
-                .duration_since(next_commit_deadline)
-                .is_ok()
-            {
-                // Remove the sync request and notify consensus that the request timed out
-                let error = Error::UnexpectedError(format!(
-                    "Sync request timed out! Hit the max time between commits: {:?}",
-                    max_time_between_commits
-                ));
-                let consensus_sync_request = self.get_consensus_sync_request().lock().take();
-                if let Some(consensus_sync_request) = consensus_sync_request {
-                    self.respond_to_sync_notification(
-                        consensus_sync_request.consensus_sync_notification,
-                        Err(error.clone()),
-                    )
-                    .await?;
-                }
-                return Err(error);
             }
         }
 
@@ -286,12 +281,14 @@ impl ConsensusNotificationHandler {
     ) -> Result<(), Error> {
         // Wrap the result in an error that consensus can process
         let message = result.map_err(|error| {
-            consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
+            diem_consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
         });
 
-        debug!(
-            "Responding to consensus sync notification with message: {:?}",
-            message
+        info!(
+            LogSchema::new(LogEntry::NotificationHandler).message(&format!(
+                "Responding to consensus sync notification with message: {:?}",
+                message
+            ))
         );
 
         // Send the result
@@ -314,12 +311,14 @@ impl ConsensusNotificationHandler {
     ) -> Result<(), Error> {
         // Wrap the result in an error that consensus can process
         let message = result.map_err(|error| {
-            consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
+            diem_consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
         });
 
         debug!(
-            "Responding to consensus commit notification with message: {:?}",
-            message
+            LogSchema::new(LogEntry::NotificationHandler).message(&format!(
+                "Responding to consensus commit notification with message: {:?}",
+                message
+            ))
         );
 
         // Send the result
@@ -348,7 +347,7 @@ impl FusedStream for ConsensusNotificationHandler {
 
 /// A notification for error transactions and events that have been committed to
 /// storage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ErrorNotification {
     pub error: Error,
     pub notification_id: NotificationId,
@@ -390,15 +389,18 @@ impl FusedStream for ErrorNotificationListener {
 /// A simple handler for sending notifications to mempool
 #[derive(Clone)]
 pub struct MempoolNotificationHandler<M> {
+    mempool_commit_ack_timeout_ms: u64,
     mempool_notification_sender: M,
 }
 
 impl<M: MempoolNotificationSender> MempoolNotificationHandler<M> {
-    pub fn new(mempool_notification_sender: M) -> Self {
+    pub fn new(mempool_notification_sender: M, mempool_commit_ack_timeout_ms: u64) -> Self {
         Self {
+            mempool_commit_ack_timeout_ms,
             mempool_notification_sender,
         }
     }
+
     /// Notifies mempool that transactions have been committed.
     pub async fn notify_mempool_of_committed_transactions(
         &mut self,
@@ -410,13 +412,16 @@ impl<M: MempoolNotificationSender> MempoolNotificationHandler<M> {
             .notify_new_commit(
                 committed_transactions,
                 block_timestamp_usecs,
-                MEMPOOL_COMMIT_ACK_TIMEOUT_MS,
+                self.mempool_commit_ack_timeout_ms,
             )
             .await;
 
         if let Err(error) = result {
-            // TODO(joshlind): log this!
-            Err(Error::NotifyMempoolError(format!("{:?}", error)))
+            let error = Error::NotifyMempoolError(format!("{:?}", error));
+            error!(LogSchema::new(LogEntry::NotificationHandler)
+                .error(&error)
+                .message("Failed to notify mempool of committed transactions!"));
+            Err(error)
         } else {
             Ok(())
         }

@@ -1,10 +1,10 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides a generic set of traits for dealing with cryptographic primitives.
 //!
-//! For examples on how to use these traits, see the implementations of the [`ed25519`] or
-//! [`bls12381`] modules.
+//! For examples on how to use these traits, see the implementations of the [`crate::ed25519`]
 
 use crate::hash::{CryptoHash, CryptoHasher};
 use anyhow::Result;
@@ -60,7 +60,7 @@ pub trait Length {
 /// round-trip to bytes and corresponding [`TryFrom`][TryFrom].
 pub trait ValidCryptoMaterial:
     // The for<'a> exactly matches the assumption "deserializable from any lifetime".
-    for<'a> TryFrom<&'a [u8], Error = CryptoMaterialError> + Serialize + DeserializeOwned
+    for<'a> TryFrom<&'a [u8], Error=CryptoMaterialError> + Serialize + DeserializeOwned
 {
     /// Convert the valid crypto material to bytes.
     fn to_bytes(&self) -> Vec<u8>;
@@ -74,6 +74,9 @@ pub trait ValidCryptoMaterialStringExt: ValidCryptoMaterial {
     /// When trying to convert from bytes, we simply decode the string into
     /// bytes before checking if we can convert.
     fn from_encoded_string(encoded_str: &str) -> std::result::Result<Self, CryptoMaterialError> {
+        // Strip 0x at beginning if there is one
+        let encoded_str = encoded_str.strip_prefix("0x").unwrap_or(encoded_str);
+
         let bytes_out = ::hex::decode(encoded_str);
         // We defer to `try_from` to make sure we only produce valid crypto materials.
         bytes_out
@@ -81,9 +84,10 @@ pub trait ValidCryptoMaterialStringExt: ValidCryptoMaterial {
             .or(Err(CryptoMaterialError::DeserializationError))
             .and_then(|ref bytes| Self::try_from(bytes))
     }
+
     /// A function to encode into hex-string after serializing.
     fn to_encoded_string(&self) -> Result<String> {
-        Ok(::hex::encode(&self.to_bytes()))
+        Ok(format!("0x{}", ::hex::encode(self.to_bytes())))
     }
 }
 
@@ -125,9 +129,12 @@ pub trait SigningKey:
     /// that we know how to serialize. There is no pre-hashing into a
     /// `HashValue` to be done by the caller.
     ///
-    /// Note: this assumes serialization is unfaillible. See diem_common::bcs::ser
+    /// Note: this assumes serialization is infallible. See crates::bcs::ser
     /// for a discussion of this assumption.
-    fn sign<T: CryptoHash + Serialize>(&self, message: &T) -> Self::SignatureMaterial;
+    fn sign<T: CryptoHash + Serialize>(
+        &self,
+        message: &T,
+    ) -> Result<Self::SignatureMaterial, CryptoMaterialError>;
 
     /// Signs a non-hash input message. For testing only.
     #[cfg(any(test, feature = "fuzzing"))]
@@ -141,12 +148,13 @@ pub trait SigningKey:
 
 /// Returns the signing message for the given message.
 /// It is used by `SigningKey#sign` function.
-pub fn signing_message<T: CryptoHash + Serialize>(message: &T) -> Vec<u8> {
+pub fn signing_message<T: CryptoHash + Serialize>(
+    message: &T,
+) -> Result<Vec<u8>, CryptoMaterialError> {
     let mut bytes = <T::Hasher as CryptoHasher>::seed().to_vec();
     bcs::serialize_into(&mut bytes, &message)
-        .map_err(|_| CryptoMaterialError::SerializationError)
-        .expect("Serialization of signable material should not fail.");
-    bytes
+        .map_err(|_| CryptoMaterialError::SerializationError)?;
+    Ok(bytes)
 }
 
 /// A type for key material that can be publicly shared, and in asymmetric
@@ -154,7 +162,7 @@ pub fn signing_message<T: CryptoHash + Serialize>(message: &T) -> Vec<u8> {
 /// reference.
 /// This convertibility requirement ensures the existence of a
 /// deterministic, canonical public key construction from a private key.
-pub trait PublicKey: Sized + Clone + Eq + Hash +
+pub trait PublicKey: Sized + Clone + Eq + Hash + ValidCryptoMaterial +
     // This unsightly turbofish type parameter is the precise constraint
     // needed to require that there exists an
     //
@@ -307,4 +315,9 @@ pub(crate) mod private {
     impl Sealed for crate::multi_ed25519::MultiEd25519PrivateKey {}
     impl Sealed for crate::multi_ed25519::MultiEd25519PublicKey {}
     impl Sealed for crate::multi_ed25519::MultiEd25519Signature {}
+
+    impl Sealed for crate::bls12381::PrivateKey {}
+    impl Sealed for crate::bls12381::PublicKey {}
+    impl Sealed for crate::bls12381::Signature {}
+    impl Sealed for crate::bls12381::ProofOfPossession {}
 }

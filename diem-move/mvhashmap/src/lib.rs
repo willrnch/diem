@@ -1,223 +1,154 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use once_cell::sync::OnceCell;
-use std::{
-    cmp::{max, PartialOrd},
-    collections::{btree_map::BTreeMap, HashMap},
-    fmt::Debug,
-    hash::Hash,
+use crate::{
+    types::{MVDataError, MVDataOutput, MVModulesError, MVModulesOutput, TxnIndex, Version},
+    versioned_data::VersionedData,
+    versioned_modules::VersionedModules,
 };
+use diem_aggregator::delta_change_set::DeltaOp;
+use diem_crypto::hash::HashValue;
+use diem_types::{
+    executable::{Executable, ModulePath},
+    write_set::TransactionWrite,
+};
+use std::{fmt::Debug, hash::Hash};
+
+pub mod types;
+pub mod unsync_map;
+mod utils;
+pub mod versioned_data;
+pub mod versioned_modules;
 
 #[cfg(test)]
 mod unit_tests;
 
-/// A structure that holds placeholders for each write to the database
-//
-//  The structure is created by one thread creating the scheduling, and
-//  at that point it is used as a &mut by that single thread.
-//
-//  Then it is passed to all threads executing as a shared reference. At
-//  this point only a single thread must write to any entry, and others
-//  can read from it. Only entries are mutated using interior mutability,
-//  but no entries can be added or deleted.
-//
-
-pub type Version = usize;
-
-pub struct MVHashMap<K, V> {
-    data: HashMap<K, BTreeMap<Version, WriteCell<V>>>,
+/// Main multi-version data-structure used by threads to read/write during parallel
+/// execution.
+///
+/// Concurrency is managed by DashMap, i.e. when a method accesses a BTreeMap at a
+/// given key, it holds exclusive access and doesn't need to explicitly synchronize
+/// with other reader/writers.
+///
+/// TODO: separate V into different generic types for data and code modules with specialized
+/// traits (currently both WriteOp for executor).
+pub struct MVHashMap<K, V: TransactionWrite, X: Executable> {
+    data: VersionedData<K, V>,
+    modules: VersionedModules<K, V, X>,
 }
 
-#[derive(Debug)]
-pub enum Error {
-    // A write has been performed on an entry that is not in the possible_writes list.
-    UnexpectedWrite,
-    // A query doesn't match any entry in the map.
-    NotInMap,
-}
-
-#[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
-pub(crate) struct WriteCell<V>(OnceCell<Option<V>>);
-
-impl<V> WriteCell<V> {
-    pub fn new() -> WriteCell<V> {
-        WriteCell(OnceCell::new())
-    }
-
-    pub fn is_assigned(&self) -> bool {
-        self.0.get().is_some()
-    }
-
-    pub fn write(&self, v: V) {
-        // Each cell should only be written exactly once.
-        assert!(self.0.set(Some(v)).is_ok())
-    }
-
-    pub fn skip(&self) {
-        assert!(self.0.set(None).is_ok());
-    }
-
-    pub fn get(&self) -> Option<&Option<V>> {
-        self.0.get()
-    }
-}
-
-impl<K: Hash + Clone + Eq, V> MVHashMap<K, V> {
-    /// Create the MVHashMap structure from a list of possible writes. Each element in the list
-    /// indicates a key that could potentially be modified at its given version.
-    ///
-    /// Returns the MVHashMap, and the maximum number of writes that can write to one single key.
-    pub fn new_from(possible_writes: Vec<(K, Version)>) -> (Self, usize) {
-        let mut outer_map: HashMap<K, BTreeMap<Version, WriteCell<V>>> = HashMap::new();
-        for (key, version) in possible_writes.into_iter() {
-            outer_map
-                .entry(key)
-                .or_default()
-                .insert(version, WriteCell::new());
-        }
-        let max_dependency_size = outer_map
-            .values()
-            .fold(0, |max_depth, btree_map| max(max_depth, btree_map.len()));
-
-        (MVHashMap { data: outer_map }, max_dependency_size)
-    }
-
-    /// Get the number of keys in the MVHashMap.
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    fn get_entry(&self, key: &K, version: Version) -> Result<&WriteCell<V>, Error> {
-        self.data
-            .get(key)
-            .ok_or(Error::UnexpectedWrite)?
-            .get(&version)
-            .ok_or(Error::UnexpectedWrite)
-    }
-
-    /// Write to `key` at `version`.
-    /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn write(&self, key: &K, version: Version, data: V) -> Result<(), Error> {
-        // By construction there will only be a single writer, before the
-        // write there will be no readers on the variable.
-        // So it is safe to go ahead and write without any further check.
-
-        let entry = self.get_entry(key, version)?;
-
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            if entry.is_assigned() {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
-
-        entry.write(data);
-
-        Ok(())
-    }
-
-    /// Skips writing to `key` at `version` if that entry hasn't been assigned.
-    /// Function will return an error if the write is not in the initial `possible_writes` list.
-    pub fn skip_if_not_set(&self, key: &K, version: Version) -> Result<(), Error> {
-        // We only write or skip once per entry
-        // So it is safe to go ahead and just do it.
-        let entry = self.get_entry(key, version)?;
-
-        // Test the invariant holds
-        if !entry.is_assigned() {
-            entry.skip();
-        }
-
-        Ok(())
-    }
-
-    /// Skips writing to `key` at `version`.
-    /// Function will return an error if the write is not in the initial `possible_writes` list.
-    /// `skip` should only be invoked when `key` at `version` hasn't been assigned.
-    pub fn skip(&self, key: &K, version: Version) -> Result<(), Error> {
-        // We only write or skip once per entry
-        // So it is safe to go ahead and just do it.
-        let entry = self.get_entry(key, version)?;
-
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            if entry.is_assigned() {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
-
-        entry.skip();
-        Ok(())
-    }
-
-    /// Get the value of `key` at `version`.
-    /// Returns Ok(val) if such key is already assigned by previous transactions.
-    /// Returns Err(None) if `version` is smaller than the write of all previous versions.
-    /// Returns Err(Some(version)) if such key is dependent on the `version`-th transaction.
-    pub fn read(&self, key: &K, version: Version) -> Result<&V, Option<Version>> {
-        let tree = self.data.get(key).ok_or(None)?;
-
-        let mut iter = tree.range(0..version);
-
-        while let Some((entry_key, entry_val)) = iter.next_back() {
-            if *entry_key < version {
-                match entry_val.get() {
-                    // Entry not yet computed, return the version that blocked this query.
-                    None => return Err(Some(*entry_key)),
-                    // Entry is skipped, go to previous version.
-                    Some(None) => continue,
-                    Some(Some(v)) => return Ok(v),
-                }
-            }
-        }
-
-        Err(None)
-    }
-}
-
-const PARALLEL_THRESHOLD: usize = 1000;
-
-impl<K, V> MVHashMap<K, V>
-where
-    K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Send,
+impl<K: ModulePath + Hash + Clone + Eq + Debug, V: TransactionWrite, X: Executable>
+    MVHashMap<K, V, X>
 {
-    fn split_merge(
-        num_cpus: usize,
-        recursion_depth: usize,
-        split: Vec<(K, Version)>,
-    ) -> (usize, HashMap<K, BTreeMap<Version, WriteCell<V>>>) {
-        if (1 << recursion_depth) > num_cpus || split.len() < PARALLEL_THRESHOLD {
-            let mut data = HashMap::new();
-            let mut max_len = 0;
-            for (path, version) in split.into_iter() {
-                let place = data.entry(path).or_insert_with(BTreeMap::new);
-                place.insert(version, WriteCell::new());
-                max_len = max(max_len, place.len());
-            }
-            (max_len, data)
-        } else {
-            // Partition the possible writes by keys and work on each partition in parallel.
-            let pivot_address = split[split.len() / 2].0.clone();
-            let (left, right): (Vec<_>, Vec<_>) =
-                split.into_iter().partition(|(p, _)| *p < pivot_address);
-            let ((m0, mut left_map), (m1, right_map)) = rayon::join(
-                || Self::split_merge(num_cpus, recursion_depth + 1, left),
-                || Self::split_merge(num_cpus, recursion_depth + 1, right),
-            );
-            left_map.extend(right_map);
-            (max(m0, m1), left_map)
+    // -----------------------------------
+    // Functions shared for data and modules.
+
+    pub fn new() -> MVHashMap<K, V, X> {
+        MVHashMap {
+            data: VersionedData::new(),
+            modules: VersionedModules::new(),
         }
     }
 
-    /// Create the MVHashMap structure from a list of possible writes in parallel.
-    pub fn new_from_parallel(possible_writes: Vec<(K, Version)>) -> (Self, usize) {
-        let num_cpus = num_cpus::get();
+    pub fn take(self) -> (VersionedData<K, V>, VersionedModules<K, V, X>) {
+        (self.data, self.modules)
+    }
 
-        let (max_dependency_len, data) = Self::split_merge(num_cpus, 0, possible_writes);
-        (MVHashMap { data }, max_dependency_len)
+    /// Mark an entry from transaction 'txn_idx' at access path 'key' as an estimated write
+    /// (for future incarnation). Will panic if the entry is not in the data-structure.
+    pub fn mark_estimate(&self, key: &K, txn_idx: TxnIndex) {
+        match key.module_path() {
+            Some(_) => self.modules.mark_estimate(key, txn_idx),
+            None => self.data.mark_estimate(key, txn_idx),
+        }
+    }
+
+    /// Delete an entry from transaction 'txn_idx' at access path 'key'. Will panic
+    /// if the corresponding entry does not exist.
+    pub fn delete(&self, key: &K, txn_idx: TxnIndex) {
+        // This internally deserializes the path, TODO: fix.
+        match key.module_path() {
+            Some(_) => self.modules.delete(key, txn_idx),
+            None => self.data.delete(key, txn_idx),
+        };
+    }
+
+    /// Add a versioned write at a specified key, in data or modules map according to the key.
+    pub fn write(&self, key: K, version: Version, value: V) {
+        match key.module_path() {
+            Some(_) => self.modules.write(key, version.0, value),
+            None => self.data.write(key, version, value),
+        }
+    }
+
+    // -----------------------------------------------
+    // Functions specific to the multi-versioned data.
+
+    /// Add a delta at a specified key.
+    pub fn add_delta(&self, key: K, txn_idx: TxnIndex, delta: DeltaOp) {
+        debug_assert!(
+            key.module_path().is_none(),
+            "Delta must be stored at a path corresponding to data"
+        );
+
+        self.data.add_delta(key, txn_idx, delta);
+    }
+
+    pub fn materialize_delta(&self, key: &K, txn_idx: TxnIndex) -> Result<u128, DeltaOp> {
+        debug_assert!(
+            key.module_path().is_none(),
+            "Delta must be stored at a path corresponding to data"
+        );
+
+        self.data.materialize_delta(key, txn_idx)
+    }
+
+    pub fn set_aggregator_base_value(&self, key: &K, value: u128) {
+        debug_assert!(
+            key.module_path().is_none(),
+            "Delta must be stored at a path corresponding to data"
+        );
+
+        self.data.set_aggregator_base_value(key, value);
+    }
+
+    /// Read data at access path 'key', from the perspective of transaction 'txn_idx'.
+    pub fn fetch_data(
+        &self,
+        key: &K,
+        txn_idx: TxnIndex,
+    ) -> anyhow::Result<MVDataOutput<V>, MVDataError> {
+        self.data.fetch_data(key, txn_idx)
+    }
+
+    // ----------------------------------------------
+    // Functions specific to the multi-versioned modules map.
+
+    /// Adds a new executable to the multi-version data-structure. The executable is either
+    /// storage-version (and fixed) or uniquely identified by the (cryptographic) hash of the
+    /// module published during the block.
+    pub fn store_executable(&self, key: &K, descriptor_hash: HashValue, executable: X) {
+        self.modules
+            .store_executable(key, descriptor_hash, executable);
+    }
+
+    /// Fetches the latest module stored at the given key, either as in an executable form,
+    /// if already cached, or in a raw module format that the VM can convert to an executable.
+    /// The errors are returned if no module is found, or if a dependency is encountered.
+    pub fn fetch_module(
+        &self,
+        key: &K,
+        txn_idx: TxnIndex,
+    ) -> anyhow::Result<MVModulesOutput<V, X>, MVModulesError> {
+        self.modules.fetch_module(key, txn_idx)
+    }
+}
+
+impl<K: ModulePath + Hash + Clone + Debug + Eq, V: TransactionWrite, X: Executable> Default
+    for MVHashMap<K, V, X>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }

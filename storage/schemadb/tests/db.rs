@@ -1,14 +1,15 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use byteorder::{LittleEndian, ReadBytesExt};
-use proptest::{collection::vec, prelude::*};
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, ValueCodec},
-    ColumnFamilyName, SchemaBatch, DB, DEFAULT_CF_NAME,
+    ColumnFamilyName, SchemaBatch, DB,
 };
+use byteorder::{LittleEndian, ReadBytesExt};
+use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 
 // Creating two schemas that share exactly the same structure but are stored in different column
 // families. Also note that the key and value are of the same type `TestField`. By implementing
@@ -73,7 +74,7 @@ impl ValueCodec<TestSchema2> for TestField {
 
 fn get_column_families() -> Vec<ColumnFamilyName> {
     vec![
-        DEFAULT_CF_NAME,
+        DEFAULT_COLUMN_FAMILY_NAME,
         TestSchema1::COLUMN_FAMILY_NAME,
         TestSchema2::COLUMN_FAMILY_NAME,
     ]
@@ -83,26 +84,26 @@ fn open_db(dir: &diem_temppath::TempPath) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(&dir.path(), "test", get_column_families(), &db_opts).expect("Failed to open DB.")
+    DB::open(dir.path(), "test", get_column_families(), &db_opts).expect("Failed to open DB.")
 }
 
 fn open_db_read_only(dir: &diem_temppath::TempPath) -> DB {
-    DB::open_readonly(
-        &dir.path(),
+    DB::open_cf_readonly(
+        &rocksdb::Options::default(),
+        dir.path(),
         "test",
         get_column_families(),
-        &rocksdb::Options::default(),
     )
     .expect("Failed to open DB.")
 }
 
 fn open_db_as_secondary(dir: &diem_temppath::TempPath, dir_sec: &diem_temppath::TempPath) -> DB {
-    DB::open_as_secondary(
-        &dir.path(),
-        &dir_sec.path(),
+    DB::open_cf_as_secondary(
+        &rocksdb::Options::default(),
+        dir.path(),
+        dir_sec.path(),
         "test",
         get_column_families(),
-        &rocksdb::Options::default(),
     )
     .expect("Failed to open DB.")
 }
@@ -172,35 +173,6 @@ fn test_schema_put_get() {
     );
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn test_schema_range_delete(
-        ranges_to_delete in vec(
-            (0..100u32).prop_flat_map(|begin| (Just(begin), (begin..100u32))), 0..10)
-    ) {
-        let db = TestDB::new();
-        for i in 0..100u32 {
-            db.put::<TestSchema1>(&TestField(i), &TestField(i)).unwrap();
-        }
-        let mut should_exist_vec = [true; 100];
-        for (begin, end) in ranges_to_delete {
-            db.range_delete::<TestSchema1, TestField>(&TestField(begin), &TestField(end)).unwrap();
-            for i in begin..end {
-                should_exist_vec[i as usize] = false;
-            }
-        }
-
-        for (i, should_exist) in should_exist_vec.iter().enumerate() {
-            assert_eq!(
-                db.get::<TestSchema1>(&TestField(i as u32)).unwrap().is_some(),
-                *should_exist,
-            )
-        }
-    }
-}
-
 fn collect_values<S: Schema>(db: &TestDB) -> Vec<(S::Key, S::Value)> {
     let mut iter = db
         .iter::<S>(Default::default())
@@ -221,7 +193,7 @@ fn gen_expected_values(values: &[(u32, u32)]) -> Vec<(TestField, TestField)> {
 fn test_single_schema_batch() {
     let db = TestDB::new();
 
-    let mut db_batch = SchemaBatch::new();
+    let db_batch = SchemaBatch::new();
     db_batch
         .put::<TestSchema1>(&TestField(0), &TestField(0))
         .unwrap();
@@ -242,6 +214,7 @@ fn test_single_schema_batch() {
     db_batch
         .put::<TestSchema2>(&TestField(5), &TestField(5))
         .unwrap();
+
     db.write_schemas(db_batch).unwrap();
 
     assert_eq!(
@@ -258,7 +231,7 @@ fn test_single_schema_batch() {
 fn test_two_schema_batches() {
     let db = TestDB::new();
 
-    let mut db_batch1 = SchemaBatch::new();
+    let db_batch1 = SchemaBatch::new();
     db_batch1
         .put::<TestSchema1>(&TestField(0), &TestField(0))
         .unwrap();
@@ -276,7 +249,7 @@ fn test_two_schema_batches() {
         gen_expected_values(&[(0, 0), (1, 1)]),
     );
 
-    let mut db_batch2 = SchemaBatch::new();
+    let db_batch2 = SchemaBatch::new();
     db_batch2.delete::<TestSchema2>(&TestField(3)).unwrap();
     db_batch2
         .put::<TestSchema2>(&TestField(3), &TestField(3))
@@ -356,7 +329,7 @@ fn test_report_size() {
     let db = TestDB::new();
 
     for i in 0..1000 {
-        let mut db_batch = SchemaBatch::new();
+        let db_batch = SchemaBatch::new();
         db_batch
             .put::<TestSchema1>(&TestField(i), &TestField(i))
             .unwrap();
@@ -366,7 +339,8 @@ fn test_report_size() {
         db.write_schemas(db_batch).unwrap();
     }
 
-    db.flush_all().unwrap();
+    db.flush_cf("TestCF1").unwrap();
+    db.flush_cf("TestCF2").unwrap();
 
     assert!(
         db.get_property("TestCF1", "rocksdb.estimate-live-data-size")

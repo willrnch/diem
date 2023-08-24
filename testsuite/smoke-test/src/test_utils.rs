@@ -1,30 +1,23 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_config::config::{Identity, NodeConfig, SecureBackend};
-use diem_crypto::ed25519::Ed25519PublicKey;
+use diem_cached_packages::diem_stdlib;
+use diem_forge::{reconfig, LocalSwarm, NodeExt, Swarm};
 use diem_rest_client::Client as RestClient;
 use diem_sdk::{
-    transaction_builder::{Currency, TransactionFactory},
+    transaction_builder::TransactionFactory,
     types::{transaction::SignedTransaction, LocalAccount},
 };
-use forge::{LocalSwarm, NodeExt, Swarm};
 use rand::random;
-use std::{fs::File, io::Write, path::PathBuf};
 
-pub async fn create_and_fund_account(swarm: &mut LocalSwarm, amount: u64) -> LocalAccount {
-    let account = LocalAccount::generate(&mut rand::rngs::OsRng);
-    swarm
-        .chain_info()
-        .create_parent_vasp_account(Currency::XUS, account.authentication_key())
-        .await
-        .unwrap();
-    swarm
-        .chain_info()
-        .fund(Currency::XUS, account.address(), amount)
-        .await
-        .unwrap();
-    account
+pub const MAX_CATCH_UP_WAIT_SECS: u64 = 180; // The max time we'll wait for nodes to catch up
+pub const MAX_CONNECTIVITY_WAIT_SECS: u64 = 180; // The max time we'll wait for nodes to gain connectivity
+pub const MAX_HEALTHY_WAIT_SECS: u64 = 120; // The max time we'll wait for nodes to become healthy
+
+pub async fn create_and_fund_account(swarm: &'_ mut dyn Swarm, amount: u64) -> LocalAccount {
+    let mut info = swarm.diem_public_info();
+    info.create_and_fund_user_account(amount).await.unwrap()
 }
 
 pub async fn transfer_coins_non_blocking(
@@ -34,10 +27,8 @@ pub async fn transfer_coins_non_blocking(
     receiver: &LocalAccount,
     amount: u64,
 ) -> SignedTransaction {
-    let txn = sender.sign_with_transaction_builder(transaction_factory.peer_to_peer(
-        Currency::XUS,
-        receiver.address(),
-        amount,
+    let txn = sender.sign_with_transaction_builder(transaction_factory.payload(
+        diem_stdlib::diem_coin_transfer(receiver.address(), amount),
     ));
 
     client.submit(&txn).await.unwrap();
@@ -59,7 +50,7 @@ pub async fn transfer_coins(
     txn
 }
 
-pub async fn transfer_and_reconfig(
+pub async fn transfer_and_maybe_reconfig(
     client: &RestClient,
     transaction_factory: &TransactionFactory,
     root_account: &mut LocalAccount,
@@ -70,14 +61,7 @@ pub async fn transfer_and_reconfig(
     for _ in 0..num_transfers {
         // Reconfigurations have a 20% chance of being executed
         if random::<u16>() % 5 == 0 {
-            let diem_version = client.get_diem_version().await.unwrap();
-            let current_version = *diem_version.into_inner().payload.major.inner();
-            let txn = root_account.sign_with_transaction_builder(
-                transaction_factory.update_diem_version(0, current_version + 1),
-            );
-            client.submit_and_wait(&txn).await.unwrap();
-
-            println!("Changing diem version to {}", current_version + 1,);
+            reconfig(client, transaction_factory, root_account).await;
         }
 
         transfer_coins(client, transaction_factory, sender, receiver, 1).await;
@@ -85,17 +69,13 @@ pub async fn transfer_and_reconfig(
 }
 
 pub async fn assert_balance(client: &RestClient, account: &LocalAccount, balance: u64) {
-    let balances = client
-        .get_account_balances(account.address())
+    let on_chain_balance = client
+        .get_account_balance(account.address())
         .await
         .unwrap()
         .into_inner();
 
-    let onchain_balance = balances
-        .into_iter()
-        .find(|amount_view| amount_view.currency_code() == Currency::XUS)
-        .unwrap();
-    assert_eq!(onchain_balance.amount, balance);
+    assert_eq!(on_chain_balance.get(), balance);
 }
 
 /// This module provides useful functions for operating, handling and managing
@@ -103,43 +83,15 @@ pub async fn assert_balance(client: &RestClient, account: &LocalAccount, balance
 /// require a SmokeTestEnvironment, as it provides a generic interface across
 /// DiemSwarms, regardless of if the swarm is a validator swarm, validator full
 /// node swarm, or a public full node swarm.
-pub mod diem_swarm_utils {
-    use crate::test_utils::fetch_backend_storage;
-    use diem_config::config::{NodeConfig, OnDiskStorageConfig, SecureBackend, WaypointConfig};
-    use diem_global_constants::{DIEM_ROOT_KEY, TREASURY_COMPLIANCE_KEY};
-    use diem_secure_storage::{CryptoStorage, KVStorage, OnDiskStorage, Storage};
+#[cfg(test)]
+pub mod swarm_utils {
+    use diem_config::config::{NodeConfig, SecureBackend, WaypointConfig};
+    use diem_secure_storage::{KVStorage, Storage};
     use diem_types::waypoint::Waypoint;
-    use forge::{LocalNode, LocalSwarm, Swarm};
-
-    /// Loads the nodes's storage backend identified by the node index in the given swarm.
-    pub fn load_validators_backend_storage(validator: &LocalNode) -> SecureBackend {
-        fetch_backend_storage(validator.config(), None)
-    }
-
-    pub fn create_root_storage(swarm: &mut LocalSwarm) -> SecureBackend {
-        let chain_info = swarm.chain_info();
-        let root_key =
-            bcs::from_bytes(&bcs::to_bytes(chain_info.root_account.private_key()).unwrap())
-                .unwrap();
-        let treasury_compliance_key = bcs::from_bytes(
-            &bcs::to_bytes(chain_info.treasury_compliance_account.private_key()).unwrap(),
-        )
-        .unwrap();
-
-        let mut root_storage_config = OnDiskStorageConfig::default();
-        root_storage_config.path = swarm.dir().join("root-storage.json");
-        let mut root_storage = OnDiskStorage::new(root_storage_config.path());
-        root_storage
-            .import_private_key(DIEM_ROOT_KEY, root_key)
-            .unwrap();
-        root_storage
-            .import_private_key(TREASURY_COMPLIANCE_KEY, treasury_compliance_key)
-            .unwrap();
-
-        SecureBackend::OnDiskStorage(root_storage_config)
-    }
 
     pub fn insert_waypoint(node_config: &mut NodeConfig, waypoint: Waypoint) {
+        node_config.base.waypoint = WaypointConfig::FromConfig(waypoint);
+
         let f = |backend: &SecureBackend| {
             let mut storage: Storage = backend.into();
             storage
@@ -151,73 +103,34 @@ pub mod diem_swarm_utils {
         };
         let backend = &node_config.consensus.safety_rules.backend;
         f(backend);
-        match &node_config.base.waypoint {
-            WaypointConfig::FromStorage(backend) => {
-                f(backend);
-            }
-            _ => panic!("unexpected waypoint from node config"),
-        }
     }
-}
-
-/// Loads the node's storage backend from the given node config. If a namespace
-/// is specified, the storage namespace will be overridden.
-fn fetch_backend_storage(
-    node_config: &NodeConfig,
-    overriding_namespace: Option<String>,
-) -> SecureBackend {
-    if let Identity::FromStorage(storage_identity) =
-        &node_config.validator_network.as_ref().unwrap().identity
-    {
-        match storage_identity.backend.clone() {
-            SecureBackend::OnDiskStorage(mut config) => {
-                if let Some(namespace) = overriding_namespace {
-                    config.namespace = Some(namespace);
-                }
-                SecureBackend::OnDiskStorage(config)
-            }
-            _ => unimplemented!("On-disk storage is the only backend supported in smoke tests"),
-        }
-    } else {
-        panic!("Couldn't load identity from storage");
-    }
-}
-
-/// Writes a given public key to a file specified by the given path using hex encoding.
-/// Contents are written using utf-8 encoding and a newline is appended to ensure that
-/// whitespace can be handled by tests.
-pub fn write_key_to_file_hex_format(key: &Ed25519PublicKey, key_file_path: PathBuf) {
-    let hex_encoded_key = hex::encode(key.to_bytes());
-    let key_and_newline = hex_encoded_key + "\n";
-    let mut file = File::create(key_file_path).unwrap();
-    file.write_all(key_and_newline.as_bytes()).unwrap();
-}
-
-/// Writes a given public key to a file specified by the given path using bcs encoding.
-pub fn write_key_to_file_bcs_format(key: &Ed25519PublicKey, key_file_path: PathBuf) {
-    let bcs_encoded_key = bcs::to_bytes(&key).unwrap();
-    let mut file = File::create(key_file_path).unwrap();
-    file.write_all(&bcs_encoded_key).unwrap();
 }
 
 /// This helper function creates 3 new accounts, mints funds, transfers funds
 /// between the accounts and verifies that these operations succeed.
 pub async fn check_create_mint_transfer(swarm: &mut LocalSwarm) {
-    let client = swarm.validators().next().unwrap().rest_client();
-    let transaction_factory = swarm.chain_info().transaction_factory();
+    check_create_mint_transfer_node(swarm, 0).await;
+}
+
+/// This helper function creates 3 new accounts, mints funds, transfers funds
+/// between the accounts and verifies that these operations succeed on one specific validator.
+pub async fn check_create_mint_transfer_node(swarm: &mut LocalSwarm, idx: usize) {
+    let client = swarm.validators().nth(idx).unwrap().rest_client();
 
     // Create account 0, mint 10 coins and check balance
-    let mut account_0 = create_and_fund_account(swarm, 10).await;
+    let transaction_factory = TransactionFactory::new(swarm.chain_id());
+    let mut info = swarm.diem_public_info_for_node(idx);
+    let mut account_0 = info.create_and_fund_user_account(10).await.unwrap();
     assert_balance(&client, &account_0, 10).await;
 
     // Create account 1, mint 1 coin, transfer 3 coins from account 0 to 1, check balances
-    let account_1 = create_and_fund_account(swarm, 1).await;
+    let account_1 = info.create_and_fund_user_account(1).await.unwrap();
     transfer_coins(&client, &transaction_factory, &mut account_0, &account_1, 3).await;
 
     assert_balance(&client, &account_0, 7).await;
     assert_balance(&client, &account_1, 4).await;
 
     // Create account 2, mint 15 coins and check balance
-    let account_2 = create_and_fund_account(swarm, 15).await;
+    let account_2 = info.create_and_fund_user_account(15).await.unwrap();
     assert_balance(&client, &account_2, 15).await;
 }

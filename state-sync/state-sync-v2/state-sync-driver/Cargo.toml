@@ -1,45 +1,64 @@
 [package]
-name = "state-sync-driver"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-repository = "https://github.com/diem/diem"
+name = "diem-state-sync-driver"
 description = "The driver for state sync"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-futures = "0.3.12"
-serde = { version = "1.0.124", default-features = false }
-thiserror = "1.0.24"
-tokio = { version = "1.8.1", features = ["full"] }
-tokio-stream = "0.1.4"
-
-consensus-notifications = { path = "../../inter-component/consensus-notifications" }
-data-streaming-service = { path = "../data-streaming-service" }
-diem-config = { path = "../../../config" }
-diem-data-client = { path = "../../diem-data-client" }
-diem-infallible = { path = "../../../crates/diem-infallible" }
-diem-logger = { path = "../../../crates/diem-logger" }
-diem-types = { path = "../../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../../crates/diem-workspace-hack" }
-event-notifications = { path = "../../inter-component/event-notifications" }
-executor = { path = "../../../execution/executor" }
-executor-types = { path = "../../../execution/executor-types" }
-mempool-notifications = { path = "../../inter-component/mempool-notifications" }
-storage-interface = { path = "../../../storage/storage-interface" }
+anyhow = { workspace = true }
+diem-config = { workspace = true }
+diem-consensus-notifications = { workspace = true }
+diem-crypto = { workspace = true }
+diem-data-client = { workspace = true }
+diem-data-streaming-service = { workspace = true }
+diem-event-notifications = { workspace = true }
+diem-executor-types = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-mempool-notifications = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-runtimes = { workspace = true }
+diem-schemadb = { workspace = true }
+diem-scratchpad = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
-claim = "0.5.0"
-
-channel = { path = "../../../crates/channel" }
-diemdb = { path = "../../../storage/diemdb" }
-diem-crypto = { path = "../../../crates/diem-crypto" }
-diem-temppath = { path = "../../../crates/diem-temppath" }
-diem-time-service = { path = "../../../crates/diem-time-service", features = ["async", "testing"] }
-diem-vm = { path = "../../../diem-move/diem-vm" }
-executor-test-helpers = { path = "../../../execution/executor-test-helpers" }
-network = { path = "../../../network", features = ["fuzzing"] }
-storage-service-client = { path = "../../storage-service/client" }
-vm-genesis = { path = "../../../diem-move/vm-genesis", features = ["fuzzing"] }
+anyhow = { workspace = true }
+diem-channels = { workspace = true }
+diem-crypto = { workspace = true }
+diem-db = { workspace = true }
+diem-executor = { workspace = true }
+diem-executor-test-helpers = { workspace = true }
+diem-genesis = { workspace = true, features = ["testing"] }
+diem-network = { workspace = true }
+diem-storage-service-client = { workspace = true }
+diem-storage-service-types = { workspace = true }
+diem-temppath = { workspace = true }
+diem-time-service = { workspace = true, features = ["async", "testing"] }
+diem-vm = { workspace = true }
+diem-vm-genesis = { workspace = true }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+claims = { workspace = true }
+mockall = { workspace = true }
+move-core-types = { workspace = true }
+ntest = { workspace = true }
+rand = { workspace = true }

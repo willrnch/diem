@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Copyright (c) The Diem Core Contributors
+# Copyright © Diem Foundation
+# Parts of the project are originally copyright © Meta Platforms, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
 # This script modifies local cargo files to reflect compatibility (semver)
@@ -9,8 +10,8 @@
 
 # It requires cargo-edit and cargo-outdated
 # Example usage:
-# diem$ ./scripts/cargo_update_outdated.sh
-# diem$ git commit --all -m "Update dependencies"
+# $ ./scripts/cargo_update_outdated.sh
+# $ git commit --all -m "Update dependencies"
 set -e
 
 # check install for outdated & edit

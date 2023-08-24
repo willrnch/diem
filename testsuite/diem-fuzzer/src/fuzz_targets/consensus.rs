@@ -1,8 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::FuzzTargetImpl;
-use consensus::round_manager_fuzzing::{fuzz_proposal, generate_corpus_proposal};
+use diem_consensus::round_manager_fuzzing::{fuzz_proposal, generate_corpus_proposal};
 use diem_proptest_helpers::ValueGenerator;
 
 #[derive(Clone, Debug, Default)]

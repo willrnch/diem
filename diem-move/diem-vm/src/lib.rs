@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -100,11 +101,9 @@
 //!             +-----------------------------+
 //! ```
 
-#[macro_use]
-extern crate mirai_annotations;
 mod access_path_cache;
 #[macro_use]
-mod counters;
+pub mod counters;
 pub mod data_cache;
 
 #[cfg(feature = "mirai-contracts")]
@@ -113,30 +112,26 @@ pub mod foreign_contracts;
 mod adapter_common;
 pub mod diem_vm;
 mod diem_vm_impl;
+pub mod block_executor;
 mod errors;
-pub mod logging;
+pub mod move_vm_ext;
 pub mod natives;
-pub mod parallel_executor;
-pub mod read_write_set_analysis;
-pub mod script_to_script_function;
+pub mod sharded_block_executor;
 pub mod system_module_names;
 pub mod transaction_metadata;
+mod transaction_validation;
+mod verifier;
 
-#[cfg(test)]
-mod unit_tests;
-
-pub use crate::{diem_vm::DiemVM, diem_vm_impl::convert_changeset_and_events};
-
+pub use crate::diem_vm::DiemVM;
+use crate::sharded_block_executor::ShardedBlockExecutor;
 use diem_state_view::StateView;
 use diem_types::{
-    access_path::AccessPath,
+    block_executor::partitioner::SubBlocksForShard,
     transaction::{SignedTransaction, Transaction, TransactionOutput, VMValidatorResult},
     vm_status::VMStatus,
 };
-use move_core_types::{
-    account_address::AccountAddress,
-    language_storage::{ResourceKey, StructTag},
-};
+use std::{marker::Sync, sync::Arc};
+pub use verifier::view_function::determine_is_view;
 
 /// This trait describes the VM's validation interfaces.
 pub trait VMValidator {
@@ -158,12 +153,24 @@ pub trait VMExecutor: Send + Sync {
     /// Executes a block of transactions and returns output for each one of them.
     fn execute_block(
         transactions: Vec<Transaction>,
-        state_view: &impl StateView,
+        state_view: &(impl StateView + Sync),
+        maybe_block_gas_limit: Option<u64>,
+    ) -> Result<Vec<TransactionOutput>, VMStatus>;
+
+    /// Executes a block of transactions using a sharded block executor and returns the results.
+    fn execute_block_sharded<S: StateView + Sync + Send + 'static>(
+        sharded_block_executor: &ShardedBlockExecutor<S>,
+        block: Vec<SubBlocksForShard<Transaction>>,
+        state_view: Arc<S>,
+        maybe_block_gas_limit: Option<u64>,
     ) -> Result<Vec<TransactionOutput>, VMStatus>;
 }
 
+/*
 /// Get the AccessPath to a resource stored under `address` with type name `tag`
-fn create_access_path(address: AccountAddress, tag: StructTag) -> AccessPath {
+/// DNS
+fn create_access_path(address: AccountAddress, tag: StructTag) -> anyhow::Result<AccessPath> {
     let resource_tag = ResourceKey::new(address, tag);
     AccessPath::resource_access_path(resource_tag)
 }
+ */

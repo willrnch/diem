@@ -1,90 +1,77 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use anyhow::Result;
+use diem_cached_packages::diem_stdlib;
 use diem_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, Uniform};
-use diem_temppath::TempPath;
-use diem_transaction_builder::stdlib::{
-    encode_create_parent_vasp_account_script, encode_peer_to_peer_with_metadata_script,
+use diem_db::DiemDB;
+use diem_executor::{
+    block_executor::BlockExecutor,
+    db_bootstrapper::{generate_waypoint, maybe_bootstrap},
 };
+use diem_executor_test_helpers::{
+    bootstrap_genesis, gen_ledger_info_with_sigs, get_test_signed_transaction,
+};
+use diem_executor_types::BlockExecutorTrait;
+use diem_state_view::account_with_state_view::AsAccountWithStateView;
+use diem_storage_interface::{state_view::LatestDbStateCheckpointView, DbReaderWriter};
+use diem_temppath::TempPath;
 use diem_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config::{
-        from_currency_code_string, testnet_dd_account_address, treasury_compliance_account_address,
-        xus_tag, BalanceResource, XUS_NAME,
+        diem_test_root_address, new_block_event_key, CoinStoreResource, NewBlockEvent,
+        CORE_CODE_ADDRESS,
     },
-    account_state::AccountState,
-    account_state_blob::AccountStateBlob,
+    account_view::AccountView,
     contract_event::ContractEvent,
-    on_chain_config,
-    on_chain_config::{
-        config_address, default_access_path_for_config, ConfigurationResource, OnChainConfig,
-        ValidatorSet,
-    },
-    proof::SparseMerkleRangeProof,
-    transaction::{
-        authenticator::AuthenticationKey, ChangeSet, Transaction, TransactionPayload, Version,
-        WriteSetPayload, PRE_GENESIS_VERSION,
-    },
+    event::EventHandle,
+    on_chain_config::{access_path_for_config, ConfigurationResource, OnChainConfig, ValidatorSet},
+    state_store::state_key::StateKey,
+    test_helpers::transaction_test_helpers::{block, BLOCK_GAS_LIMIT},
+    transaction::{authenticator::AuthenticationKey, ChangeSet, Transaction, WriteSetPayload},
     trusted_state::TrustedState,
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
     write_set::{WriteOp, WriteSetMut},
 };
 use diem_vm::DiemVM;
-use diemdb::{DiemDB, GetRestoreHandler};
-use executor::{
-    block_executor::BlockExecutor,
-    components::apply_chunk_output::IntoLedgerView,
-    db_bootstrapper::{generate_waypoint, maybe_bootstrap},
+use move_core_types::{
+    language_storage::TypeTag,
+    move_resource::{MoveResource, MoveStructType},
 };
-use executor_test_helpers::{
-    bootstrap_genesis, gen_ledger_info_with_sigs, get_test_signed_transaction,
-};
-use executor_types::BlockExecutorTrait;
-use move_core_types::move_resource::MoveResource;
 use rand::SeedableRng;
-use std::{convert::TryFrom, sync::Arc};
-use storage_interface::{DbReader, DbReaderWriter, StateSnapshotReceiver};
 
 #[test]
 fn test_empty_db() {
-    let genesis = vm_genesis::test_genesis_change_set_and_validators(Some(1));
+    let genesis = diem_vm_genesis::test_genesis_change_set_and_validators(Some(1));
     let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis.0));
     let tmp_dir = TempPath::new();
     let db_rw = DbReaderWriter::new(DiemDB::new_for_test(&tmp_dir));
 
-    // BlockExecutor won't be able to boot on empty db due to lack of StartupInfo.
-    assert!(db_rw.reader.get_startup_info().unwrap().is_none());
+    assert!(db_rw
+        .reader
+        .get_latest_ledger_info_option()
+        .unwrap()
+        .is_none());
 
     // Bootstrap empty DB.
     let waypoint = generate_waypoint::<DiemVM>(&db_rw, &genesis_txn).expect("Should not fail.");
     maybe_bootstrap::<DiemVM>(&db_rw, &genesis_txn, waypoint).unwrap();
-    let startup_info = db_rw
-        .reader
-        .get_startup_info()
-        .expect("Should not fail.")
-        .expect("Should not be None.");
+    let ledger_info = db_rw.reader.get_latest_ledger_info().unwrap();
     assert_eq!(
-        Waypoint::new_epoch_boundary(startup_info.latest_ledger_info.ledger_info()).unwrap(),
+        Waypoint::new_epoch_boundary(ledger_info.ledger_info()).unwrap(),
         waypoint
     );
 
-    let initial_accumulator = db_rw
-        .reader
-        .get_accumulator_summary(waypoint.version())
-        .unwrap();
     let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
     let state_proof = db_rw
         .reader
         .get_state_proof(trusted_state.version())
         .unwrap();
-    let trusted_state_change = trusted_state
-        .verify_and_ratchet(&state_proof, Some(&initial_accumulator))
-        .unwrap();
+    let trusted_state_change = trusted_state.verify_and_ratchet(&state_proof).unwrap();
     assert!(trusted_state_change.is_epoch_change());
 
     // `maybe_bootstrap()` does nothing on non-empty DB.
@@ -96,13 +83,18 @@ fn execute_and_commit(txns: Vec<Transaction>, db: &DbReaderWriter, signer: &Vali
     let li = db.reader.get_latest_ledger_info().unwrap();
     let version = li.ledger_info().version();
     let epoch = li.ledger_info().next_block_epoch();
-    let target_version = version + txns.len() as u64;
+    let target_version = version + txns.len() as u64 + 1; // Due to StateCheckpoint txn
     let executor = BlockExecutor::<DiemVM>::new(db.clone());
     let output = executor
-        .execute_block((block_id, txns), executor.committed_block_id())
+        .execute_block(
+            (block_id, block(txns, BLOCK_GAS_LIMIT)).into(),
+            executor.committed_block_id(),
+            BLOCK_GAS_LIMIT,
+        )
         .unwrap();
     assert_eq!(output.num_leaves(), target_version + 1);
-    let ledger_info_with_sigs = gen_ledger_info_with_sigs(epoch, &output, block_id, vec![signer]);
+    let ledger_info_with_sigs =
+        gen_ledger_info_with_sigs(epoch, &output, block_id, &[signer.clone()]);
     executor
         .commit_blocks(vec![block_id], ledger_info_with_sigs)
         .unwrap();
@@ -131,20 +123,18 @@ fn get_demo_accounts() -> (
     (account1, privkey1, account2, privkey2)
 }
 
-fn get_mint_transaction(
+fn get_diem_coin_mint_transaction(
     diem_root_key: &Ed25519PrivateKey,
     diem_root_seq_num: u64,
     account: &AccountAddress,
     amount: u64,
 ) -> Transaction {
     get_test_signed_transaction(
-        testnet_dd_account_address(),
+        diem_test_root_address(),
         /* sequence_number = */ diem_root_seq_num,
         diem_root_key.clone(),
         diem_root_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(xus_tag(), *account, amount, vec![], vec![]),
-        )),
+        Some(diem_stdlib::diem_coin_mint(*account, amount)),
     )
 }
 
@@ -152,28 +142,18 @@ fn get_account_transaction(
     diem_root_key: &Ed25519PrivateKey,
     diem_root_seq_num: u64,
     account: &AccountAddress,
-    account_key: &Ed25519PrivateKey,
+    _account_key: &Ed25519PrivateKey,
 ) -> Transaction {
-    let account_auth_key = AuthenticationKey::ed25519(&account_key.public_key());
     get_test_signed_transaction(
-        treasury_compliance_account_address(),
+        diem_test_root_address(),
         /* sequence_number = */ diem_root_seq_num,
         diem_root_key.clone(),
         diem_root_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_create_parent_vasp_account_script(
-                xus_tag(),
-                0,
-                *account,
-                account_auth_key.prefix().to_vec(),
-                vec![],
-                false,
-            ),
-        )),
+        Some(diem_stdlib::diem_account_create_account(*account)),
     )
 }
 
-fn get_transfer_transaction(
+fn get_diem_coin_transfer_transaction(
     sender: AccountAddress,
     sender_seq_number: u64,
     sender_key: &Ed25519PrivateKey,
@@ -185,191 +165,58 @@ fn get_transfer_transaction(
         sender_seq_number,
         sender_key.clone(),
         sender_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(xus_tag(), recipient, amount, vec![], vec![]),
-        )),
+        Some(diem_stdlib::diem_coin_transfer(recipient, amount)),
     )
 }
 
 fn get_balance(account: &AccountAddress, db: &DbReaderWriter) -> u64 {
-    let account_state_blob = db
-        .reader
-        .get_latest_account_state(*account)
+    let db_state_view = db.reader.latest_state_checkpoint_view().unwrap();
+    let account_state_view = db_state_view.as_account_with_state_view(account);
+    account_state_view
+        .get_coin_store_resource()
         .unwrap()
-        .unwrap();
-    let account_state = AccountState::try_from(&account_state_blob).unwrap();
-    account_state
-        .get_balance_resources()
-        .unwrap()
-        .get(&from_currency_code_string(XUS_NAME).unwrap())
         .unwrap()
         .coin()
 }
 
 fn get_configuration(db: &DbReaderWriter) -> ConfigurationResource {
-    let config_blob = db
-        .reader
-        .get_latest_account_state(config_address())
+    let db_state_view = db.reader.latest_state_checkpoint_view().unwrap();
+    let diem_framework_account_state_view =
+        db_state_view.as_account_with_state_view(&CORE_CODE_ADDRESS);
+    diem_framework_account_state_view
+        .get_configuration_resource()
         .unwrap()
-        .unwrap();
-    let config_state = AccountState::try_from(&config_blob).unwrap();
-    config_state.get_configuration_resource().unwrap().unwrap()
-}
-
-fn get_state_backup(
-    db: &Arc<DiemDB>,
-) -> (
-    Vec<(HashValue, AccountStateBlob)>,
-    SparseMerkleRangeProof,
-    HashValue,
-) {
-    let backup_handler = db.get_backup_handler();
-    let accounts = backup_handler
-        .get_account_iter(4)
         .unwrap()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-    let proof = backup_handler
-        .get_account_state_range_proof(accounts.last().unwrap().0, 1)
-        .unwrap();
-    let db_reader: Arc<dyn DbReader> = db.clone();
-    let root_hash = db
-        .get_latest_tree_state()
-        .unwrap()
-        .into_ledger_view(&db_reader)
-        .unwrap()
-        .state_root();
-
-    (accounts, proof, root_hash)
-}
-
-fn restore_state_to_db(
-    db: &Arc<DiemDB>,
-    accounts: Vec<(HashValue, AccountStateBlob)>,
-    proof: SparseMerkleRangeProof,
-    root_hash: HashValue,
-    version: Version,
-) {
-    let rh = db.get_restore_handler();
-    let mut receiver = rh
-        .get_state_restore_receiver(version, root_hash, true /* account_count_migration */)
-        .unwrap();
-    for (chunk, proof) in vec![(accounts, proof)].into_iter() {
-        receiver.add_chunk(chunk, proof).unwrap();
-    }
-    receiver.finish().unwrap();
 }
 
 #[test]
-fn test_pre_genesis() {
-    let genesis = vm_genesis::test_genesis_change_set_and_validators(Some(1));
-    let genesis_key = &vm_genesis::GENESIS_KEYPAIR.0;
-    let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis.0));
-
-    // Create bootstrapped DB.
-    let tmp_dir = TempPath::new();
-    let (db, db_rw) = DbReaderWriter::wrap(DiemDB::new_for_test(&tmp_dir));
-    let signer = ValidatorSigner::new(genesis.1[0].data.address, genesis.1[0].key.clone());
-    let waypoint = bootstrap_genesis::<DiemVM>(&db_rw, &genesis_txn).unwrap();
-
-    // Mint for 2 demo accounts.
-    let (account1, account1_key, account2, account2_key) = get_demo_accounts();
-    let txn1 = get_account_transaction(genesis_key, 0, &account1, &account1_key);
-    let txn2 = get_account_transaction(genesis_key, 1, &account2, &account2_key);
-    let txn3 = get_mint_transaction(genesis_key, 0, &account1, 2000);
-    let txn4 = get_mint_transaction(genesis_key, 1, &account2, 2000);
-    execute_and_commit(vec![txn1, txn2, txn3, txn4], &db_rw, &signer);
-    assert_eq!(get_balance(&account1, &db_rw), 2000);
-    assert_eq!(get_balance(&account2, &db_rw), 2000);
-
-    // Get state tree backup.
-    let (accounts_backup, proof, root_hash) = get_state_backup(&db);
-    // Restore into PRE-GENESIS state of a new empty DB.
-    let tmp_dir = TempPath::new();
-    let (db, db_rw) = DbReaderWriter::wrap(DiemDB::new_for_test(&tmp_dir));
-    restore_state_to_db(&db, accounts_backup, proof, root_hash, PRE_GENESIS_VERSION);
-
-    // DB is not empty, `maybe_bootstrap()` will try to apply and fail the waypoint check.
-    assert!(maybe_bootstrap::<DiemVM>(&db_rw, &genesis_txn, waypoint).is_err());
-    // Nor is it able to boot BlockExecutor.
-    assert!(db_rw.reader.get_startup_info().unwrap().is_none());
-
-    // New genesis transaction: set validator set and overwrite account1 balance
-    let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(ChangeSet::new(
-        WriteSetMut::new(vec![
-            (
-                default_access_path_for_config(ValidatorSet::CONFIG_ID),
-                WriteOp::Value(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
-            ),
-            (
-                AccessPath::new(account1, BalanceResource::access_path_for(xus_tag())),
-                WriteOp::Value(bcs::to_bytes(&BalanceResource::new(1000)).unwrap()),
-            ),
-        ])
-        .freeze()
-        .unwrap(),
-        vec![ContractEvent::new(
-            on_chain_config::new_epoch_event_key(),
-            0,
-            xus_tag(),
-            vec![],
-        )],
-    )));
-
-    // Bootstrap DB on top of pre-genesis state.
-    let waypoint = generate_waypoint::<DiemVM>(&db_rw, &genesis_txn).unwrap();
-    assert!(maybe_bootstrap::<DiemVM>(&db_rw, &genesis_txn, waypoint).unwrap());
-
-    let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
-    let initial_accumulator = db_rw
-        .reader
-        .get_accumulator_summary(trusted_state.version())
-        .unwrap();
-    let state_proof = db_rw
-        .reader
-        .get_state_proof(trusted_state.version())
-        .unwrap();
-    let trusted_state_change = trusted_state
-        .verify_and_ratchet(&state_proof, Some(&initial_accumulator))
-        .unwrap();
-    assert!(trusted_state_change.is_epoch_change());
-
-    // Effect of bootstrapping reflected.
-    assert_eq!(get_balance(&account1, &db_rw), 1000);
-    // Pre-genesis state accessible.
-    assert_eq!(get_balance(&account2, &db_rw), 2000);
-}
-
-#[test]
+#[cfg_attr(feature = "consensus-only-perf-test", ignore)]
 fn test_new_genesis() {
-    let genesis = vm_genesis::test_genesis_change_set_and_validators(Some(1));
-    let genesis_key = &vm_genesis::GENESIS_KEYPAIR.0;
+    let genesis = diem_vm_genesis::test_genesis_change_set_and_validators(Some(1));
+    let genesis_key = &diem_vm_genesis::GENESIS_KEYPAIR.0;
     let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis.0));
     // Create bootstrapped DB.
     let tmp_dir = TempPath::new();
     let db = DbReaderWriter::new(DiemDB::new_for_test(&tmp_dir));
     let waypoint = bootstrap_genesis::<DiemVM>(&db, &genesis_txn).unwrap();
-    let signer = ValidatorSigner::new(genesis.1[0].data.address, genesis.1[0].key.clone());
+    let signer = ValidatorSigner::new(
+        genesis.1[0].data.owner_address,
+        genesis.1[0].consensus_key.clone(),
+    );
 
     // Mint for 2 demo accounts.
     let (account1, account1_key, account2, account2_key) = get_demo_accounts();
     let txn1 = get_account_transaction(genesis_key, 0, &account1, &account1_key);
     let txn2 = get_account_transaction(genesis_key, 1, &account2, &account2_key);
-    let txn3 = get_mint_transaction(genesis_key, 0, &account1, 2_000_000);
-    let txn4 = get_mint_transaction(genesis_key, 1, &account2, 2_000_000);
+    let txn3 = get_diem_coin_mint_transaction(genesis_key, 2, &account1, 200_000_000);
+    let txn4 = get_diem_coin_mint_transaction(genesis_key, 3, &account2, 200_000_000);
     execute_and_commit(vec![txn1, txn2, txn3, txn4], &db, &signer);
-    assert_eq!(get_balance(&account1, &db), 2_000_000);
-    assert_eq!(get_balance(&account2, &db), 2_000_000);
+    assert_eq!(get_balance(&account1, &db), 200_000_000);
+    assert_eq!(get_balance(&account2, &db), 200_000_000);
 
     let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
-    let initial_accumulator = db
-        .reader
-        .get_accumulator_summary(trusted_state.version())
-        .unwrap();
     let state_proof = db.reader.get_state_proof(trusted_state.version()).unwrap();
-    let trusted_state_change = trusted_state
-        .verify_and_ratchet(&state_proof, Some(&initial_accumulator))
-        .unwrap();
+    let trusted_state_change = trusted_state.verify_and_ratchet(&state_proof).unwrap();
     assert!(trusted_state_change.is_epoch_change());
 
     // New genesis transaction: set validator set, bump epoch and overwrite account1 balance.
@@ -377,57 +224,77 @@ fn test_new_genesis() {
     let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(ChangeSet::new(
         WriteSetMut::new(vec![
             (
-                default_access_path_for_config(ValidatorSet::CONFIG_ID),
-                WriteOp::Value(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
+                StateKey::access_path(
+                    access_path_for_config(ValidatorSet::CONFIG_ID).expect("access path in test"),
+                ),
+                WriteOp::Modification(bcs::to_bytes(&ValidatorSet::new(vec![])).unwrap()),
             ),
             (
-                AccessPath::new(config_address(), ConfigurationResource::resource_path()),
-                WriteOp::Value(bcs::to_bytes(&configuration.bump_epoch_for_test()).unwrap()),
+                StateKey::access_path(AccessPath::new(
+                    CORE_CODE_ADDRESS,
+                    ConfigurationResource::resource_path(),
+                )),
+                WriteOp::Modification(bcs::to_bytes(&configuration.bump_epoch_for_test()).unwrap()),
             ),
             (
-                AccessPath::new(account1, BalanceResource::access_path_for(xus_tag())),
-                WriteOp::Value(bcs::to_bytes(&BalanceResource::new(1_000_000)).unwrap()),
+                StateKey::access_path(AccessPath::new(
+                    account1,
+                    CoinStoreResource::resource_path(),
+                )),
+                WriteOp::Modification(
+                    bcs::to_bytes(&CoinStoreResource::new(
+                        100_000_000,
+                        false,
+                        EventHandle::random(0),
+                        EventHandle::random(0),
+                    ))
+                    .unwrap(),
+                ),
             ),
         ])
         .freeze()
         .unwrap(),
-        vec![ContractEvent::new(
-            *configuration.events().key(),
-            0,
-            xus_tag(),
-            vec![],
-        )],
+        vec![
+            ContractEvent::new(
+                *configuration.events().key(),
+                0,
+                TypeTag::Struct(Box::new(
+                    <ConfigurationResource as MoveStructType>::struct_tag(),
+                )),
+                vec![],
+            ),
+            ContractEvent::new(
+                new_block_event_key(),
+                0,
+                TypeTag::Struct(Box::new(NewBlockEvent::struct_tag())),
+                vec![],
+            ),
+        ],
     )));
 
     // Bootstrap DB into new genesis.
     let waypoint = generate_waypoint::<DiemVM>(&db, &genesis_txn).unwrap();
     assert!(maybe_bootstrap::<DiemVM>(&db, &genesis_txn, waypoint).unwrap());
-    assert_eq!(waypoint.version(), 5);
+    assert_eq!(waypoint.version(), 6);
 
     // Client bootable from waypoint.
     let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
-    let initial_accumulator = db
-        .reader
-        .get_accumulator_summary(trusted_state.version())
-        .unwrap();
     let state_proof = db.reader.get_state_proof(trusted_state.version()).unwrap();
-    let trusted_state_change = trusted_state
-        .verify_and_ratchet(&state_proof, Some(&initial_accumulator))
-        .unwrap();
+    let trusted_state_change = trusted_state.verify_and_ratchet(&state_proof).unwrap();
     assert!(trusted_state_change.is_epoch_change());
     let trusted_state = trusted_state_change.new_state().unwrap();
-    assert_eq!(trusted_state.version(), 5);
-    assert!(state_proof.consistency_proof().is_empty());
+    assert_eq!(trusted_state.version(), 6);
 
     // Effect of bootstrapping reflected.
-    assert_eq!(get_balance(&account1, &db), 1_000_000);
+    assert_eq!(get_balance(&account1, &db), 100_000_000);
     // State before new genesis accessible.
-    assert_eq!(get_balance(&account2, &db), 2_000_000);
+    assert_eq!(get_balance(&account2, &db), 200_000_000);
 
+    println!("FINAL TRANSFER");
     // Transfer some money.
-    let txn = get_transfer_transaction(account1, 0, &account1_key, account2, 500_000);
+    let txn = get_diem_coin_transfer_transaction(account1, 0, &account1_key, account2, 50_000_000);
     execute_and_commit(vec![txn], &db, &signer);
 
     // And verify.
-    assert_eq!(get_balance(&account2, &db), 2_500_000);
+    assert_eq!(get_balance(&account2, &db), 250_000_000);
 }

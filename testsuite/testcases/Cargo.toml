@@ -1,25 +1,41 @@
 [package]
-name = "testcases"
+name = "diem-testcases"
+description = "Diem compatibility tests"
 version = "0.0.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "compat tests"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = "1.0.52"
-bcs = "0.1.2"
-diem-sdk = { path = "../../sdk" }
-diem-operational-tool = {path = "../../config/management/operational", features = ["testing"] }
-diem-rest-client = { path = "../../crates/diem-rest-client"}
-forge = { path = "../forge" }
-rand = "0.8.3"
-tokio = { version = "1.8.1", features = ["full"] }
-diem-logger = { path = "../../crates/diem-logger" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
+anyhow = { workspace = true }
+diem = { workspace = true, features = ["fuzzing"] }
+diem-forge = { workspace = true }
+diem-genesis = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-keygen = { workspace = true }
+diem-logger = { workspace = true }
+diem-move-examples = { workspace = true }
+diem-release-builder = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-runtimes = { workspace = true }
+diem-sdk = { workspace = true }
+diem-temppath = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+csv = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [[test]]
 name = "forge-local-compatibility"

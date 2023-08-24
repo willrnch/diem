@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -16,6 +17,10 @@ use diem_config::{
 use diem_crypto::x25519;
 use diem_id_generator::{IdGenerator, U32IdGenerator};
 use diem_logger::prelude::*;
+// Re-exposed for diem-network-checker
+pub use diem_netcore::transport::tcp::{resolve_and_connect, TCPBufferCfg, TcpSocket};
+use diem_netcore::transport::{proxy_protocol, tcp, ConnectionOrigin, Transport};
+use diem_short_hex_str::AsShortHexStr;
 use diem_time_service::{timeout, TimeService, TimeServiceTrait};
 use diem_types::{
     chain_id::ChainId,
@@ -27,9 +32,7 @@ use futures::{
     io::{AsyncRead, AsyncWrite},
     stream::{Stream, StreamExt, TryStreamExt},
 };
-use netcore::transport::{proxy_protocol, tcp, ConnectionOrigin, Transport};
-use serde::Serialize;
-use short_hex_str::AsShortHexStr;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, convert::TryFrom, fmt, io, pin::Pin, sync::Arc, time::Duration};
 
 #[cfg(test)]
@@ -49,8 +52,10 @@ static CONNECTION_ID_GENERATOR: ConnectionIdGenerator = ConnectionIdGenerator::n
 pub const DIEM_TCP_TRANSPORT: tcp::TcpTransport = tcp::TcpTransport {
     // Use default options.
     ttl: None,
-    // Use TCP_NODELAY for diem tcp connections.
+    // Use TCP_NODELAY for Diem tcp connections.
     nodelay: Some(true),
+    // Use default TCP setting, overridden by Network config
+    tcp_buff_cfg: tcp::TCPBufferCfg::new(),
 };
 
 /// A trait alias for "socket-like" things.
@@ -59,8 +64,14 @@ pub trait TSocket: AsyncRead + AsyncWrite + Send + fmt::Debug + Unpin + 'static 
 impl<T> TSocket for T where T: AsyncRead + AsyncWrite + Send + fmt::Debug + Unpin + 'static {}
 
 /// Unique local identifier for a connection.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ConnectionId(u32);
+
+impl ConnectionId {
+    pub fn get_inner(&self) -> u32 {
+        self.0
+    }
+}
 
 impl From<u32> for ConnectionId {
     fn from(i: u32) -> ConnectionId {
@@ -86,7 +97,7 @@ impl ConnectionIdGenerator {
 }
 
 /// Metadata associated with an established and fully upgraded connection.
-#[derive(Clone, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionMetadata {
     pub remote_peer_id: PeerId,
     pub connection_id: ConnectionId,
@@ -155,8 +166,9 @@ impl fmt::Display for ConnectionMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[{},{},{},{},{:?},{:?}]",
+            "[{},{:?},{},{},{},{:?},{:?}]",
             self.remote_peer_id,
+            self.connection_id,
             self.addr,
             self.origin,
             self.messaging_protocol,
@@ -227,9 +239,9 @@ fn add_pp_addr(proxy_protocol_enabled: bool, error: io::Error, addr: &NetworkAdd
 
 /// Upgrade an inbound connection. This means we run a Noise IK handshake for
 /// authentication and then negotiate common supported protocols. If
-/// `ctxt.trusted_peers` is `Some(_)`, then we will only allow connections from
-/// peers with a pubkey in this set. Otherwise, we will allow inbound connections
-/// from any pubkey.
+/// `ctxt.noise.auth_mode` is `HandshakeAuthMode::Mutual( anti_replay_timestamps , trusted_peers )`,
+/// then we will only allow connections from peers with a pubkey in the `trusted_peers`
+/// set. Otherwise, we will allow inbound connections from any pubkey.
 async fn upgrade_inbound<T: TSocket>(
     ctxt: Arc<UpgradeContext>,
     fut_socket: impl Future<Output = io::Result<T>>,
@@ -319,7 +331,7 @@ async fn upgrade_inbound<T: TSocket>(
     })
 }
 
-/// Upgrade an inbound connection. This means we run a Noise IK handshake for
+/// Upgrade an outbound connection. This means we run a Noise IK handshake for
 /// authentication and then negotiate common supported protocols.
 pub async fn upgrade_outbound<T: TSocket>(
     ctxt: Arc<UpgradeContext>,
@@ -332,9 +344,14 @@ pub async fn upgrade_outbound<T: TSocket>(
     let socket = fut_socket.await?;
 
     // noise handshake
-    let mut socket = ctxt
+    let (mut socket, peer_role) = ctxt
         .noise
-        .upgrade_outbound(socket, remote_pubkey, AntiReplayTimestamps::now)
+        .upgrade_outbound(
+            socket,
+            remote_peer_id,
+            remote_pubkey,
+            AntiReplayTimestamps::now,
+        )
         .await
         .map_err(|err| {
             if err.should_security_log() {
@@ -384,7 +401,7 @@ pub async fn upgrade_outbound<T: TSocket>(
             origin,
             messaging_protocol,
             application_protocols,
-            PeerRole::Unknown,
+            peer_role,
         ),
     })
 }
@@ -400,7 +417,7 @@ pub async fn upgrade_outbound<T: TSocket>(
 /// protocol). Finally, we negotiate common supported application protocols with
 /// the `Handshake` protocol.
 // TODO(philiphayes): rework Transport trait, possibly include Upgrade trait.
-// ideas in this PR thread: https://github.com/diem/diem/pull/3478#issuecomment-617385633
+// ideas in this PR thread: https://github.com/aptos-labs/diem-core/pull/3478#issuecomment-617385633
 pub struct DiemNetTransport<TTransport> {
     base_transport: TTransport,
     ctxt: Arc<UpgradeContext>,
@@ -483,12 +500,12 @@ where
                 let base_addr = NetworkAddress::try_from(base_transport_protos.to_vec())
                     .expect("base_transport_protos is always non-empty");
                 Ok((base_addr, *pubkey, *version))
-            }
+            },
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "Unexpected dialing network address: '{}', expected: \
-                     '/../ln-noise-ik/<pubkey>/ln-handshake/<version>'",
+                     '/../noise-ik/<pubkey>/handshake/<version>'",
                     addr
                 ),
             )),
@@ -504,7 +521,7 @@ where
     ///
     /// We parse the dial address like:
     ///
-    /// `/<base_transport>` + `/ln-noise-ik/<pubkey>/ln-handshake/<version>`
+    /// `/<base_transport>` + `/noise-ik/<pubkey>/handshake/<version>`
     ///
     /// If the base transport is `MemoryTransport`, then `/<base_transport>` is:
     ///
@@ -624,12 +641,12 @@ where
     TTransport::Inbound: Send + 'static,
     TTransport::Listener: Send + 'static,
 {
-    type Output = Connection<NoiseStream<TTransport::Output>>;
     type Error = io::Error;
     type Inbound = Pin<Box<dyn Future<Output = io::Result<Self::Output>> + Send + 'static>>;
-    type Outbound = Pin<Box<dyn Future<Output = io::Result<Self::Output>> + Send + 'static>>;
     type Listener =
         Pin<Box<dyn Stream<Item = io::Result<(Self::Inbound, NetworkAddress)>> + Send + 'static>>;
+    type Outbound = Pin<Box<dyn Future<Output = io::Result<Self::Output>> + Send + 'static>>;
+    type Output = Connection<NoiseStream<TTransport::Output>>;
 
     fn dial(&self, peer_id: PeerId, addr: NetworkAddress) -> io::Result<Self::Outbound> {
         self.dial(peer_id, addr)

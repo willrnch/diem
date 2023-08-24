@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{FuzzTarget, FuzzTargetImpl};
@@ -9,101 +10,84 @@ use std::{collections::BTreeMap, env};
 // List fuzz target modules here.
 mod consensus;
 mod executor;
-mod json_rpc_service;
 mod mempool;
 mod move_vm;
 mod network;
 mod proof;
 mod safety_rules;
 mod secure_storage_vault;
-mod state_sync;
 mod storage;
 mod transaction;
 mod vm;
+
+// TODO(joshlind): add a fuzzer for state sync v2!
 
 static ALL_TARGETS: Lazy<BTreeMap<&'static str, Box<dyn FuzzTargetImpl>>> = Lazy::new(|| {
     // List fuzz targets here in this format:
     let targets: Vec<Box<dyn FuzzTargetImpl>> = vec![
         // Consensus
-        Box::new(consensus::ConsensusProposal::default()),
+        Box::<consensus::ConsensusProposal>::default(),
         // Executor
-        Box::new(executor::ExecuteAndCommitBlocks::default()),
-        Box::new(executor::ExecuteAndCommitChunk::default()),
-        // JSON RPC Service
-        Box::new(json_rpc_service::JsonRpcSubmitTransactionRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetAccountRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetAccountTransactionRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetAccountTransactionsRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetTransactionsRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetEventsRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetMetadataRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetCurrenciesRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetStateProofRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetAccountStateWithProofRequest::default()),
-        Box::new(json_rpc_service::JsonRpcGetNetworkStatusRequest::default()),
+        Box::<executor::ExecuteAndCommitBlocks>::default(),
         // Mempool
-        Box::new(mempool::MempoolIncomingTransactions::default()),
+        Box::<mempool::MempoolIncomingTransactions>::default(),
         // Move VM
-        Box::new(move_vm::ValueTarget::default()),
+        Box::<move_vm::ValueTarget>::default(),
         // Proof
-        Box::new(proof::TestAccumulatorProofFuzzer::default()),
-        Box::new(proof::SparseMerkleProofFuzzer::default()),
-        Box::new(proof::TestAccumulatorRangeProofFuzzer::default()),
-        Box::new(proof::TransactionInfoWithProofFuzzer::default()),
-        Box::new(proof::AccountStateProofFuzzer::default()),
-        Box::new(proof::EventProofFuzzer::default()),
-        Box::new(proof::TransactionInfoListWithProofFuzzer::default()),
+        Box::<proof::TestAccumulatorProofFuzzer>::default(),
+        Box::<proof::SparseMerkleProofFuzzer>::default(),
+        Box::<proof::TestAccumulatorRangeProofFuzzer>::default(),
+        Box::<proof::TransactionInfoWithProofFuzzer>::default(),
+        Box::<proof::TransactionInfoListWithProofFuzzer>::default(),
         // Network
-        Box::new(network::NetworkNoiseInitiator::default()),
-        Box::new(network::NetworkNoiseResponder::default()),
-        Box::new(network::NetworkNoiseStream::default()),
-        Box::new(network::NetworkHandshakeExchange::default()),
-        Box::new(network::NetworkHandshakeNegotiation::default()),
-        Box::new(network::PeerNetworkMessagesReceive::default()),
+        Box::<network::NetworkNoiseInitiator>::default(),
+        Box::<network::NetworkNoiseResponder>::default(),
+        Box::<network::NetworkNoiseStream>::default(),
+        Box::<network::NetworkHandshakeExchange>::default(),
+        Box::<network::NetworkHandshakeNegotiation>::default(),
+        Box::<network::PeerNetworkMessagesReceive>::default(),
         // Safety Rules Server (LSR)
-        Box::new(safety_rules::SafetyRulesConstructAndSignVote::default()),
-        Box::new(safety_rules::SafetyRulesInitialize::default()),
-        Box::new(safety_rules::SafetyRulesHandleMessage::default()),
-        Box::new(safety_rules::SafetyRulesSignProposal::default()),
-        Box::new(safety_rules::SafetyRulesSignTimeout::default()),
+        Box::<safety_rules::SafetyRulesConstructAndSignVote>::default(),
+        Box::<safety_rules::SafetyRulesInitialize>::default(),
+        Box::<safety_rules::SafetyRulesHandleMessage>::default(),
+        Box::<safety_rules::SafetyRulesSignProposal>::default(),
+        Box::<safety_rules::SafetyRulesSignTimeout>::default(),
         // Secure Storage Vault
-        Box::new(secure_storage_vault::VaultGenericResponse::default()),
-        Box::new(secure_storage_vault::VaultPolicyReadResponse::default()),
-        Box::new(secure_storage_vault::VaultPolicyListResponse::default()),
-        Box::new(secure_storage_vault::VaultSecretListResponse::default()),
-        Box::new(secure_storage_vault::VaultSecretReadResponse::default()),
-        Box::new(secure_storage_vault::VaultTokenCreateResponse::default()),
-        Box::new(secure_storage_vault::VaultTokenRenewResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitCreateResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitExportResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitListResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitReadResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitRestoreResponse::default()),
-        Box::new(secure_storage_vault::VaultTransitSignResponse::default()),
-        Box::new(secure_storage_vault::VaultUnsealedResponse::default()),
-        // State Sync
-        Box::new(state_sync::StateSyncMsg::default()),
+        Box::<secure_storage_vault::VaultGenericResponse>::default(),
+        Box::<secure_storage_vault::VaultPolicyReadResponse>::default(),
+        Box::<secure_storage_vault::VaultPolicyListResponse>::default(),
+        Box::<secure_storage_vault::VaultSecretListResponse>::default(),
+        Box::<secure_storage_vault::VaultSecretReadResponse>::default(),
+        Box::<secure_storage_vault::VaultTokenCreateResponse>::default(),
+        Box::<secure_storage_vault::VaultTokenRenewResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitCreateResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitExportResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitListResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitReadResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitRestoreResponse>::default(),
+        Box::<secure_storage_vault::VaultTransitSignResponse>::default(),
+        Box::<secure_storage_vault::VaultUnsealedResponse>::default(),
         // Storage
         // Box::new(storage::StorageSaveBlocks::default()),
-        Box::new(storage::StorageSchemaDecode::default()),
+        Box::<storage::StorageSchemaDecode>::default(),
         //Box::new(storage::JellyfishGetWithProof::default()),
-        Box::new(storage::JellyfishGetWithProofWithDistinctLastNibble::default()),
-        Box::new(storage::JellyfishGetRangeProof::default()),
-        Box::new(storage::JellyfishGetLeafCount::default()),
-        Box::new(storage::AccumulatorFrozenSubtreeHashes::default()),
-        Box::new(storage::AccumulatorProof::default()),
-        Box::new(storage::AccumulatorConsistencyProof::default()),
-        Box::new(storage::AccumulatorRangeProof::default()),
-        Box::new(storage::AccumulatorAppendMany::default()),
-        Box::new(storage::AccumulatorAppendEmpty::default()),
-        Box::new(storage::SparseMerkleCorrectness::default()),
+        Box::<storage::JellyfishGetWithProofWithDistinctLastNibble>::default(),
+        Box::<storage::JellyfishGetRangeProof>::default(),
+        Box::<storage::JellyfishGetLeafCount>::default(),
+        Box::<storage::AccumulatorFrozenSubtreeHashes>::default(),
+        Box::<storage::AccumulatorProof>::default(),
+        Box::<storage::AccumulatorConsistencyProof>::default(),
+        Box::<storage::AccumulatorRangeProof>::default(),
+        Box::<storage::AccumulatorAppendMany>::default(),
+        Box::<storage::AccumulatorAppendEmpty>::default(),
+        Box::<storage::SparseMerkleCorrectness>::default(),
         // Transaction
-        Box::new(transaction::LanguageTransactionExecution::default()),
-        Box::new(transaction::SignedTransactionTarget::default()),
-        Box::new(transaction::MutatedSignedTransaction::default()),
-        Box::new(transaction::TwoSignedTransactions::default()),
+        Box::<transaction::LanguageTransactionExecution>::default(),
+        Box::<transaction::SignedTransactionTarget>::default(),
+        Box::<transaction::MutatedSignedTransaction>::default(),
+        Box::<transaction::TwoSignedTransactions>::default(),
         // VM
-        Box::new(vm::CompiledModuleTarget::default()),
+        Box::<vm::CompiledModuleTarget>::default(),
     ];
     targets
         .into_iter()

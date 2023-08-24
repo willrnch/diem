@@ -1,11 +1,16 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_types::account_address::AccountAddress;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
-#[derive(Clone, Debug, PartialEq, Copy)]
+/// The address of an account
+///
+/// This is represented in a string as a 64 character hex string, sometimes
+/// shortened by stripping leading 0s, and adding a 0x.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Address(AccountAddress);
 
 impl Address {
@@ -16,6 +21,7 @@ impl Address {
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // TODO: This should not be hex literal, it should be the full hex
         write!(f, "{}", self.0.to_hex_literal())
     }
 }
@@ -77,14 +83,12 @@ impl<'de> Deserialize<'de> for Address {
 #[cfg(test)]
 mod tests {
     use crate::address::Address;
-
     use diem_types::account_address::AccountAddress;
-
     use serde_json::{json, Value};
 
     #[test]
     fn test_from_and_to_string() {
-        let valid_addresses = vec!["0x1", "0x001", "00000000000000000000000000000001"];
+        let valid_addresses = vec!["0x1", "0x001", "0x00000000000000000000000000000001"];
         for address in valid_addresses {
             assert_eq!(address.parse::<Address>().unwrap().to_string(), "0x1");
         }
@@ -112,10 +116,7 @@ mod tests {
         let address: Address = serde_json::from_value(json!("0x1")).unwrap();
 
         let account_address: AccountAddress = address.into();
-        assert_eq!(
-            account_address.to_string(),
-            "00000000000000000000000000000001"
-        );
+        assert_eq!(account_address, AccountAddress::ONE);
 
         let new_address: Address = account_address.into();
         assert_eq!(new_address, address);
@@ -126,10 +127,7 @@ mod tests {
         let address: Address = serde_json::from_value(json!("0x1")).unwrap();
 
         let account_address: AccountAddress = (&address).into();
-        assert_eq!(
-            account_address.to_string(),
-            "00000000000000000000000000000001"
-        );
+        assert_eq!(account_address, AccountAddress::ONE);
 
         let new_address: Address = account_address.into();
         assert_eq!(new_address, address);

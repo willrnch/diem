@@ -1,25 +1,26 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_fuzzer::FuzzTarget;
+use clap::Parser;
 use std::{fs, path::PathBuf};
-use structopt::StructOpt;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     name = "Diem-Fuzzer Investigator",
-    author = "The Diem Association",
+    author = "Diem",
     about = "Utility tool to investigate fuzzing artifacts"
 )]
 struct Args {
     /// Admission Control port to connect to.
-    #[structopt(short = "i", long)]
+    #[clap(short = 'i', long)]
     pub input_file: Option<String>,
 }
 
 fn main() {
     // args
-    let args = Args::from_args();
+    let args = Args::parse();
 
     // check if it exists
     let input_file = PathBuf::from(args.input_file.expect("input file must be set via -i"));
@@ -45,4 +46,10 @@ fn main() {
     // run the target fuzzer on the file
     let data = fs::read(input_file).expect("failed to read artifact");
     target.fuzz(&data);
+}
+
+#[test]
+fn verify_tool() {
+    use clap::CommandFactory;
+    Args::command().debug_assert()
 }

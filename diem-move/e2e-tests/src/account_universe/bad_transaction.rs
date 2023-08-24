@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -10,14 +11,12 @@ use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
 };
+use diem_gas::{FeePerGasUnit, Gas, InitialGasSchedule, TransactionGasParameters};
 use diem_proptest_helpers::Index;
 use diem_types::{
-    account_config::XUS_NAME,
     transaction::{Script, SignedTransaction, TransactionStatus},
     vm_status::StatusCode,
 };
-use move_core_types::gas_schedule::{AbstractMemorySize, GasAlgebra, GasCarrier, GasConstants};
-use move_vm_types::gas_schedule::calculate_intrinsic_gas;
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 use std::sync::Arc;
@@ -45,13 +44,7 @@ impl AUTransactionGen for SequenceNumberMismatchGen {
             self.seq
         };
 
-        let txn = empty_txn(
-            sender.account(),
-            seq,
-            gas_costs::TXN_RESERVED,
-            0,
-            XUS_NAME.to_string(),
-        );
+        let txn = empty_txn(sender.account(), seq, gas_costs::TXN_RESERVED, 0);
 
         (
             txn,
@@ -91,33 +84,33 @@ impl AUTransactionGen for InsufficientBalanceGen {
             sender.sequence_number,
             max_gas_unit,
             self.gas_unit_price,
-            XUS_NAME.to_string(),
         );
 
         // TODO: Move such config to AccountUniverse
-        let default_constants = GasConstants::default();
-        let raw_bytes_len = AbstractMemorySize::new(txn.raw_txn_bytes_len() as GasCarrier);
-        let min_cost = GasConstants::default()
-            .to_external_units(calculate_intrinsic_gas(
-                raw_bytes_len,
-                &GasConstants::default(),
-            ))
-            .get();
+        let txn_gas_params = TransactionGasParameters::initial();
+        let raw_bytes_len = txn.raw_txn_bytes_len() as u64;
+        let min_cost: Gas = txn_gas_params
+            .calculate_intrinsic_gas(raw_bytes_len.into())
+            .to_unit_round_up_with_params(&txn_gas_params);
 
         (
             txn,
             (
-                if max_gas_unit > default_constants.maximum_number_of_gas_units.get() {
+                if Gas::from(max_gas_unit) > txn_gas_params.maximum_number_of_gas_units {
                     TransactionStatus::Discard(
                         StatusCode::MAX_GAS_UNITS_EXCEEDS_MAX_GAS_UNITS_BOUND,
                     )
-                } else if max_gas_unit < min_cost {
+                } else if Gas::from(max_gas_unit) < min_cost {
                     TransactionStatus::Discard(
                         StatusCode::MAX_GAS_UNITS_BELOW_MIN_TRANSACTION_GAS_UNITS,
                     )
-                } else if self.gas_unit_price > default_constants.max_price_per_gas_unit.get() {
+                } else if FeePerGasUnit::from(self.gas_unit_price)
+                    > txn_gas_params.max_price_per_gas_unit
+                {
                     TransactionStatus::Discard(StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND)
-                } else if self.gas_unit_price < default_constants.min_price_per_gas_unit.get() {
+                } else if FeePerGasUnit::from(self.gas_unit_price)
+                    < txn_gas_params.min_price_per_gas_unit
+                {
                     TransactionStatus::Discard(StatusCode::GAS_UNIT_PRICE_BELOW_MIN_BOUND)
                 } else {
                     TransactionStatus::Discard(StatusCode::INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE)

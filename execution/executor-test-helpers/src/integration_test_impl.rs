@@ -1,41 +1,49 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    bootstrap_genesis, gen_block_id, gen_ledger_info_with_sigs, get_test_signed_transaction,
-};
+use crate::{bootstrap_genesis, gen_block_id, gen_ledger_info_with_sigs};
 use anyhow::{anyhow, ensure, Result};
-use diem_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use diem_transaction_builder::stdlib::{
-    encode_create_parent_vasp_account_script, encode_peer_to_peer_with_metadata_script,
+use diem_cached_packages::diem_stdlib;
+use diem_consensus_types::block::Block;
+use diem_db::DiemDB;
+use diem_executor::block_executor::BlockExecutor;
+use diem_executor_types::BlockExecutorTrait;
+use diem_sdk::{
+    transaction_builder::TransactionFactory,
+    types::{AccountKey, LocalAccount},
 };
+use diem_state_view::account_with_state_view::{AccountWithStateView, AsAccountWithStateView};
+use diem_storage_interface::{state_view::DbStateViewAtVersion, DbReaderWriter, Order};
 use diem_types::{
-    account_config::{
-        from_currency_code_string, testnet_dd_account_address, treasury_compliance_account_address,
-        xus_tag, XUS_NAME,
-    },
-    account_state::AccountState,
-    account_state_blob::AccountStateWithProof,
+    account_config::diem_test_root_address,
+    account_view::AccountView,
+    block_metadata::BlockMetadata,
+    chain_id::ChainId,
     event::EventKey,
+    test_helpers::transaction_test_helpers::{block, BLOCK_GAS_LIMIT},
     transaction::{
-        authenticator::AuthenticationKey, Transaction, TransactionListWithProof,
-        TransactionPayload, TransactionWithProof, WriteSetPayload,
+        Transaction, Transaction::UserTransaction, TransactionListWithProof, TransactionWithProof,
+        WriteSetPayload,
     },
     trusted_state::{TrustedState, TrustedStateChange},
     waypoint::Waypoint,
 };
 use diem_vm::DiemVM;
-use diemdb::DiemDB;
-use executor::block_executor::BlockExecutor;
-use executor_types::BlockExecutorTrait;
 use rand::SeedableRng;
-use std::{convert::TryFrom, sync::Arc};
-use storage_interface::{DbReaderWriter, Order};
+use std::sync::Arc;
 
 pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
-    let (genesis, validators) = vm_genesis::test_genesis_change_set_and_validators(Some(1));
+    const B: u64 = 1_000_000_000;
+
+    let (genesis, validators) = diem_vm_genesis::test_genesis_change_set_and_validators(Some(1));
     let genesis_txn = Transaction::GenesisTransaction(WriteSetPayload::Direct(genesis));
-    let genesis_key = &vm_genesis::GENESIS_KEYPAIR.0;
+
+    let mut core_resources_account: LocalAccount = LocalAccount::new(
+        diem_test_root_address(),
+        AccountKey::from_private_key(diem_vm_genesis::GENESIS_KEYPAIR.0.clone()),
+        0,
+    );
 
     let path = diem_temppath::TempPath::new();
     path.create_as_dir().unwrap();
@@ -43,291 +51,235 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
 
     let parent_block_id = executor.committed_block_id();
     let signer = diem_types::validator_signer::ValidatorSigner::new(
-        validators[0].data.address,
-        validators[0].key.clone(),
+        validators[0].data.owner_address,
+        validators[0].consensus_key.clone(),
     );
 
     // This generates accounts that do not overlap with genesis
     let seed = [3u8; 32];
     let mut rng = ::rand::rngs::StdRng::from_seed(seed);
 
-    let privkey1 = Ed25519PrivateKey::generate(&mut rng);
-    let pubkey1 = privkey1.public_key();
-    let account1_auth_key = AuthenticationKey::ed25519(&pubkey1);
-    let account1 = account1_auth_key.derived_address();
+    let mut account1 = LocalAccount::generate(&mut rng);
+    let mut account2 = LocalAccount::generate(&mut rng);
+    let account3 = LocalAccount::generate(&mut rng);
+    let account4 = LocalAccount::generate(&mut rng);
 
-    let privkey2 = Ed25519PrivateKey::generate(&mut rng);
-    let pubkey2 = privkey2.public_key();
-    let account2_auth_key = AuthenticationKey::ed25519(&pubkey2);
-    let account2 = account2_auth_key.derived_address();
+    let account1_address = account1.address();
+    let account2_address = account2.address();
+    let account3_address = account3.address();
 
-    let pubkey3 = Ed25519PrivateKey::generate(&mut rng).public_key();
-    let account3_auth_key = AuthenticationKey::ed25519(&pubkey3);
-    let account3 = account3_auth_key.derived_address();
+    let txn_factory = TransactionFactory::new(ChainId::test());
 
-    let pubkey4 = Ed25519PrivateKey::generate(&mut rng).public_key();
-    let account4_auth_key = AuthenticationKey::ed25519(&pubkey4); // non-existent account
-    let account4 = account4_auth_key.derived_address();
-    let genesis_account = testnet_dd_account_address();
-    let tc_account = treasury_compliance_account_address();
-
-    let tx1 = get_test_signed_transaction(
-        tc_account,
-        /* sequence_number = */ 0,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_create_parent_vasp_account_script(
-                xus_tag(),
-                0,
-                account1,
-                account1_auth_key.prefix().to_vec(),
-                vec![],
-                false, /* add all currencies */
-            ),
-        )),
-    );
-
-    let tx2 = get_test_signed_transaction(
-        tc_account,
-        /* sequence_number = */ 1,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_create_parent_vasp_account_script(
-                xus_tag(),
-                0,
-                account2,
-                account2_auth_key.prefix().to_vec(),
-                vec![],
-                false, /* add all currencies */
-            ),
-        )),
-    );
-
-    let tx3 = get_test_signed_transaction(
-        tc_account,
-        /* sequence_number = */ 2,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_create_parent_vasp_account_script(
-                xus_tag(),
-                0,
-                account3,
-                account3_auth_key.prefix().to_vec(),
-                vec![],
-                false, /* add all currencies */
-            ),
-        )),
-    );
-
-    // Create account1 with 2M coins.
-    let txn1 = get_test_signed_transaction(
-        genesis_account,
-        /* sequence_number = */ 0,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(
-                xus_tag(),
-                account1,
-                2_000_000,
-                vec![],
-                vec![],
-            ),
-        )),
-    );
-
-    // Create account2 with 1.2M coins.
-    let txn2 = get_test_signed_transaction(
-        genesis_account,
-        /* sequence_number = */ 1,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(
-                xus_tag(),
-                account2,
-                1_200_000,
-                vec![],
-                vec![],
-            ),
-        )),
-    );
-
-    // Create account3 with 1M coins.
-    let txn3 = get_test_signed_transaction(
-        genesis_account,
-        /* sequence_number = */ 2,
-        genesis_key.clone(),
-        genesis_key.public_key(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(
-                xus_tag(),
-                account3,
-                1_000_000,
-                vec![],
-                vec![],
-            ),
-        )),
-    );
-
-    // Transfer 20k coins from account1 to account2.
-    // balance: <1.98M, 1.22M, 1M
-    let txn4 = get_test_signed_transaction(
-        account1,
-        /* sequence_number = */ 0,
-        privkey1.clone(),
-        pubkey1.clone(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(xus_tag(), account2, 20_000, vec![], vec![]),
-        )),
-    );
-
-    // Transfer 10k coins from account2 to account3.
-    // balance: <1.98M, <1.21M, 1.01M
-    let txn5 = get_test_signed_transaction(
-        account2,
-        /* sequence_number = */ 0,
-        privkey2,
-        pubkey2,
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(xus_tag(), account3, 10_000, vec![], vec![]),
-        )),
-    );
-
-    // Transfer 70k coins from account1 to account3.
-    // balance: <1.91M, <1.21M, 1.08M
-    let txn6 = get_test_signed_transaction(
-        account1,
-        /* sequence_number = */ 1,
-        privkey1.clone(),
-        pubkey1.clone(),
-        Some(TransactionPayload::Script(
-            encode_peer_to_peer_with_metadata_script(xus_tag(), account3, 70_000, vec![], vec![]),
-        )),
-    );
-
-    let block1 = vec![tx1, tx2, tx3, txn1, txn2, txn3, txn4, txn5, txn6];
     let block1_id = gen_block_id(1);
+    let block1_meta = Transaction::BlockMetadata(BlockMetadata::new(
+        block1_id,
+        1,
+        0,
+        signer.author(),
+        vec![0],
+        vec![],
+        1,
+    ));
+    let tx1 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.create_user_account(account1.public_key()));
+    let tx2 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.create_user_account(account2.public_key()));
+    let tx3 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.create_user_account(account3.public_key()));
 
-    let mut block2 = vec![];
+    // Create account1 with 2T coins.
+    let txn1 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.mint(account1.address(), 2_000 * B));
+    // Create account2 with 1.2T coins.
+    let txn2 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.mint(account2.address(), 1_200 * B));
+    // Create account3 with 1T coins.
+    let txn3 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.mint(account3.address(), 1_000 * B));
+
+    // Transfer 20B coins from account1 to account2.
+    // balance: <1.98T, 1.22T, 1T
+    let txn4 =
+        account1.sign_with_transaction_builder(txn_factory.transfer(account2.address(), 20 * B));
+
+    // Transfer 10B coins from account2 to account3.
+    // balance: <1.98T, <1.21T, 1.01T
+    let txn5 =
+        account2.sign_with_transaction_builder(txn_factory.transfer(account3.address(), 10 * B));
+
+    // Transfer 70B coins from account1 to account3.
+    // balance: <1.91T, <1.21T, 1.08T
+    let txn6 =
+        account1.sign_with_transaction_builder(txn_factory.transfer(account3.address(), 70 * B));
+
+    let reconfig1 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.payload(diem_stdlib::version_set_version(100)));
+
+    let block1: Vec<_> = vec![
+        block1_meta,
+        UserTransaction(tx1),
+        UserTransaction(tx2),
+        UserTransaction(tx3),
+        UserTransaction(txn1),
+        UserTransaction(txn2),
+        UserTransaction(txn3),
+        UserTransaction(txn4),
+        UserTransaction(txn5),
+        UserTransaction(txn6),
+        UserTransaction(reconfig1),
+    ];
+
     let block2_id = gen_block_id(2);
+    let block2_meta = Transaction::BlockMetadata(BlockMetadata::new(
+        block2_id,
+        2,
+        0,
+        signer.author(),
+        vec![0],
+        vec![],
+        2,
+    ));
+    let reconfig2 = core_resources_account
+        .sign_with_transaction_builder(txn_factory.payload(diem_stdlib::version_set_version(200)));
+    let block2 = vec![block2_meta, UserTransaction(reconfig2)];
 
+    let block3_id = gen_block_id(3);
+    let block3_meta = Transaction::BlockMetadata(BlockMetadata::new(
+        block3_id,
+        2,
+        1,
+        signer.author(),
+        vec![0],
+        vec![],
+        3,
+    ));
+    let mut block3 = vec![block3_meta];
     // Create 14 txns transferring 10k from account1 to account3 each.
-    for i in 2..=15 {
-        block2.push(get_test_signed_transaction(
-            account1,
-            /* sequence_number = */ i,
-            privkey1.clone(),
-            pubkey1.clone(),
-            Some(TransactionPayload::Script(
-                encode_peer_to_peer_with_metadata_script(
-                    xus_tag(),
-                    account3,
-                    10_000,
-                    vec![],
-                    vec![],
-                ),
-            )),
-        ));
+    for _ in 2..=15 {
+        block3.push(UserTransaction(account1.sign_with_transaction_builder(
+            txn_factory.transfer(account3.address(), 10 * B),
+        )));
     }
+    let block3 = block(block3, BLOCK_GAS_LIMIT); // append state checkpoint txn
 
     let output1 = executor
-        .execute_block((block1_id, block1.clone()), parent_block_id)
+        .execute_block(
+            (block1_id, block1.clone()).into(),
+            parent_block_id,
+            BLOCK_GAS_LIMIT,
+        )
         .unwrap();
-    let ledger_info_with_sigs = gen_ledger_info_with_sigs(1, &output1, block1_id, vec![&signer]);
-    executor
-        .commit_blocks(vec![block1_id], ledger_info_with_sigs)
-        .unwrap();
+    let li1 = gen_ledger_info_with_sigs(1, &output1, block1_id, &[signer.clone()]);
+    let epoch2_genesis_id = Block::make_genesis_block_from_ledger_info(li1.ledger_info()).id();
+    executor.commit_blocks(vec![block1_id], li1).unwrap();
 
-    let initial_accumulator = db.reader.get_accumulator_summary(0).unwrap();
     let state_proof = db.reader.get_state_proof(0).unwrap();
     let trusted_state = TrustedState::from_epoch_waypoint(waypoint);
-    let trusted_state =
-        match trusted_state.verify_and_ratchet(&state_proof, Some(&initial_accumulator)) {
-            Ok(TrustedStateChange::Epoch { new_state, .. }) => new_state,
-            _ => panic!("unexpected state change"),
-        };
+    let trusted_state = match trusted_state.verify_and_ratchet(&state_proof) {
+        Ok(TrustedStateChange::Epoch { new_state, .. }) => new_state,
+        _ => panic!("unexpected state change"),
+    };
     let current_version = state_proof.latest_ledger_info().version();
-    assert_eq!(trusted_state.version(), 9);
+    assert_eq!(trusted_state.version(), 11);
 
     let t1 = db
         .reader
-        .get_account_transaction(genesis_account, 0, false, current_version)
+        .get_account_transaction(core_resources_account.address(), 3, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t1.as_ref(), &block1[3]).unwrap();
+    verify_committed_txn_status(t1.as_ref(), &block1[4]).unwrap();
 
     let t2 = db
         .reader
-        .get_account_transaction(genesis_account, 1, false, current_version)
+        .get_account_transaction(core_resources_account.address(), 4, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t2.as_ref(), &block1[4]).unwrap();
+    verify_committed_txn_status(t2.as_ref(), &block1[5]).unwrap();
 
     let t3 = db
         .reader
-        .get_account_transaction(genesis_account, 2, false, current_version)
+        .get_account_transaction(core_resources_account.address(), 5, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t3.as_ref(), &block1[5]).unwrap();
+    verify_committed_txn_status(t3.as_ref(), &block1[6]).unwrap();
+
+    let reconfig1 = db
+        .reader
+        .get_account_transaction(core_resources_account.address(), 6, false, current_version)
+        .unwrap();
+    verify_committed_txn_status(reconfig1.as_ref(), &block1[10]).unwrap();
 
     let tn = db
         .reader
-        .get_account_transaction(genesis_account, 3, false, current_version)
+        .get_account_transaction(core_resources_account.address(), 7, false, current_version)
         .unwrap();
     assert!(tn.is_none());
 
     let t4 = db
         .reader
-        .get_account_transaction(account1, 0, true, current_version)
+        .get_account_transaction(account1.address(), 0, true, current_version)
         .unwrap();
-    verify_committed_txn_status(t4.as_ref(), &block1[6]).unwrap();
+    verify_committed_txn_status(t4.as_ref(), &block1[7]).unwrap();
     // We requested the events to come back from this one, so verify that they did
     assert_eq!(t4.unwrap().events.unwrap().len(), 2);
 
     let t5 = db
         .reader
-        .get_account_transaction(account2, 0, false, current_version)
+        .get_account_transaction(account2.address(), 0, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t5.as_ref(), &block1[7]).unwrap();
+    verify_committed_txn_status(t5.as_ref(), &block1[8]).unwrap();
 
     let t6 = db
         .reader
-        .get_account_transaction(account1, 1, true, current_version)
+        .get_account_transaction(account1.address(), 1, true, current_version)
         .unwrap();
-    verify_committed_txn_status(t6.as_ref(), &block1[8]).unwrap();
+    verify_committed_txn_status(t6.as_ref(), &block1[9]).unwrap();
 
-    let account1_state_with_proof = db
-        .reader
-        .get_account_state_with_proof(account1, current_version, current_version)
-        .unwrap();
-    verify_account_balance(&account1_state_with_proof, |x| x == 1_910_000).unwrap();
+    // test the initial balance.
+    let db_state_view = db.reader.state_view_at_version(Some(7)).unwrap();
+    let account1_view = db_state_view.as_account_with_state_view(&account1_address);
+    verify_account_balance(get_account_balance(&account1_view), |x| x == 2_000 * B).unwrap();
 
-    let account2_state_with_proof = db
-        .reader
-        .get_account_state_with_proof(account2, current_version, current_version)
-        .unwrap();
-    verify_account_balance(&account2_state_with_proof, |x| x == 1_210_000).unwrap();
+    let account2_view = db_state_view.as_account_with_state_view(&account2_address);
+    verify_account_balance(get_account_balance(&account2_view), |x| x == 1_200 * B).unwrap();
 
-    let account3_state_with_proof = db
+    let account3_view = db_state_view.as_account_with_state_view(&account3_address);
+    verify_account_balance(get_account_balance(&account3_view), |x| x == 1_000 * B).unwrap();
+
+    // test the final balance.
+    let db_state_view = db
         .reader
-        .get_account_state_with_proof(account3, current_version, current_version)
+        .state_view_at_version(Some(current_version))
         .unwrap();
-    verify_account_balance(&account3_state_with_proof, |x| x == 1_080_000).unwrap();
+    let account1_view = db_state_view.as_account_with_state_view(&account1_address);
+    verify_account_balance(get_account_balance(&account1_view), |x| {
+        approx_eq(x, 1_910 * B)
+    })
+    .unwrap();
+
+    let account2_view = db_state_view.as_account_with_state_view(&account2_address);
+    verify_account_balance(get_account_balance(&account2_view), |x| {
+        approx_eq(x, 1_210 * B)
+    })
+    .unwrap();
+
+    let account3_view = db_state_view.as_account_with_state_view(&account3_address);
+    verify_account_balance(get_account_balance(&account3_view), |x| {
+        approx_eq(x, 1_080 * B)
+    })
+    .unwrap();
 
     let transaction_list_with_proof = db
         .reader
-        .get_transactions(3, 10, current_version, false)
+        .get_transactions(3, 12, current_version, false)
         .unwrap();
     verify_transactions(&transaction_list_with_proof, &block1[2..]).unwrap();
 
     let account1_sent_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account1, 3),
+            &account1.sent_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account1_sent_events.len(), 2);
@@ -335,10 +287,11 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
     let account2_sent_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account2, 3),
+            &account2.sent_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account2_sent_events.len(), 1);
@@ -346,10 +299,11 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
     let account3_sent_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account3, 3),
+            &account3.sent_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account3_sent_events.len(), 0);
@@ -357,116 +311,153 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
     let account1_received_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account1, 2),
+            &account1.received_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
+    // Account1 has one deposit event since DiemCoin was minted to it.
     assert_eq!(account1_received_events.len(), 1);
 
     let account2_received_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account2, 2),
+            &account2.received_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
+    // Account2 has two deposit events: from being minted to and from one transfer.
     assert_eq!(account2_received_events.len(), 2);
 
     let account3_received_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account3, 2),
+            &account3.received_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
+    // Account3 has three deposit events: from being minted to and from two transfers.
     assert_eq!(account3_received_events.len(), 3);
-
-    let account4_state = db
+    let account4_resource = db
         .reader
-        .get_account_state_with_proof(account4, current_version, current_version)
+        .state_view_at_version(Some(current_version))
+        .unwrap()
+        .as_account_with_state_view(&account4.address())
+        .get_account_resource()
         .unwrap();
-    assert!(account4_state.blob.is_none());
+    assert!(account4_resource.is_none());
 
     let account4_transaction = db
         .reader
-        .get_account_transaction(account4, 0, true, current_version)
+        .get_account_transaction(account4.address(), 0, true, current_version)
         .unwrap();
     assert!(account4_transaction.is_none());
 
     let account4_sent_events = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account4, 3),
+            &account4.sent_event_key(),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert!(account4_sent_events.is_empty());
 
-    // Execute the 2nd block.
+    // Execute block 2, 3, 4
     let output2 = executor
-        .execute_block((block2_id, block2.clone()), block1_id)
+        .execute_block(
+            (block2_id, block2).into(),
+            epoch2_genesis_id,
+            BLOCK_GAS_LIMIT,
+        )
         .unwrap();
-    let ledger_info_with_sigs = gen_ledger_info_with_sigs(1, &output2, block2_id, vec![&signer]);
-    executor
-        .commit_blocks(vec![block2_id], ledger_info_with_sigs)
-        .unwrap();
+    let li2 = gen_ledger_info_with_sigs(2, &output2, block2_id, &[signer.clone()]);
+    let epoch3_genesis_id = Block::make_genesis_block_from_ledger_info(li2.ledger_info()).id();
+    executor.commit_blocks(vec![block2_id], li2).unwrap();
 
     let state_proof = db.reader.get_state_proof(trusted_state.version()).unwrap();
-    let trusted_state_change = trusted_state
-        .verify_and_ratchet(&state_proof, None)
-        .unwrap();
-    assert!(matches!(
-        trusted_state_change,
-        TrustedStateChange::Version { .. }
-    ));
+    let trusted_state = match trusted_state.verify_and_ratchet(&state_proof) {
+        Ok(TrustedStateChange::Epoch { new_state, .. }) => new_state,
+        _ => panic!("unexpected state change"),
+    };
     let current_version = state_proof.latest_ledger_info().version();
-    assert_eq!(current_version, 23);
+    assert_eq!(current_version, 13);
 
+    let output3 = executor
+        .execute_block(
+            (block3_id, block3.clone()).into(),
+            epoch3_genesis_id,
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
+    let li3 = gen_ledger_info_with_sigs(3, &output3, block3_id, &[signer]);
+    executor.commit_blocks(vec![block3_id], li3).unwrap();
+
+    let state_proof = db.reader.get_state_proof(trusted_state.version()).unwrap();
+    let _trusted_state = match trusted_state.verify_and_ratchet(&state_proof) {
+        Ok(TrustedStateChange::Version { new_state, .. }) => new_state,
+        _ => panic!("unexpected state change"),
+    };
+    let current_version = state_proof.latest_ledger_info().version();
+    assert_eq!(current_version, 29);
+
+    // More verification
     let t7 = db
         .reader
-        .get_account_transaction(account1, 2, false, current_version)
+        .get_account_transaction(account1.address(), 2, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t7.as_ref(), &block2[0]).unwrap();
+    verify_committed_txn_status(t7.as_ref(), &block3[1]).unwrap();
 
     let t20 = db
         .reader
-        .get_account_transaction(account1, 15, false, current_version)
+        .get_account_transaction(account1.address(), 15, false, current_version)
         .unwrap();
-    verify_committed_txn_status(t20.as_ref(), &block2[13]).unwrap();
+    verify_committed_txn_status(t20.as_ref(), &block3[14]).unwrap();
 
-    let account1_state_with_proof = db
+    let db_state_view = db
         .reader
-        .get_account_state_with_proof(account1, current_version, current_version)
+        .state_view_at_version(Some(current_version))
         .unwrap();
-    verify_account_balance(&account1_state_with_proof, |x| x == 1_770_000).unwrap();
 
-    let account3_state_with_proof = db
-        .reader
-        .get_account_state_with_proof(account3, current_version, current_version)
-        .unwrap();
-    verify_account_balance(&account3_state_with_proof, |x| x == 1_220_000).unwrap();
+    let account1_view = db_state_view.as_account_with_state_view(&account1_address);
+    verify_account_balance(get_account_balance(&account1_view), |x| {
+        approx_eq(x, 1_770 * B)
+    })
+    .unwrap();
+
+    let account3_view = db_state_view.as_account_with_state_view(&account3_address);
+    verify_account_balance(get_account_balance(&account3_view), |x| {
+        approx_eq(x, 1_220 * B)
+    })
+    .unwrap();
+
+    // With block gas limit, StateCheckpoint txn is inserted to block after execution.
+    let diff = BLOCK_GAS_LIMIT.map(|_| 0).unwrap_or(1);
 
     let transaction_list_with_proof = db
         .reader
-        .get_transactions(10, 17, current_version, false)
+        .get_transactions(14, 15 + diff, current_version, false)
         .unwrap();
-    verify_transactions(&transaction_list_with_proof, &block2[..]).unwrap();
+    verify_transactions(&transaction_list_with_proof, &block3).unwrap();
 
     let account1_sent_events_batch1 = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account1, 3),
+            &EventKey::new(3, account1.address()),
             0,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account1_sent_events_batch1.len(), 10);
@@ -474,10 +465,11 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
     let account1_sent_events_batch2 = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account1, 3),
+            &EventKey::new(3, account1.address()),
             10,
             Order::Ascending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account1_sent_events_batch2.len(), 6);
@@ -485,34 +477,53 @@ pub fn test_execution_with_storage_impl() -> Arc<DiemDB> {
     let account3_received_events_batch1 = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account3, 2),
-            u64::max_value(),
+            &EventKey::new(2, account3.address()),
+            u64::MAX,
             Order::Descending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account3_received_events_batch1.len(), 10);
-    assert_eq!(account3_received_events_batch1[0].1.sequence_number(), 16);
+    // Account3 has one extra deposit event from being minted to.
+    assert_eq!(
+        account3_received_events_batch1[0].event.sequence_number(),
+        16
+    );
 
     let account3_received_events_batch2 = db
         .reader
         .get_events(
-            &EventKey::new_from_address(&account3, 2),
+            &EventKey::new(2, account3.address()),
             6,
             Order::Descending,
             10,
+            current_version,
         )
         .unwrap();
     assert_eq!(account3_received_events_batch2.len(), 7);
-    assert_eq!(account3_received_events_batch2[0].1.sequence_number(), 6);
+    assert_eq!(
+        account3_received_events_batch2[0].event.sequence_number(),
+        6
+    );
 
     diem_db
+}
+
+fn approx_eq(a: u64, b: u64) -> bool {
+    const M: u64 = 10_000_000;
+    a + M > b && b + M > a
 }
 
 pub fn create_db_and_executor<P: AsRef<std::path::Path>>(
     path: P,
     genesis: &Transaction,
-) -> (Arc<DiemDB>, DbReaderWriter, BlockExecutor<DiemVM>, Waypoint) {
+) -> (
+    Arc<DiemDB>,
+    DbReaderWriter,
+    BlockExecutor<DiemVM>,
+    Waypoint,
+) {
     let (db, dbrw) = DbReaderWriter::wrap(DiemDB::new_for_test(&path));
     let waypoint = bootstrap_genesis::<DiemVM>(&dbrw, genesis).unwrap();
     let executor = BlockExecutor::new(dbrw.clone());
@@ -520,22 +531,18 @@ pub fn create_db_and_executor<P: AsRef<std::path::Path>>(
     (db, dbrw, executor, waypoint)
 }
 
-pub fn verify_account_balance<F>(
-    account_state_with_proof: &AccountStateWithProof,
-    f: F,
-) -> Result<()>
+pub fn get_account_balance(account_state_view: &AccountWithStateView) -> u64 {
+    account_state_view
+        .get_coin_store_resource()
+        .unwrap()
+        .map(|b| b.coin())
+        .unwrap_or(0)
+}
+
+pub fn verify_account_balance<F>(balance: u64, f: F) -> Result<()>
 where
     F: Fn(u64) -> bool,
 {
-    let balance = if let Some(blob) = &account_state_with_proof.blob {
-        AccountState::try_from(blob)?
-            .get_balance_resources()?
-            .get(&from_currency_code_string(XUS_NAME).unwrap())
-            .map(|b| b.coin())
-            .unwrap_or(0)
-    } else {
-        0
-    };
     ensure!(
         f(balance),
         "balance {} doesn't satisfy the condition passed in",

@@ -1,10 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::metrics::DIEM_STORAGE_LEDGER;
+use crate::metrics::LEDGER_COUNTER;
+use diem_num_variants::NumVariants;
 use num_derive::ToPrimitive;
 use num_traits::ToPrimitive;
-use num_variants::NumVariants;
 #[cfg(test)]
 use proptest::{collection::hash_map, prelude::*};
 #[cfg(test)]
@@ -15,7 +16,7 @@ use std::collections::BTreeMap;
 /// Types of ledger counters.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ToPrimitive, NumVariants)]
 #[cfg_attr(test, derive(Arbitrary))]
-pub(crate) enum LedgerCounter {
+pub enum LedgerCounter {
     EventsCreated = 101,
 
     NewStateLeaves = 201,
@@ -89,7 +90,7 @@ impl InnerLedgerCounters {
 }
 
 /// Represents `LedgerCounter` bumps yielded by saving a batch of transactions.
-pub(crate) struct LedgerCounterBumps {
+pub struct LedgerCounterBumps {
     bumps: InnerLedgerCounters,
 }
 
@@ -145,7 +146,7 @@ impl LedgerCounters {
     /// Bump Prometheus counters.
     pub fn bump_op_counters(&self) {
         for counter in &LedgerCounter::VARIANTS {
-            DIEM_STORAGE_LEDGER
+            LEDGER_COUNTER
                 .with_label_values(&[counter.name()])
                 .set(self.get(*counter) as i64);
         }

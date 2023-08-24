@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,7 +8,7 @@ use crate::{
     quorum_cert::QuorumCert,
 };
 use anyhow::{bail, ensure, format_err};
-use diem_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
+use diem_crypto::{bls12381, hash::CryptoHash, HashValue};
 use diem_infallible::duration_since_epoch;
 use diem_types::{
     account_address::AccountAddress,
@@ -15,13 +16,17 @@ use diem_types::{
     block_metadata::BlockMetadata,
     epoch_state::EpochState,
     ledger_info::LedgerInfo,
-    transaction::{Transaction, Version},
+    transaction::{SignedTransaction, Transaction, Version},
     validator_signer::ValidatorSigner,
     validator_verifier::ValidatorVerifier,
 };
 use mirai_annotations::debug_checked_verify_eq;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt::{self, Display, Formatter};
+use std::{
+    convert::TryFrom,
+    fmt::{self, Display, Formatter},
+    iter::once,
+};
 
 #[path = "block_test_utils.rs"]
 #[cfg(any(test, feature = "fuzzing"))]
@@ -42,7 +47,7 @@ pub struct Block {
     block_data: BlockData,
     /// Signature that the hash of this block has been authored by the owner of the private key,
     /// this is only set within Proposal blocks
-    signature: Option<Ed25519Signature>,
+    signature: Option<bls12381::Signature>,
 }
 
 impl fmt::Debug for Block {
@@ -53,12 +58,15 @@ impl fmt::Debug for Block {
 
 impl Display for Block {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        let nil_marker = if self.is_nil_block() { " (NIL)" } else { "" };
+        let author = self
+            .author()
+            .map(|addr| format!("{}", addr))
+            .unwrap_or_else(|| "(NIL)".to_string());
         write!(
             f,
-            "[id: {}{}, epoch: {}, round: {:02}, parent_id: {}, timestamp: {}]",
+            "[id: {}, author: {}, epoch: {}, round: {:02}, parent_id: {}, timestamp: {}]",
             self.id,
-            nil_marker,
+            author,
             self.epoch(),
             self.round(),
             self.quorum_cert().certified_block().id(),
@@ -94,6 +102,16 @@ impl Block {
         self.block_data.payload()
     }
 
+    pub fn payload_size(&self) -> usize {
+        match self.block_data.payload() {
+            None => 0,
+            Some(payload) => match payload {
+                Payload::InQuorumStore(pos) => pos.proofs.len(),
+                Payload::DirectMempool(txns) => txns.len(),
+            },
+        }
+    }
+
     pub fn quorum_cert(&self) -> &QuorumCert {
         self.block_data.quorum_cert()
     }
@@ -102,7 +120,7 @@ impl Block {
         self.block_data.round()
     }
 
-    pub fn signature(&self) -> Option<&Ed25519Signature> {
+    pub fn signature(&self) -> Option<&bls12381::Signature> {
         self.signature.as_ref()
     }
 
@@ -160,7 +178,7 @@ impl Block {
     pub fn new_for_testing(
         id: HashValue,
         block_data: BlockData,
-        signature: Option<Ed25519Signature>,
+        signature: Option<bls12381::Signature>,
     ) -> Self {
         Block {
             id,
@@ -171,8 +189,12 @@ impl Block {
 
     /// The NIL blocks are special: they're not carrying any real payload and are generated
     /// independently by different validators just to fill in the round with some QC.
-    pub fn new_nil(round: Round, quorum_cert: QuorumCert) -> Self {
-        let block_data = BlockData::new_nil(round, quorum_cert);
+    pub fn new_nil(
+        round: Round,
+        quorum_cert: QuorumCert,
+        failed_authors: Vec<(Round, Author)>,
+    ) -> Self {
+        let block_data = BlockData::new_nil(round, quorum_cert, failed_authors);
 
         Block {
             id: block_data.hash(),
@@ -187,10 +209,12 @@ impl Block {
         timestamp_usecs: u64,
         quorum_cert: QuorumCert,
         validator_signer: &ValidatorSigner,
-    ) -> Self {
+        failed_authors: Vec<(Round, Author)>,
+    ) -> anyhow::Result<Self> {
         let block_data = BlockData::new_proposal(
             payload,
             validator_signer.author(),
+            failed_authors,
             round,
             timestamp_usecs,
             quorum_cert,
@@ -202,14 +226,16 @@ impl Block {
     pub fn new_proposal_from_block_data(
         block_data: BlockData,
         validator_signer: &ValidatorSigner,
-    ) -> Self {
-        let signature = validator_signer.sign(&block_data);
-        Self::new_proposal_from_block_data_and_signature(block_data, signature)
+    ) -> anyhow::Result<Self> {
+        let signature = validator_signer.sign(&block_data)?;
+        Ok(Self::new_proposal_from_block_data_and_signature(
+            block_data, signature,
+        ))
     }
 
     pub fn new_proposal_from_block_data_and_signature(
         block_data: BlockData,
-        signature: Ed25519Signature,
+        signature: bls12381::Signature,
     ) -> Self {
         Block {
             id: block_data.hash(),
@@ -223,7 +249,7 @@ impl Block {
     pub fn validate_signature(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
         match self.block_data.block_type() {
             BlockType::Genesis => bail!("We should not accept genesis from others"),
-            BlockType::NilBlock => self.quorum_cert().verify(validator),
+            BlockType::NilBlock { .. } => self.quorum_cert().verify(validator),
             BlockType::Proposal { author, .. } => {
                 let signature = self
                     .signature
@@ -231,7 +257,7 @@ impl Block {
                     .ok_or_else(|| format_err!("Missing signature in Proposal"))?;
                 validator.verify(*author, &self.block_data, signature)?;
                 self.quorum_cert().verify(validator)
-            }
+            },
         }
     }
 
@@ -257,6 +283,33 @@ impl Block {
                 "Reconfiguration suffix should not carry payload"
             );
         }
+        if let Some(failed_authors) = self.block_data().failed_authors() {
+            // when validating for being well formed,
+            // allow for missing failed authors,
+            // for whatever reason (from different max configuration, etc),
+            // but don't allow anything that shouldn't be there.
+            //
+            // we validate the full correctness of this field in round_manager.process_proposal()
+            let succ_round = self.round() + u64::from(self.is_nil_block());
+            let skipped_rounds = succ_round.checked_sub(parent.round() + 1);
+            ensure!(
+                skipped_rounds.is_some(),
+                "Block round is smaller than block's parent round"
+            );
+            ensure!(
+                failed_authors.len() <= skipped_rounds.unwrap() as usize,
+                "Block has more failed authors than missed rounds"
+            );
+            let mut bound = parent.round();
+            for (round, _) in failed_authors {
+                ensure!(
+                    bound < *round && *round < succ_round,
+                    "Incorrect round in failed authors"
+                );
+                bound = *round;
+            }
+        }
+
         if self.is_nil_block() || parent.has_reconfiguration() {
             ensure!(
                 self.timestamp_usecs() == parent.timestamp_usecs(),
@@ -289,15 +342,72 @@ impl Block {
         Ok(())
     }
 
-    pub fn transactions_to_execute(&self) -> Vec<Transaction> {
-        std::iter::once(Transaction::BlockMetadata(self.into()))
-            .chain(
-                self.payload()
-                    .unwrap_or(&Vec::new())
+    pub fn transactions_to_execute(
+        &self,
+        validators: &[AccountAddress],
+        txns: Vec<SignedTransaction>,
+        block_gas_limit: Option<u64>,
+    ) -> Vec<Transaction> {
+        if block_gas_limit.is_some() {
+            // After the per-block gas limit change, StateCheckpoint txn
+            // is inserted after block execution
+            once(Transaction::BlockMetadata(
+                self.new_block_metadata(validators),
+            ))
+            .chain(txns.into_iter().map(Transaction::UserTransaction))
+            .collect()
+        } else {
+            // Before the per-block gas limit change, StateCheckpoint txn
+            // is inserted here for compatibility.
+            once(Transaction::BlockMetadata(
+                self.new_block_metadata(validators),
+            ))
+            .chain(txns.into_iter().map(Transaction::UserTransaction))
+            .chain(once(Transaction::StateCheckpoint(self.id)))
+            .collect()
+        }
+    }
+
+    fn new_block_metadata(&self, validators: &[AccountAddress]) -> BlockMetadata {
+        BlockMetadata::new(
+            self.id(),
+            self.epoch(),
+            self.round(),
+            self.author().unwrap_or(AccountAddress::ZERO),
+            // A bitvec of voters
+            self.quorum_cert()
+                .ledger_info()
+                .get_voters_bitvec()
+                .clone()
+                .into(),
+            // For nil block, we use 0x0 which is convention for nil address in move.
+            self.block_data()
+                .failed_authors()
+                .map_or(vec![], |failed_authors| {
+                    Self::failed_authors_to_indices(validators, failed_authors)
+                }),
+            self.timestamp_usecs(),
+        )
+    }
+
+    fn failed_authors_to_indices(
+        validators: &[AccountAddress],
+        failed_authors: &[(Round, Author)],
+    ) -> Vec<u32> {
+        failed_authors
+            .iter()
+            .map(|(_round, failed_author)| {
+                validators
                     .iter()
-                    .cloned()
-                    .map(Transaction::UserTransaction),
-            )
+                    .position(|&v| v == *failed_author)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed author {} not in validator list {:?}",
+                            *failed_author, validators
+                        )
+                    })
+            })
+            .map(|index| u32::try_from(index).unwrap())
             .collect()
     }
 }
@@ -311,7 +421,7 @@ impl<'de> Deserialize<'de> for Block {
         #[serde(rename = "Block")]
         struct BlockWithoutId {
             block_data: BlockData,
-            signature: Option<Ed25519Signature>,
+            signature: Option<bls12381::Signature>,
         }
 
         let BlockWithoutId {
@@ -324,25 +434,5 @@ impl<'de> Deserialize<'de> for Block {
             block_data,
             signature,
         })
-    }
-}
-
-impl From<&Block> for BlockMetadata {
-    fn from(block: &Block) -> Self {
-        Self::new(
-            block.id(),
-            block.round(),
-            block.timestamp_usecs(),
-            // an ordered vector of voters' account address
-            block
-                .quorum_cert()
-                .ledger_info()
-                .signatures()
-                .keys()
-                .cloned()
-                .collect(),
-            // For nil block, we use 0x0 which is convention for nil address in move.
-            block.author().unwrap_or(AccountAddress::ZERO),
-        )
     }
 }

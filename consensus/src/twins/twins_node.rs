@@ -1,45 +1,55 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     counters,
     epoch_manager::EpochManager,
+    experimental::buffer_manager::OrderedBlocks,
     network::NetworkTask,
-    network_interface::{ConsensusNetworkEvents, ConsensusNetworkSender},
+    network_interface::{ConsensusNetworkClient, DIRECT_SEND, RPC},
     network_tests::{NetworkPlayground, TwinId},
-    test_utils::{MockStateComputer, MockStorage, MockTransactionManager},
+    payload_manager::PayloadManager,
+    quorum_store::quorum_store_db::MockQuorumStoreDB,
+    test_utils::{MockStateComputer, MockStorage},
     util::time_service::ClockTimeService,
 };
-use channel::{self, diem_channel, message_queues::QueueStyle};
-use consensus_types::common::{Author, Payload, Round};
+use diem_bounded_executor::BoundedExecutor;
+use diem_channels::{self, diem_channel, message_queues::QueueStyle};
 use diem_config::{
-    config::{
-        ConsensusProposerType::{self, RoundProposer},
-        NodeConfig, WaypointConfig,
-    },
+    config::{NodeConfig, WaypointConfig},
     generator::{self, ValidatorSwarm},
-    network_id::NetworkId,
+    network_id::{NetworkId, PeerNetworkId},
 };
+use diem_consensus_types::common::{Author, Round};
+use diem_event_notifications::{ReconfigNotification, ReconfigNotificationListener};
 use diem_mempool::mocks::MockSharedMempool;
-use diem_types::{
-    ledger_info::LedgerInfoWithSignatures,
-    on_chain_config::{OnChainConfig, OnChainConfigPayload, ValidatorSet},
-    validator_info::ValidatorInfo,
-    waypoint::Waypoint,
-};
-use event_notifications::{ReconfigNotification, ReconfigNotificationListener};
-use futures::channel::mpsc;
-use network::{
+use diem_network::{
+    application::interface::{NetworkClient, NetworkServiceEvents},
     peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
     protocols::{
-        network::{NewNetworkEvents, NewNetworkSender},
+        network,
+        network::{NetworkEvents, NewNetworkEvents, NewNetworkSender},
         wire::handshake::v1::ProtocolIdSet,
     },
     transport::ConnectionMetadata,
     ProtocolId,
 };
+use diem_types::{
+    ledger_info::LedgerInfoWithSignatures,
+    on_chain_config::{
+        ConsensusConfigV1, OnChainConfig, OnChainConfigPayload, OnChainConsensusConfig,
+        ProposerElectionType::{self, RoundProposer},
+        ValidatorSet,
+    },
+    transaction::SignedTransaction,
+    validator_info::ValidatorInfo,
+    waypoint::Waypoint,
+};
+use futures::{channel::mpsc, StreamExt};
+use maplit::hashmap;
 use std::{collections::HashMap, iter::FromIterator, sync::Arc};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 
 /// Auxiliary struct that is preparing SMR for the test
 pub struct SMRNode {
@@ -48,7 +58,7 @@ pub struct SMRNode {
     pub commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures>,
     _runtime: Runtime,
     _shared_mempool: MockSharedMempool,
-    _state_sync: mpsc::UnboundedReceiver<Payload>,
+    _state_sync: mpsc::UnboundedReceiver<Vec<SignedTransaction>>,
 }
 
 fn author_from_config(config: &NodeConfig) -> Author {
@@ -59,86 +69,114 @@ impl SMRNode {
     fn start(
         playground: &mut NetworkPlayground,
         config: NodeConfig,
+        consensus_config: OnChainConsensusConfig,
         storage: Arc<MockStorage>,
         twin_id: TwinId,
     ) -> Self {
+        // Create a runtime for the twin
+        let thread_name = format!("twin-{}", twin_id.id);
+        let runtime = diem_runtimes::spawn_named_runtime(thread_name, None);
+        let _entered_runtime = runtime.enter();
+
+        // Setup the network and SMR node
         let (network_reqs_tx, network_reqs_rx) = diem_channel::new(QueueStyle::FIFO, 8, None);
         let (connection_reqs_tx, _) = diem_channel::new(QueueStyle::FIFO, 8, None);
         let (consensus_tx, consensus_rx) = diem_channel::new(QueueStyle::FIFO, 8, None);
-        let (_conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
+        let (_conn_mgr_reqs_tx, conn_mgr_reqs_rx) = diem_channels::new_test(8);
         let (_, conn_notifs_channel) = conn_notifs_channel::new();
-        let mut network_sender = ConsensusNetworkSender::new(
+        let network_sender = network::NetworkSender::new(
             PeerManagerRequestSender::new(network_reqs_tx),
             ConnectionRequestSender::new(connection_reqs_tx),
         );
-        network_sender.initialize(playground.peer_protocols());
-        let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_notifs_channel);
+        let network_client = NetworkClient::new(
+            DIRECT_SEND.into(),
+            RPC.into(),
+            hashmap! {NetworkId::Validator => network_sender},
+            playground.peer_protocols(),
+        );
+        let consensus_network_client = ConsensusNetworkClient::new(network_client);
+        let network_events = NetworkEvents::new(consensus_rx, conn_notifs_channel, None);
+        let network_service_events =
+            NetworkServiceEvents::new(hashmap! {NetworkId::Validator => network_events});
 
         playground.add_node(twin_id, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
 
         let (state_sync_client, state_sync) = mpsc::unbounded();
-        let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
+        let (ordered_blocks_tx, mut ordered_blocks_events) = mpsc::unbounded::<OrderedBlocks>();
         let shared_mempool = MockSharedMempool::new();
-        let consensus_to_mempool_sender = shared_mempool.consensus_sender.clone();
+        let (quorum_store_to_mempool_sender, _) = mpsc::channel(1_024);
         let state_computer = Arc::new(MockStateComputer::new(
             state_sync_client,
-            commit_cb_sender,
+            ordered_blocks_tx,
             Arc::clone(&storage),
         ));
-        let txn_manager = Arc::new(MockTransactionManager::new(Some(
-            consensus_to_mempool_sender,
-        )));
         let (reconfig_sender, reconfig_events) = diem_channel::new(QueueStyle::LIFO, 1, None);
         let reconfig_listener = ReconfigNotificationListener {
             notification_receiver: reconfig_events,
         };
+        let _commit_notifier = Arc::from(PayloadManager::DirectMempool);
         let mut configs = HashMap::new();
         configs.insert(
             ValidatorSet::CONFIG_ID,
             bcs::to_bytes(storage.get_validator_set()).unwrap(),
         );
+        configs.insert(
+            OnChainConsensusConfig::CONFIG_ID,
+            // Requires double serialization, check deserialize_into_config for more details
+            bcs::to_bytes(&bcs::to_bytes(&consensus_config).unwrap()).unwrap(),
+        );
         let payload = OnChainConfigPayload::new(1, Arc::new(configs));
-        reconfig_sender
-            .push(
-                (),
-                ReconfigNotification {
-                    version: 1,
-                    on_chain_configs: payload,
-                },
-            )
-            .unwrap();
 
-        let runtime = Builder::new_multi_thread()
-            .thread_name(format!(
-                "{}-node-{}",
-                twin_id.id,
-                std::thread::current().name().unwrap_or("")
-            ))
-            .enable_all()
-            .build()
+        reconfig_sender
+            .push((), ReconfigNotification {
+                version: 1,
+                on_chain_configs: payload,
+            })
             .unwrap();
 
         let time_service = Arc::new(ClockTimeService::new(runtime.handle().clone()));
 
         let (timeout_sender, timeout_receiver) =
-            channel::new(1_024, &counters::PENDING_ROUND_TIMEOUTS);
-        let (self_sender, self_receiver) = channel::new(1_024, &counters::PENDING_SELF_MESSAGES);
+            diem_channels::new(1_024, &counters::PENDING_ROUND_TIMEOUTS);
+        let (self_sender, self_receiver) =
+            diem_channels::new(1_024, &counters::PENDING_SELF_MESSAGES);
+
+        let quorum_store_storage = Arc::new(MockQuorumStoreDB::new());
+        let bounded_executor = BoundedExecutor::new(2, playground.handle());
 
         let epoch_mgr = EpochManager::new(
             &config,
             time_service,
             self_sender,
-            network_sender,
+            consensus_network_client,
             timeout_sender,
-            txn_manager,
-            state_computer,
+            quorum_store_to_mempool_sender,
+            state_computer.clone(),
             storage.clone(),
+            quorum_store_storage,
             reconfig_listener,
+            bounded_executor,
         );
-        let (network_task, network_receiver) = NetworkTask::new(network_events, self_receiver);
+        let (network_task, network_receiver) =
+            NetworkTask::new(network_service_events, self_receiver);
 
         runtime.spawn(network_task.start());
         runtime.spawn(epoch_mgr.start(timeout_receiver, network_receiver));
+
+        let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
+        runtime.spawn(async move {
+            loop {
+                let ordered_blocks = ordered_blocks_events.next().await.unwrap();
+                let commit = ordered_blocks.ordered_proof.clone();
+                state_computer
+                    .commit_to_storage(ordered_blocks)
+                    .await
+                    .unwrap();
+
+                commit_cb_sender.unbounded_send(commit.clone()).unwrap();
+            }
+        });
+
         Self {
             id: twin_id,
             _runtime: runtime,
@@ -154,39 +192,45 @@ impl SMRNode {
         num_nodes: usize,
         num_twins: usize,
         playground: &mut NetworkPlayground,
-        proposer_type: ConsensusProposerType,
+        proposer_type: ProposerElectionType,
         round_proposers_idx: Option<HashMap<Round, usize>>,
     ) -> Vec<Self> {
         assert!(num_nodes >= num_twins);
         let ValidatorSwarm {
             nodes: mut node_configs,
         } = generator::validator_swarm_for_testing(num_nodes);
-        let peer_metadata_storage = playground.peer_protocols();
+        let peers_and_metadata = playground.peer_protocols();
         node_configs.iter().for_each(|config| {
-            let mut conn_meta = ConnectionMetadata::mock(author_from_config(config));
+            let peer_id = author_from_config(config);
+            let mut conn_meta = ConnectionMetadata::mock(peer_id);
             conn_meta.application_protocols = ProtocolIdSet::from_iter([
                 ProtocolId::ConsensusDirectSendJson,
                 ProtocolId::ConsensusDirectSendBcs,
                 ProtocolId::ConsensusRpcBcs,
             ]);
-            peer_metadata_storage.insert_connection(NetworkId::Validator, conn_meta);
+            let peer_network_id = PeerNetworkId::new(NetworkId::Validator, peer_id);
+            peers_and_metadata
+                .insert_connection_metadata(peer_network_id, conn_meta)
+                .unwrap();
         });
 
+        node_configs.sort_by_key(author_from_config);
         let validator_set = ValidatorSet::new(
             node_configs
                 .iter()
-                .map(|config| {
+                .enumerate()
+                .map(|(index, config)| {
                     let sr_test_config = config.consensus.safety_rules.test.as_ref().unwrap();
                     ValidatorInfo::new_with_test_network_keys(
                         sr_test_config.author,
                         sr_test_config.consensus_key.as_ref().unwrap().public_key(),
                         1,
+                        index as u64,
                     )
                 })
                 .collect(),
         );
         // sort by the peer id
-        node_configs.sort_by_key(|n1| author_from_config(n1));
 
         let proposer_type = match proposer_type {
             RoundProposer(_) => {
@@ -198,7 +242,7 @@ impl SMRNode {
                     })
                 }
                 RoundProposer(round_proposers)
-            }
+            },
             _ => proposer_type,
         };
 
@@ -225,8 +269,6 @@ impl SMRNode {
                 .unwrap()
                 .waypoint = Some(waypoint);
             config.base.waypoint = WaypointConfig::FromConfig(waypoint);
-            config.consensus.proposer_type = proposer_type.clone();
-            config.consensus.safety_rules.verify_vote_proposal_signature = false;
             // Disable timeout in twins test to avoid flakiness
             config.consensus.round_initial_timeout_ms = 2_000_000;
 
@@ -234,7 +276,18 @@ impl SMRNode {
 
             let twin_id = TwinId { id: smr_id, author };
 
-            smr_nodes.push(Self::start(playground, config, storage, twin_id));
+            let consensus_config = OnChainConsensusConfig::V1(ConsensusConfigV1 {
+                proposer_election_type: proposer_type.clone(),
+                ..ConsensusConfigV1::default()
+            });
+
+            smr_nodes.push(Self::start(
+                playground,
+                config,
+                consensus_config,
+                storage,
+                twin_id,
+            ));
         }
         smr_nodes
     }

@@ -1,20 +1,16 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    account_state_blob::AccountStateBlob,
-    proof::{
-        definition::{
-            AccountStateProof, EventProof, TransactionInfoListWithProof, TransactionInfoWithProof,
-        },
-        AccumulatorConsistencyProof, SparseMerkleRangeProof, TestAccumulatorProof,
-        TestAccumulatorRangeProof,
-    },
+use crate::proof::{
+    definition::{TransactionInfoListWithProof, TransactionInfoWithProof},
+    AccumulatorConsistencyProof, SparseMerkleRangeProof, TestAccumulatorProof,
+    TestAccumulatorRangeProof,
 };
 use bcs::test_helpers::assert_canonical_encode_decode;
 use proptest::prelude::*;
 
-type SparseMerkleProof = crate::proof::SparseMerkleProof<AccountStateBlob>;
+type SparseMerkleProof = crate::proof::SparseMerkleProof;
 
 proptest! {
 
@@ -57,18 +53,6 @@ proptest! {
 
     #[test]
     fn test_transaction_proof_bcs_roundtrip(proof in any::<TransactionInfoWithProof>()) {
-        assert_canonical_encode_decode(proof);
-    }
-
-
-    #[test]
-    fn test_account_state_proof_bcs_roundtrip(proof in any::<AccountStateProof>()) {
-        assert_canonical_encode_decode(proof);
-    }
-
-
-    #[test]
-    fn test_event_proof_bcs_roundtrip(proof in any::<EventProof>()) {
         assert_canonical_encode_decode(proof);
     }
 

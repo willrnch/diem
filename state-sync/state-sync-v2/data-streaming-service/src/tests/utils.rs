@@ -1,22 +1,40 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{data_notification::DataNotification, data_stream::DataStreamListener, error::Error};
-use async_trait::async_trait;
+use diem_config::config::DiemDataClientConfig;
 use diem_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, SigningKey, Uniform};
 use diem_data_client::{
-    AdvertisedData, DiemDataClient, GlobalDataSummary, OptimalChunkSizes, Response,
-    ResponseCallback, ResponseContext, ResponseError,
+    global_summary::{AdvertisedData, GlobalDataSummary, OptimalChunkSizes},
+    interface::{
+        DiemDataClientInterface, Response, ResponseCallback, ResponseContext, ResponseError,
+    },
 };
+use diem_infallible::Mutex;
 use diem_logger::Level;
+use diem_storage_service_types::{
+    requests::{
+        DataRequest, EpochEndingLedgerInfoRequest, NewTransactionOutputsWithProofRequest,
+        NewTransactionsOrOutputsWithProofRequest, NewTransactionsWithProofRequest,
+        StateValuesWithProofRequest, TransactionOutputsWithProofRequest,
+        TransactionsOrOutputsWithProofRequest, TransactionsWithProofRequest,
+    },
+    responses::{CompleteDataRange, TransactionOrOutputListWithProof},
+    Epoch,
+};
 use diem_types::{
     account_address::AccountAddress,
-    account_state_blob::AccountStatesChunkWithProof,
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     chain_id::ChainId,
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     proof::SparseMerkleRangeProof,
+    state_store::{
+        state_key::StateKey,
+        state_value::{StateValue, StateValueChunkWithProof},
+    },
     transaction::{
         RawTransaction, Script, SignedTransaction, Transaction, TransactionListWithProof,
         TransactionOutput, TransactionOutputListWithProof, TransactionPayload, TransactionStatus,
@@ -24,81 +42,185 @@ use diem_types::{
     },
     write_set::WriteSet,
 };
+use async_trait::async_trait;
 use futures::StreamExt;
 use rand::{rngs::OsRng, Rng};
-use std::{
-    collections::{BTreeMap, HashMap},
-    thread,
-    time::Duration,
-};
-use storage_service_types::{CompleteDataRange, Epoch};
+use std::{cmp::min, collections::HashMap, ops::DerefMut, sync::Arc, thread, time::Duration};
 use tokio::time::timeout;
 
-/// The number of accounts held at any version
-pub const TOTAL_NUM_ACCOUNTS: u64 = 2000;
+// TODO(joshlind): provide a better way to mock the data client.
+// Especially around verifying timeouts!
+
+/// The number of state values held at any version
+pub const TOTAL_NUM_STATE_VALUES: u64 = 2000;
 
 /// Test constants for advertised data
-pub const MAX_RESPONSE_ID: u64 = 100000;
-pub const MIN_ADVERTISED_ACCOUNTS: u64 = 9500;
-pub const MAX_ADVERTISED_ACCOUNTS: u64 = 10000;
 pub const MIN_ADVERTISED_EPOCH_END: u64 = 100;
 pub const MAX_ADVERTISED_EPOCH_END: u64 = 150;
+pub const MIN_ADVERTISED_STATES: u64 = 9500;
+pub const MAX_ADVERTISED_STATES: u64 = 10000;
 pub const MIN_ADVERTISED_TRANSACTION: u64 = 1000;
 pub const MAX_ADVERTISED_TRANSACTION: u64 = 10000;
 pub const MIN_ADVERTISED_TRANSACTION_OUTPUT: u64 = 1000;
 pub const MAX_ADVERTISED_TRANSACTION_OUTPUT: u64 = 10000;
+pub const MAX_REAL_EPOCH_END: u64 = MAX_ADVERTISED_EPOCH_END + 2;
+pub const MAX_REAL_TRANSACTION: u64 = MAX_ADVERTISED_TRANSACTION + 10;
+pub const MAX_REAL_TRANSACTION_OUTPUT: u64 = MAX_REAL_TRANSACTION;
+pub const MAX_RESPONSE_ID: u64 = 100000;
 
 /// Test timeout constant
-pub const MAX_NOTIFICATION_TIMEOUT_SECS: u64 = 10;
+pub const MAX_NOTIFICATION_TIMEOUT_SECS: u64 = 40;
 
 /// A simple mock of the Diem Data Client
 #[derive(Clone, Debug)]
 pub struct MockDiemDataClient {
-    pub epoch_ending_ledger_infos: HashMap<Epoch, LedgerInfoWithSignatures>,
-    pub synced_ledger_infos: Vec<LedgerInfoWithSignatures>,
+    pub diem_data_client_config: DiemDataClientConfig,
+    pub advertised_epoch_ending_ledger_infos: HashMap<Epoch, LedgerInfoWithSignatures>,
+    pub advertised_synced_ledger_infos: Vec<LedgerInfoWithSignatures>,
+    pub data_beyond_highest_advertised: bool, // If true, data exists beyond the highest advertised
+    pub data_request_counter: Arc<Mutex<HashMap<DataRequest, u64>>>, // Tracks the number of times the same data request was made
+    pub highest_epoch_ending_ledger_infos: HashMap<Epoch, LedgerInfoWithSignatures>,
+    pub limit_chunk_sizes: bool, // If true, responses will be truncated to emulate chunk and network limits
+    pub skip_emulate_network_latencies: bool, // If true, skips network latency emulation
+    pub skip_timeout_verification: bool, // If true, skips timeout verification for incoming requests
 }
 
 impl MockDiemDataClient {
-    pub fn new() -> Self {
-        let epoch_ending_ledger_infos = create_epoch_ending_ledger_infos();
-        let synced_ledger_infos = create_synced_ledger_infos(&epoch_ending_ledger_infos);
+    pub fn new(
+        diem_data_client_config: DiemDataClientConfig,
+        data_beyond_highest_advertised: bool,
+        limit_chunk_sizes: bool,
+        skip_emulate_network_latencies: bool,
+        skip_timeout_verification: bool,
+    ) -> Self {
+        // Create the advertised data
+        let advertised_epoch_ending_ledger_infos = create_epoch_ending_ledger_infos(
+            MIN_ADVERTISED_EPOCH_END,
+            MIN_ADVERTISED_TRANSACTION,
+            MAX_ADVERTISED_EPOCH_END,
+            MAX_ADVERTISED_TRANSACTION,
+        );
+        let advertised_synced_ledger_infos = create_synced_ledger_infos(
+            MIN_ADVERTISED_EPOCH_END,
+            MIN_ADVERTISED_TRANSACTION,
+            MAX_ADVERTISED_EPOCH_END,
+            MAX_ADVERTISED_TRANSACTION,
+            &advertised_epoch_ending_ledger_infos,
+        );
+
+        // Create the highest data
+        let highest_epoch_ending_ledger_infos = create_epoch_ending_ledger_infos(
+            MAX_ADVERTISED_EPOCH_END + 1,
+            MAX_ADVERTISED_TRANSACTION + 1,
+            MAX_REAL_EPOCH_END,
+            MAX_REAL_TRANSACTION,
+        );
+
+        // Create the data request counter
+        let data_request_counter = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
-            epoch_ending_ledger_infos,
-            synced_ledger_infos,
+            diem_data_client_config,
+            advertised_epoch_ending_ledger_infos,
+            advertised_synced_ledger_infos,
+            data_beyond_highest_advertised,
+            data_request_counter,
+            highest_epoch_ending_ledger_infos,
+            limit_chunk_sizes,
+            skip_emulate_network_latencies,
+            skip_timeout_verification,
         }
     }
 
     fn emulate_network_latencies(&self) {
-        // Sleep for 100 - 500 ms to emulate variance
-        thread::sleep(Duration::from_millis(create_range_random_u64(100, 500)));
+        if self.skip_emulate_network_latencies {
+            return;
+        }
+
+        // Sleep for 10 - 50 ms to emulate variance
+        thread::sleep(Duration::from_millis(create_range_random_u64(10, 50)));
+    }
+
+    fn emulate_subscription_expiration(&self) -> diem_data_client::error::Error {
+        thread::sleep(Duration::from_secs(MAX_NOTIFICATION_TIMEOUT_SECS));
+        diem_data_client::error::Error::TimeoutWaitingForResponse("RPC timed out!".into())
+    }
+
+    fn calculate_last_index(&self, start_index: u64, end_index: u64) -> u64 {
+        if self.limit_chunk_sizes {
+            let num_items_requested = (end_index - start_index) + 1;
+            let chunk_reduction_factor = create_range_random_u64(2, 9);
+            let num_reduced_items_requested = num_items_requested / chunk_reduction_factor;
+            if num_reduced_items_requested <= 1 {
+                start_index // Limit the chunk to a single item
+            } else {
+                start_index + num_reduced_items_requested - 1 // Limit the chunk by the reduction factor
+            }
+        } else {
+            end_index // No need to limit the chunk
+        }
+    }
+
+    fn verify_request_timeout(
+        &self,
+        request_timeout_ms: u64,
+        is_subscription_request: bool,
+        data_request: DataRequest,
+    ) {
+        if self.skip_timeout_verification {
+            return;
+        }
+
+        // Verify the given timeout for the request
+        let expected_timeout = if is_subscription_request {
+            self.diem_data_client_config.subscription_timeout_ms
+        } else {
+            let min_timeout = self.diem_data_client_config.response_timeout_ms;
+            let max_timeout = self.diem_data_client_config.max_response_timeout_ms;
+
+            // Check how many times the given request has been made
+            // and update the request counter.
+            let mut data_request_counter_lock = self.data_request_counter.lock();
+            let num_times_requested = *data_request_counter_lock.get(&data_request).unwrap_or(&0);
+            let _ = data_request_counter_lock
+                .deref_mut()
+                .insert(data_request, num_times_requested + 1);
+            drop(data_request_counter_lock);
+
+            // Calculate the expected timeout based on exponential backoff
+            min(
+                max_timeout,
+                min_timeout * (u32::pow(2, num_times_requested as u32) as u64),
+            )
+        };
+
+        // Verify the request timeouts match
+        assert_eq!(request_timeout_ms, expected_timeout);
     }
 }
 
 #[async_trait]
-impl DiemDataClient for MockDiemDataClient {
+impl DiemDataClientInterface for MockDiemDataClient {
     fn get_global_data_summary(&self) -> GlobalDataSummary {
         // Create a random set of optimal chunk sizes to emulate changing environments
         let optimal_chunk_sizes = OptimalChunkSizes {
-            account_states_chunk_size: create_non_zero_random_u64(100),
+            state_chunk_size: create_range_random_u64(10, 200),
             epoch_chunk_size: create_non_zero_random_u64(10),
-            transaction_chunk_size: create_non_zero_random_u64(2000),
-            transaction_output_chunk_size: create_non_zero_random_u64(100),
+            transaction_chunk_size: create_range_random_u64(20, 1000),
+            transaction_output_chunk_size: create_range_random_u64(20, 1000),
         };
 
         // Create a global data summary with a fixed set of data
         let advertised_data = AdvertisedData {
-            account_states: vec![CompleteDataRange::new(
-                MIN_ADVERTISED_ACCOUNTS,
-                MAX_ADVERTISED_ACCOUNTS,
-            )
-            .unwrap()],
+            states: vec![
+                CompleteDataRange::new(MIN_ADVERTISED_STATES, MAX_ADVERTISED_STATES).unwrap(),
+            ],
             epoch_ending_ledger_infos: vec![CompleteDataRange::new(
                 MIN_ADVERTISED_EPOCH_END,
                 MAX_ADVERTISED_EPOCH_END,
             )
             .unwrap()],
-            synced_ledger_infos: self.synced_ledger_infos.clone(),
+            synced_ledger_infos: self.advertised_synced_ledger_infos.clone(),
             transactions: vec![CompleteDataRange::new(
                 MIN_ADVERTISED_TRANSACTION,
                 MAX_ADVERTISED_TRANSACTION,
@@ -116,90 +238,379 @@ impl DiemDataClient for MockDiemDataClient {
         }
     }
 
-    async fn get_account_states_with_proof(
+    async fn get_state_values_with_proof(
         &self,
-        _version: Version,
+        version: Version,
         start_index: u64,
         end_index: u64,
-    ) -> Result<Response<AccountStatesChunkWithProof>, diem_data_client::Error> {
+        request_timeout_ms: u64,
+    ) -> Result<Response<StateValueChunkWithProof>, diem_data_client::error::Error> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetStateValuesWithProof(StateValuesWithProofRequest {
+                version,
+                start_index,
+                end_index,
+            }),
+        );
         self.emulate_network_latencies();
 
-        // Create epoch ending ledger infos according to the requested epochs
-        let mut account_blobs = vec![];
+        // Calculate the last index based on if we should limit the chunk size
+        let end_index = self.calculate_last_index(start_index, end_index);
+
+        // Create state keys and values according to the given indices
+        let mut state_keys_and_values = vec![];
         for _ in start_index..=end_index {
-            account_blobs.push((HashValue::random(), vec![].into()));
+            state_keys_and_values.push((
+                StateKey::raw(HashValue::random().to_vec()),
+                StateValue::from(vec![]),
+            ));
         }
 
-        // Create an account states chunk with proof
-        let account_states = AccountStatesChunkWithProof {
+        // Create a state value chunk with proof
+        let state_value_chunk_with_proof = StateValueChunkWithProof {
             first_index: start_index,
             last_index: end_index,
             first_key: HashValue::random(),
             last_key: HashValue::random(),
-            account_blobs,
+            raw_values: state_keys_and_values,
             proof: SparseMerkleRangeProof::new(vec![]),
+            root_hash: HashValue::zero(),
         };
-        Ok(create_data_client_response(account_states))
+        Ok(create_data_client_response(state_value_chunk_with_proof))
     }
 
     async fn get_epoch_ending_ledger_infos(
         &self,
         start_epoch: Epoch,
         end_epoch: Epoch,
-    ) -> Result<Response<Vec<LedgerInfoWithSignatures>>, diem_data_client::Error> {
+        request_timeout_ms: u64,
+    ) -> Result<Response<Vec<LedgerInfoWithSignatures>>, diem_data_client::error::Error> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetEpochEndingLedgerInfos(EpochEndingLedgerInfoRequest {
+                start_epoch,
+                expected_end_epoch: end_epoch,
+            }),
+        );
         self.emulate_network_latencies();
+
+        // Calculate the last epoch based on if we should limit the chunk size
+        let end_epoch = self.calculate_last_index(start_epoch, end_epoch);
 
         // Fetch the epoch ending ledger infos according to the requested epochs
         let mut epoch_ending_ledger_infos = vec![];
         for epoch in start_epoch..=end_epoch {
-            let ledger_info = self.epoch_ending_ledger_infos.get(&epoch).unwrap();
+            let ledger_info = if epoch <= MAX_ADVERTISED_EPOCH_END {
+                self.advertised_epoch_ending_ledger_infos
+                    .get(&epoch)
+                    .unwrap()
+            } else {
+                self.highest_epoch_ending_ledger_infos.get(&epoch).unwrap()
+            };
             epoch_ending_ledger_infos.push(ledger_info.clone());
         }
         Ok(create_data_client_response(epoch_ending_ledger_infos))
     }
 
-    async fn get_number_of_account_states(
+    async fn get_new_transaction_outputs_with_proof(
         &self,
-        _version: Version,
-    ) -> Result<Response<u64>, diem_data_client::Error> {
-        Ok(create_data_client_response(TOTAL_NUM_ACCOUNTS))
+        known_version: Version,
+        known_epoch: Epoch,
+        request_timeout_ms: u64,
+    ) -> Result<
+        Response<(TransactionOutputListWithProof, LedgerInfoWithSignatures)>,
+        diem_data_client::error::Error,
+    > {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            true,
+            DataRequest::GetNewTransactionOutputsWithProof(NewTransactionOutputsWithProofRequest {
+                known_version,
+                known_epoch,
+            }),
+        );
+        self.emulate_network_latencies();
+
+        // Attempt to fetch the new data
+        if self.data_beyond_highest_advertised && known_version < MAX_REAL_TRANSACTION_OUTPUT {
+            // Create a mock data client without timeout verification (to handle the internal requests)
+            let mut diem_data_client = self.clone();
+            diem_data_client.skip_timeout_verification = true;
+
+            let target_ledger_info = if known_epoch <= MAX_REAL_EPOCH_END {
+                // Fetch the epoch ending ledger info
+                diem_data_client
+                    .get_epoch_ending_ledger_infos(known_epoch, known_epoch, request_timeout_ms)
+                    .await
+                    .unwrap()
+                    .payload[0]
+                    .clone()
+            } else {
+                // Return a synced ledger info at the last version and highest epoch
+                create_ledger_info(MAX_REAL_TRANSACTION_OUTPUT, MAX_REAL_EPOCH_END + 1, false)
+            };
+
+            // Fetch the new transaction outputs
+            let outputs_with_proof = diem_data_client
+                .get_transaction_outputs_with_proof(
+                    known_version + 1,
+                    known_version + 1,
+                    known_version + 1,
+                    self.diem_data_client_config.response_timeout_ms,
+                )
+                .await
+                .unwrap()
+                .payload;
+
+            // Return the new data
+            Ok(create_data_client_response((
+                outputs_with_proof,
+                target_ledger_info,
+            )))
+        } else {
+            Err(self.emulate_subscription_expiration())
+        }
+    }
+
+    async fn get_new_transactions_with_proof(
+        &self,
+        known_version: Version,
+        known_epoch: Epoch,
+        include_events: bool,
+        request_timeout_ms: u64,
+    ) -> Result<
+        Response<(TransactionListWithProof, LedgerInfoWithSignatures)>,
+        diem_data_client::error::Error,
+    > {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            true,
+            DataRequest::GetNewTransactionsWithProof(NewTransactionsWithProofRequest {
+                known_version,
+                known_epoch,
+                include_events,
+            }),
+        );
+        self.emulate_network_latencies();
+
+        // Attempt to fetch the new data
+        if self.data_beyond_highest_advertised && known_version < MAX_REAL_TRANSACTION {
+            // Create a mock data client without timeout verification (to handle the internal requests)
+            let mut diem_data_client = self.clone();
+            diem_data_client.skip_timeout_verification = true;
+
+            let target_ledger_info = if known_epoch <= MAX_REAL_EPOCH_END {
+                // Fetch the epoch ending ledger info
+                diem_data_client
+                    .get_epoch_ending_ledger_infos(known_epoch, known_epoch, request_timeout_ms)
+                    .await
+                    .unwrap()
+                    .payload[0]
+                    .clone()
+            } else {
+                // Return a synced ledger info at the last version and highest epoch
+                create_ledger_info(MAX_REAL_TRANSACTION, MAX_REAL_EPOCH_END + 1, false)
+            };
+
+            // Fetch the new transactions
+            let transactions_with_proof = diem_data_client
+                .get_transactions_with_proof(
+                    known_version + 1,
+                    known_version + 1,
+                    known_version + 1,
+                    include_events,
+                    self.diem_data_client_config.response_timeout_ms,
+                )
+                .await
+                .unwrap()
+                .payload;
+
+            // Return the new data
+            Ok(create_data_client_response((
+                transactions_with_proof,
+                target_ledger_info,
+            )))
+        } else {
+            Err(self.emulate_subscription_expiration())
+        }
+    }
+
+    async fn get_new_transactions_or_outputs_with_proof(
+        &self,
+        known_version: Version,
+        known_epoch: Epoch,
+        include_events: bool,
+        request_timeout_ms: u64,
+    ) -> diem_data_client::error::Result<
+        Response<(TransactionOrOutputListWithProof, LedgerInfoWithSignatures)>,
+    > {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            true,
+            DataRequest::GetNewTransactionsOrOutputsWithProof(
+                NewTransactionsOrOutputsWithProofRequest {
+                    known_version,
+                    known_epoch,
+                    include_events,
+                    max_num_output_reductions: 3,
+                },
+            ),
+        );
+        self.emulate_network_latencies();
+
+        // Create a mock data client without timeout verification (to handle the internal requests)
+        let mut diem_data_client = self.clone();
+        diem_data_client.skip_timeout_verification = true;
+
+        // Get the new transactions or outputs response
+        let response = if return_transactions_instead_of_outputs() {
+            let (transactions, ledger_info) = diem_data_client
+                .get_new_transactions_with_proof(
+                    known_version,
+                    known_epoch,
+                    include_events,
+                    request_timeout_ms,
+                )
+                .await?
+                .payload;
+            ((Some(transactions), None), ledger_info)
+        } else {
+            let (outputs, ledger_info) = diem_data_client
+                .get_new_transaction_outputs_with_proof(
+                    known_version,
+                    known_epoch,
+                    request_timeout_ms,
+                )
+                .await?
+                .payload;
+            ((None, Some(outputs)), ledger_info)
+        };
+        Ok(create_data_client_response(response))
+    }
+
+    async fn get_number_of_states(
+        &self,
+        version: Version,
+        request_timeout_ms: u64,
+    ) -> Result<Response<u64>, diem_data_client::error::Error> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetNumberOfStatesAtVersion(version),
+        );
+        self.emulate_network_latencies();
+
+        Ok(create_data_client_response(TOTAL_NUM_STATE_VALUES))
     }
 
     async fn get_transaction_outputs_with_proof(
         &self,
-        _proof_version: Version,
+        proof_version: Version,
         start_version: Version,
         end_version: Version,
-    ) -> Result<Response<TransactionOutputListWithProof>, diem_data_client::Error> {
+        request_timeout_ms: u64,
+    ) -> Result<Response<TransactionOutputListWithProof>, diem_data_client::error::Error> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetTransactionOutputsWithProof(TransactionOutputsWithProofRequest {
+                proof_version,
+                start_version,
+                end_version,
+            }),
+        );
         self.emulate_network_latencies();
 
-        // Create the requested transactions and transaction outputs
-        let mut transactions_and_outputs = vec![];
-        for _ in start_version..=end_version {
-            transactions_and_outputs.push((create_transaction(), create_transaction_output()));
-        }
+        // Calculate the last version based on if we should limit the chunk size
+        let end_version = self.calculate_last_index(start_version, end_version);
 
-        // Create a transaction output list with an empty proof
-        let mut output_list_with_proof = TransactionOutputListWithProof::new_empty();
-        output_list_with_proof.first_transaction_output_version = Some(start_version);
-        output_list_with_proof.transactions_and_outputs = transactions_and_outputs;
+        let output_list_with_proof = create_output_list_with_proof(start_version, end_version);
+
         Ok(create_data_client_response(output_list_with_proof))
     }
 
     async fn get_transactions_with_proof(
         &self,
-        _proof_version: Version,
+        proof_version: Version,
         start_version: Version,
         end_version: Version,
         include_events: bool,
-    ) -> Result<Response<TransactionListWithProof>, diem_data_client::Error> {
+        request_timeout_ms: u64,
+    ) -> Result<Response<TransactionListWithProof>, diem_data_client::error::Error> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetTransactionsWithProof(TransactionsWithProofRequest {
+                proof_version,
+                start_version,
+                end_version,
+                include_events,
+            }),
+        );
         self.emulate_network_latencies();
+
+        // Calculate the last version based on if we should limit the chunk size
+        let end_version = self.calculate_last_index(start_version, end_version);
 
         let transaction_list_with_proof =
             create_transaction_list_with_proof(start_version, end_version, include_events);
 
         // Return the transaction list with proofs
         Ok(create_data_client_response(transaction_list_with_proof))
+    }
+
+    async fn get_transactions_or_outputs_with_proof(
+        &self,
+        proof_version: Version,
+        start_version: Version,
+        end_version: Version,
+        include_events: bool,
+        request_timeout_ms: u64,
+    ) -> diem_data_client::error::Result<Response<TransactionOrOutputListWithProof>> {
+        self.verify_request_timeout(
+            request_timeout_ms,
+            false,
+            DataRequest::GetTransactionsOrOutputsWithProof(TransactionsOrOutputsWithProofRequest {
+                proof_version,
+                start_version,
+                end_version,
+                include_events,
+                max_num_output_reductions: 3,
+            }),
+        );
+        self.emulate_network_latencies();
+
+        // Create a mock data client without timeout verification (to handle the internal requests)
+        let mut diem_data_client = self.clone();
+        diem_data_client.skip_timeout_verification = true;
+
+        // Get the transactions or outputs response
+        let transactions_or_outputs = if return_transactions_instead_of_outputs() {
+            let transactions_with_proof = diem_data_client
+                .get_transactions_with_proof(
+                    proof_version,
+                    start_version,
+                    end_version,
+                    include_events,
+                    request_timeout_ms,
+                )
+                .await?;
+            (Some(transactions_with_proof.payload), None)
+        } else {
+            let outputs_with_proof = diem_data_client
+                .get_transaction_outputs_with_proof(
+                    proof_version,
+                    start_version,
+                    end_version,
+                    request_timeout_ms,
+                )
+                .await?;
+            (None, Some(outputs_with_proof.payload))
+        };
+        Ok(create_data_client_response(transactions_or_outputs))
     }
 }
 
@@ -249,20 +660,24 @@ pub fn create_ledger_info(
     );
     LedgerInfoWithSignatures::new(
         LedgerInfo::new(block_info, HashValue::zero()),
-        BTreeMap::new(),
+        AggregateSignature::empty(),
     )
 }
 
-/// Creates a epoch ending ledger infos for all epochs
-fn create_epoch_ending_ledger_infos() -> HashMap<Epoch, LedgerInfoWithSignatures> {
-    let mut current_epoch = MIN_ADVERTISED_EPOCH_END;
-    let mut current_version = MIN_ADVERTISED_TRANSACTION;
+/// Creates epoch ending ledger infos for the given epoch and version range
+fn create_epoch_ending_ledger_infos(
+    start_epoch: Epoch,
+    start_version: Version,
+    end_epoch: Epoch,
+    end_version: Version,
+) -> HashMap<Epoch, LedgerInfoWithSignatures> {
+    let mut current_epoch = start_epoch;
+    let mut current_version = start_version;
 
     // Populate the epoch ending ledger infos using random intervals
-    let max_num_versions_in_epoch = (MAX_ADVERTISED_TRANSACTION - MIN_ADVERTISED_TRANSACTION)
-        / ((MAX_ADVERTISED_EPOCH_END + 1) - MIN_ADVERTISED_EPOCH_END);
+    let max_num_versions_in_epoch = (end_version - start_version) / ((end_epoch + 1) - start_epoch);
     let mut epoch_ending_ledger_infos = HashMap::new();
-    while current_epoch < MAX_ADVERTISED_EPOCH_END + 1 {
+    while current_epoch < end_epoch + 1 {
         let num_versions_in_epoch = create_non_zero_random_u64(max_num_versions_in_epoch);
         current_version += num_versions_in_epoch;
 
@@ -281,16 +696,20 @@ fn create_epoch_ending_ledger_infos() -> HashMap<Epoch, LedgerInfoWithSignatures
     epoch_ending_ledger_infos
 }
 
-/// Creates a set of synced ledger infos for advertising
+/// Creates a set of synced ledger infos given the versions and epochs range
 fn create_synced_ledger_infos(
+    start_epoch: Epoch,
+    start_version: Version,
+    end_epoch: Epoch,
+    end_version: Version,
     epoch_ending_ledger_infos: &HashMap<Epoch, LedgerInfoWithSignatures>,
 ) -> Vec<LedgerInfoWithSignatures> {
-    let mut current_epoch = MIN_ADVERTISED_EPOCH_END;
-    let mut current_version = MIN_ADVERTISED_TRANSACTION;
+    let mut current_epoch = start_epoch;
+    let mut current_version = start_version;
 
     // Populate the synced ledger infos
     let mut synced_ledger_infos = vec![];
-    while current_version < MAX_ADVERTISED_TRANSACTION && current_epoch < MAX_ADVERTISED_EPOCH_END {
+    while current_version < end_version && current_epoch < end_epoch {
         let random_num_versions = create_non_zero_random_u64(10);
         current_version += random_num_versions;
 
@@ -311,13 +730,9 @@ fn create_synced_ledger_infos(
         ));
     }
 
-    // Manually insert a synced ledger info at the last transaction and epoch
-    // to ensure we can sync right up to the end.
-    synced_ledger_infos.push(create_ledger_info(
-        MAX_ADVERTISED_TRANSACTION,
-        MAX_ADVERTISED_EPOCH_END,
-        false,
-    ));
+    // Manually insert a synced ledger info at the last transaction and highest
+    // epoch to ensure we can sync right up to the end.
+    synced_ledger_infos.push(create_ledger_info(end_version, end_epoch + 1, false));
 
     synced_ledger_infos
 }
@@ -334,11 +749,10 @@ fn create_transaction() -> Transaction {
         transaction_payload,
         0,
         0,
-        "".into(),
         0,
         ChainId::new(10),
     );
-    let signature = private_key.sign(&raw_transaction);
+    let signature = private_key.sign(&raw_transaction).unwrap();
     let signed_transaction = SignedTransaction::new(raw_transaction, public_key, signature);
 
     Transaction::UserTransaction(signed_transaction)
@@ -362,12 +776,12 @@ fn create_non_zero_random_u64(max_value: u64) -> u64 {
 /// Returns a random u64 within the range, [min, max)
 fn create_range_random_u64(min_value: u64, max_value: u64) -> u64 {
     let mut rng = OsRng;
-    rng.gen_range(min_value..max_value)
+    rng.gen_range(min_value, max_value)
 }
 
 /// Initializes the Diem logger for tests
 pub fn initialize_logger() {
-    diem_logger::DiemLogger::builder()
+    diem_logger::Logger::builder()
         .is_async(false)
         .level(Level::Info)
         .build();
@@ -391,6 +805,7 @@ pub async fn get_data_notification(
     }
 }
 
+/// Creates a transaction list with proof for testing
 pub fn create_transaction_list_with_proof(
     start_version: u64,
     end_version: u64,
@@ -412,4 +827,32 @@ pub fn create_transaction_list_with_proof(
     transaction_list_with_proof.transactions = transactions;
 
     transaction_list_with_proof
+}
+
+/// Creates an output list with proof for testing
+pub fn create_output_list_with_proof(
+    start_version: u64,
+    end_version: u64,
+) -> TransactionOutputListWithProof {
+    let transaction_list_with_proof =
+        create_transaction_list_with_proof(start_version, end_version, false);
+    let transactions_and_outputs = transaction_list_with_proof
+        .transactions
+        .iter()
+        .map(|txn| (txn.clone(), create_transaction_output()))
+        .collect();
+
+    TransactionOutputListWithProof::new(
+        transactions_and_outputs,
+        Some(start_version),
+        transaction_list_with_proof.proof,
+    )
+}
+
+/// Returns true iff the server should return transactions
+/// instead of outputs.
+///
+/// Note: there's a 50-50 chance of this occurring.
+fn return_transactions_instead_of_outputs() -> bool {
+    (create_random_u64(u64::MAX) % 2) == 0
 }

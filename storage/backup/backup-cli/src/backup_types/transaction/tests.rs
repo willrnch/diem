@@ -1,23 +1,27 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     backup_types::transaction::{
         backup::{TransactionBackupController, TransactionBackupOpt},
-        restore::{TransactionRestoreController, TransactionRestoreOpt},
+        restore::TransactionRestoreBatchController,
     },
     storage::{local_fs::LocalFs, BackupStorage},
     utils::{
         backup_service_client::BackupServiceClient,
         test_utils::{start_local_backup_service, tmp_db_with_random_content},
-        ConcurrentDownloadsOpt, GlobalBackupOpt, GlobalRestoreOpt, RocksdbOpt, TrustedWaypointOpt,
+        ConcurrentDownloadsOpt, GlobalBackupOpt, GlobalRestoreOpt, ReplayConcurrencyLevelOpt,
+        RocksdbOpt, TrustedWaypointOpt,
     },
 };
+use diem_db::DiemDB;
+use diem_executor_types::VerifyExecutionMode;
+use diem_storage_interface::DbReader;
 use diem_temppath::TempPath;
 use diem_types::transaction::Version;
-use diemdb::DiemDB;
+use itertools::zip_eq;
 use std::{convert::TryInto, mem::size_of, sync::Arc};
-use storage_interface::DbReader;
 use tokio::time::Duration;
 
 #[test]
@@ -29,7 +33,7 @@ fn end_to_end() {
     backup_dir.create_as_dir().unwrap();
     let store: Arc<dyn BackupStorage> = Arc::new(LocalFs::new(backup_dir.path().to_path_buf()));
 
-    let (rt, port) = start_local_backup_service(src_db);
+    let (rt, port) = start_local_backup_service(Arc::clone(&src_db));
     let client = Arc::new(BackupServiceClient::new(format!(
         "http://localhost:{}",
         port
@@ -40,8 +44,7 @@ fn end_to_end() {
     assert_eq!(latest_version as usize + 1, total_txns);
     let txns = blocks
         .iter()
-        .map(|(txns, _li)| txns)
-        .flatten()
+        .flat_map(|(txns, _li)| txns)
         .map(|txn_to_commit| txn_to_commit.transaction())
         .collect::<Vec<_>>();
     let max_chunk_size = txns
@@ -54,9 +57,26 @@ fn end_to_end() {
     let first_ver_to_backup = (total_txns / 4) as Version;
     let num_txns_to_backup = total_txns - first_ver_to_backup as usize;
     let target_version = first_ver_to_backup + total_txns as Version / 2;
-    let num_txns_to_restore = (target_version - first_ver_to_backup + 1) as usize;
+    let mut backup_handles = vec![];
+    if first_ver_to_backup > 0 {
+        let transaction_backup_before_first_ver = rt
+            .block_on(
+                TransactionBackupController::new(
+                    TransactionBackupOpt {
+                        start_version: 0,
+                        num_transactions: first_ver_to_backup as usize,
+                    },
+                    GlobalBackupOpt { max_chunk_size },
+                    client.clone(),
+                    Arc::clone(&store),
+                )
+                .run(),
+            )
+            .unwrap();
+        backup_handles.push(transaction_backup_before_first_ver);
+    }
 
-    let manifest_handle = rt
+    let transaction_backup_after_first_ver = rt
         .block_on(
             TransactionBackupController::new(
                 TransactionBackupOpt {
@@ -70,26 +90,27 @@ fn end_to_end() {
             .run(),
         )
         .unwrap();
-
+    backup_handles.push(transaction_backup_after_first_ver);
     rt.block_on(
-        TransactionRestoreController::new(
-            TransactionRestoreOpt {
-                manifest_handle,
-                replay_from_version: None, // max
-            },
+        TransactionRestoreBatchController::new(
             GlobalRestoreOpt {
                 dry_run: false,
                 db_dir: Some(tgt_db_dir.path().to_path_buf()),
                 target_version: Some(target_version),
                 trusted_waypoints: TrustedWaypointOpt::default(),
                 rocksdb_opt: RocksdbOpt::default(),
-                concurernt_downloads: ConcurrentDownloadsOpt::default(),
-                account_count_migration: true,
+                concurrent_downloads: ConcurrentDownloadsOpt::default(),
+                replay_concurrency_level: ReplayConcurrencyLevelOpt::default(),
             }
             .try_into()
             .unwrap(),
             store,
-            None, /* epoch_history */
+            backup_handles,
+            None,
+            None,
+            None,
+            VerifyExecutionMode::verify_all(),
+            None,
         )
         .run(),
     )
@@ -98,19 +119,30 @@ fn end_to_end() {
     // We don't write down any ledger infos when recovering transactions. State-sync needs to take
     // care of it before running consensus. The latest transactions are deemed "synced" instead of
     // "committed" most likely.
-    let tgt_db = DiemDB::new_for_test(&tgt_db_dir);
-    assert_eq!(
-        tgt_db
-            .get_latest_transaction_info_option()
-            .unwrap()
-            .unwrap()
-            .0,
-        target_version,
-    );
+    let tgt_db = DiemDB::new_readonly_for_test(&tgt_db_dir);
+    let ouptputlist = tgt_db
+        .get_transaction_outputs(0, target_version, target_version)
+        .unwrap();
+
+    for (restore_ws, org_ws) in zip_eq(
+        ouptputlist
+            .transactions_and_outputs
+            .iter()
+            .map(|(_, output)| output.write_set().clone()),
+        blocks
+            .iter()
+            .flat_map(|(txns, _li)| txns)
+            .take(target_version as usize)
+            .map(|txn_to_commit| txn_to_commit.write_set().clone()),
+    ) {
+        assert_eq!(restore_ws, org_ws);
+    }
+
+    assert_eq!(tgt_db.get_latest_version().unwrap(), target_version);
     let recovered_transactions = tgt_db
         .get_transactions(
-            first_ver_to_backup,
-            num_txns_to_restore as u64,
+            0,
+            target_version,
             target_version,
             true, /* fetch_events */
         )
@@ -119,8 +151,7 @@ fn end_to_end() {
     assert_eq!(
         recovered_transactions.transactions,
         txns.into_iter()
-            .skip(first_ver_to_backup as usize)
-            .take(num_txns_to_restore)
+            .take(target_version as usize)
             .cloned()
             .collect::<Vec<_>>()
     );
@@ -129,13 +160,11 @@ fn end_to_end() {
         recovered_transactions.events.unwrap(),
         blocks
             .iter()
-            .map(|(txns, _li)| {
+            .flat_map(|(txns, _li)| {
                 txns.iter()
                     .map(|txn_to_commit| txn_to_commit.events().to_vec())
             })
-            .flatten()
-            .skip(first_ver_to_backup as usize)
-            .take(num_txns_to_restore)
+            .take(target_version as usize)
             .collect::<Vec<_>>()
     );
 

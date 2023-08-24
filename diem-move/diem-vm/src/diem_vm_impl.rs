@@ -1,206 +1,299 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     access_path_cache::AccessPathCache,
-    counters::*,
-    data_cache::RemoteStorage,
+    data_cache::StorageAdapter,
     errors::{convert_epilogue_error, convert_prologue_error, expect_only_successful_execution},
-    logging::AdapterLogSchema,
-    natives::diem_natives,
+    move_vm_ext::{MoveResolverExt, MoveVmExt, SessionExt, SessionId},
+    system_module_names::{MULTISIG_ACCOUNT_MODULE, VALIDATE_MULTISIG_TRANSACTION},
     transaction_metadata::TransactionMetadata,
+    transaction_validation::DIEM_TRANSACTION_VALIDATION,
 };
-use diem_crypto::HashValue;
-use diem_logger::prelude::*;
+use diem_framework::RuntimeModuleMetadataV1;
+use diem_gas::{
+    AbstractValueSizeGasParameters, DiemGasParameters, ChangeSetConfigs, FromOnChainGasSchedule,
+    Gas, NativeGasParameters, StorageGasParameters, StoragePricing,
+};
+use diem_logger::{enabled, prelude::*, Level};
 use diem_state_view::StateView;
 use diem_types::{
-    account_config,
-    account_config::{ChainSpecificAccountInfo, CurrencyInfoResource},
-    contract_event::ContractEvent,
-    event::EventKey,
+    account_config::CORE_CODE_ADDRESS,
+    chain_id::ChainId,
+    fee_statement::FeeStatement,
     on_chain_config::{
-        ConfigStorage, DiemVersion, OnChainConfig, VMConfig, VMPublishingOption, DIEM_VERSION_3,
+        ApprovedExecutionHashes, ConfigurationResource, FeatureFlag, Features, GasSchedule,
+        GasScheduleV2, OnChainConfig, TimedFeatures, Version,
     },
-    transaction::{SignedTransaction, TransactionOutput, TransactionStatus},
-    vm_status::{KeptVMStatus, StatusCode, VMStatus},
-    write_set::{WriteOp, WriteSet, WriteSetMut},
+    transaction::{AbortInfo, ExecutionStatus, Multisig, TransactionStatus},
+    vm_status::{StatusCode, VMStatus},
 };
+use diem_vm_logging::{log_schema::AdapterLogSchema, prelude::*};
+use diem_vm_types::output::VMOutput;
 use fail::fail_point;
-use move_binary_format::errors::{Location, VMResult};
+use move_binary_format::{errors::VMResult, CompiledModule};
 use move_core_types::{
-    account_address::AccountAddress,
-    effects::{ChangeSet as MoveChangeSet, Event as MoveEvent},
-    gas_schedule::{CostTable, GasAlgebra, GasCarrier, GasUnits, InternalGasUnits},
-    identifier::{IdentStr, Identifier},
-    language_storage::{ModuleId, TypeTag},
-    move_resource::MoveStructType,
-    resolver::{MoveResolver, ResourceResolver},
+    gas_algebra::NumArgs,
+    language_storage::ModuleId,
     value::{serialize_values, MoveValue},
 };
-use move_vm_runtime::{logging::expect_no_verification_errors, move_vm::MoveVM, session::Session};
-use move_vm_types::gas_schedule::{calculate_intrinsic_gas, GasStatus};
-use std::{convert::TryFrom, sync::Arc};
+use move_vm_runtime::logging::expect_no_verification_errors;
+use move_vm_types::gas::UnmeteredGasMeter;
+use std::sync::Arc;
 
-#[derive(Clone)]
-/// A wrapper to make VMRuntime standalone and thread safe.
+pub const MAXIMUM_APPROVED_TRANSACTION_SIZE: u64 = 1024 * 1024;
+
+/// A wrapper to make VMRuntime standalone
 pub struct DiemVMImpl {
-    move_vm: Arc<MoveVM>,
-    on_chain_config: Option<VMConfig>,
-    version: Option<DiemVersion>,
-    publishing_option: Option<VMPublishingOption>,
-    chain_account_info: Option<ChainSpecificAccountInfo>,
+    move_vm: MoveVmExt,
+    gas_feature_version: u64,
+    gas_params: Result<DiemGasParameters, String>,
+    storage_gas_params: Result<StorageGasParameters, String>,
+    version: Option<Version>,
+    features: Features,
+}
+
+pub fn gas_config(storage: &impl MoveResolverExt) -> (Result<DiemGasParameters, String>, u64) {
+    match GasScheduleV2::fetch_config(storage) {
+        Some(gas_schedule) => {
+            let feature_version = gas_schedule.feature_version;
+            let map = gas_schedule.to_btree_map();
+            (
+                DiemGasParameters::from_on_chain_gas_schedule(&map, feature_version),
+                feature_version,
+            )
+        },
+        None => match GasSchedule::fetch_config(storage) {
+            Some(gas_schedule) => {
+                let map = gas_schedule.to_btree_map();
+                (DiemGasParameters::from_on_chain_gas_schedule(&map, 0), 0)
+            },
+            None => (Err("Neither gas schedule v2 nor v1 exists.".to_string()), 0),
+        },
+    }
 }
 
 impl DiemVMImpl {
     #[allow(clippy::new_without_default)]
-    pub fn new<S: StateView>(state: &S) -> Self {
-        let inner = MoveVM::new(diem_natives())
-            .expect("should be able to create Move VM; check if there are duplicated natives");
-        let mut vm = Self {
-            move_vm: Arc::new(inner),
-            on_chain_config: None,
-            version: None,
-            publishing_option: None,
-            chain_account_info: None,
-        };
-        vm.load_configs_impl(&RemoteStorage::new(state));
-        vm.chain_account_info = Self::get_chain_specific_account_info(&RemoteStorage::new(state));
-        vm
-    }
+    pub fn new(state: &impl StateView) -> Self {
+        let storage = StorageAdapter::new(state);
 
-    pub fn init_with_config(
-        version: DiemVersion,
-        on_chain_config: VMConfig,
-        publishing_option: VMPublishingOption,
-    ) -> Self {
-        let inner = MoveVM::new(diem_natives())
-            .expect("should be able to create Move VM; check if there are duplicated natives");
+        // Get the gas parameters
+        let (mut gas_params, gas_feature_version) = gas_config(&storage);
+
+        let storage_gas_params = match &mut gas_params {
+            Ok(gas_params) => {
+                let storage_gas_params =
+                    StorageGasParameters::new(gas_feature_version, gas_params, &storage);
+
+                if let StoragePricing::V2(pricing) = &storage_gas_params.pricing {
+                    // Overwrite table io gas parameters with global io pricing.
+                    let g = &mut gas_params.natives.table.common;
+                    match gas_feature_version {
+                        0..=1 => (),
+                        2..=6 => {
+                            g.load_base_legacy = pricing.per_item_read * NumArgs::new(1);
+                            g.load_base_new = 0.into();
+                            g.load_per_byte = pricing.per_byte_read;
+                            g.load_failure = 0.into();
+                        },
+                        7.. => {
+                            g.load_base_legacy = 0.into();
+                            g.load_base_new = pricing.per_item_read * NumArgs::new(1);
+                            g.load_per_byte = pricing.per_byte_read;
+                            g.load_failure = 0.into();
+                        },
+                    }
+                }
+                Ok(storage_gas_params)
+            },
+            Err(err) => Err(format!("Failed to initialize storage gas params due to failure to load main gas parameters: {}", err)),
+        };
+
+        // TODO(Gas): Right now, we have to use some dummy values for gas parameters if they are not found on-chain.
+        //            This only happens in a edge case that is probably related to write set transactions or genesis,
+        //            which logically speaking, shouldn't be handled by the VM at all.
+        //            We should clean up the logic here once we get that refactored.
+        let (native_gas_params, abs_val_size_gas_params) = match &gas_params {
+            Ok(gas_params) => (gas_params.natives.clone(), gas_params.misc.abs_val.clone()),
+            Err(_) => (
+                NativeGasParameters::zeros(),
+                AbstractValueSizeGasParameters::zeros(),
+            ),
+        };
+
+        let features = Features::fetch_config(&storage).unwrap_or_default();
+
+        // If no chain ID is in storage, we assume we are in a testing environment and use ChainId::TESTING
+        let chain_id = ChainId::fetch_config(&storage).unwrap_or_else(ChainId::test);
+
+        let timestamp = ConfigurationResource::fetch_config(&storage)
+            .map(|config| config.last_reconfiguration_time())
+            .unwrap_or(0);
+
+        let mut timed_features = TimedFeatures::new(chain_id, timestamp);
+        if let Some(profile) = crate::DiemVM::get_timed_feature_override() {
+            timed_features = timed_features.with_override_profile(profile)
+        }
+
+        let move_vm = MoveVmExt::new(
+            native_gas_params,
+            abs_val_size_gas_params,
+            gas_feature_version,
+            chain_id.id(),
+            features.clone(),
+            timed_features,
+        )
+        .expect("should be able to create Move VM; check if there are duplicated natives");
+
+        let version = Version::fetch_config(&storage);
+
         Self {
-            move_vm: Arc::new(inner),
-            on_chain_config: Some(on_chain_config),
-            version: Some(version),
-            publishing_option: Some(publishing_option),
-            chain_account_info: None,
+            move_vm,
+            gas_feature_version,
+            gas_params,
+            storage_gas_params,
+            version,
+            features,
         }
     }
 
-    /// Provides access to some internal APIs of the Diem VM.
+    pub(crate) fn mark_loader_cache_as_invalid(&self) {
+        self.move_vm.mark_loader_cache_as_invalid();
+    }
+
+    /// Provides access to some internal APIs of the VM.
     pub fn internals(&self) -> DiemVMInternals {
         DiemVMInternals(self)
     }
 
-    pub(crate) fn chain_info(&self) -> &ChainSpecificAccountInfo {
-        self.chain_account_info
-            .as_ref()
-            .unwrap_or(&account_config::DPN_CHAIN_INFO)
-    }
-
-    pub(crate) fn publishing_option(
+    pub fn get_gas_parameters(
         &self,
         log_context: &AdapterLogSchema,
-    ) -> Result<&VMPublishingOption, VMStatus> {
-        self.publishing_option.as_ref().ok_or_else(|| {
-            log_context.alert();
-            error!(
-                *log_context,
-                "VM Startup Failed. PublishingOption Not Found"
-            );
-            VMStatus::Error(StatusCode::VM_STARTUP_FAILURE)
+    ) -> Result<&DiemGasParameters, VMStatus> {
+        self.gas_params.as_ref().map_err(|err| {
+            let msg = format!("VM Startup Failed. {}", err);
+            speculative_error!(log_context, msg.clone());
+            VMStatus::error(StatusCode::VM_STARTUP_FAILURE, Some(msg))
         })
     }
 
-    fn load_configs_impl<S: ConfigStorage>(&mut self, data_cache: &S) {
-        self.on_chain_config = VMConfig::fetch_config(data_cache);
-        self.version = DiemVersion::fetch_config(data_cache);
-        self.publishing_option = VMPublishingOption::fetch_config(data_cache);
+    pub fn get_storage_gas_parameters(
+        &self,
+        log_context: &AdapterLogSchema,
+    ) -> Result<&StorageGasParameters, VMStatus> {
+        self.storage_gas_params.as_ref().map_err(|err| {
+            let msg = format!("VM Startup Failed. {}", err);
+            speculative_error!(log_context, msg.clone());
+            VMStatus::error(StatusCode::VM_STARTUP_FAILURE, Some(msg))
+        })
     }
 
-    // TODO: Move this to an on-chain config once those are a part of the core framework
-    fn get_chain_specific_account_info<S: ResourceResolver>(
-        remote_cache: &S,
-    ) -> Option<ChainSpecificAccountInfo> {
-        match remote_cache
-            .get_resource(
-                &account_config::diem_root_address(),
-                &account_config::ChainSpecificAccountInfo::struct_tag(),
-            )
-            .ok()?
-        {
-            Some(blob) => bcs::from_bytes::<ChainSpecificAccountInfo>(&blob).ok(),
-            _ => None,
-        }
+    pub fn get_gas_feature_version(&self) -> u64 {
+        self.gas_feature_version
     }
 
-    pub fn get_gas_schedule(&self, log_context: &AdapterLogSchema) -> Result<&CostTable, VMStatus> {
-        self.on_chain_config
-            .as_ref()
-            .map(|config| &config.gas_schedule)
-            .ok_or_else(|| {
-                log_context.alert();
-                error!(*log_context, "VM Startup Failed. Gas Schedule Not Found");
-                VMStatus::Error(StatusCode::VM_STARTUP_FAILURE)
-            })
-    }
-
-    pub fn get_diem_version(&self) -> Result<DiemVersion, VMStatus> {
+    pub fn get_version(&self) -> Result<Version, VMStatus> {
         self.version.clone().ok_or_else(|| {
-            CRITICAL_ERRORS.inc();
-            error!("VM Startup Failed. Diem Version Not Found");
-            VMStatus::Error(StatusCode::VM_STARTUP_FAILURE)
+            alert!("VM Startup Failed. Version Not Found");
+            VMStatus::error(StatusCode::VM_STARTUP_FAILURE, None)
         })
+    }
+
+    pub fn get_features(&self) -> &Features {
+        &self.features
     }
 
     pub fn check_gas(
         &self,
+        resolver: &impl MoveResolverExt,
         txn_data: &TransactionMetadata,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
-        let gas_constants = &self.get_gas_schedule(log_context)?.gas_constants;
+        let txn_gas_params = &self.get_gas_parameters(log_context)?.txn;
         let raw_bytes_len = txn_data.transaction_size;
         // The transaction is too large.
-        if txn_data.transaction_size.get() > gas_constants.max_transaction_size_in_bytes {
-            warn!(
-                *log_context,
-                "[VM] Transaction size too big {} (max {})",
-                raw_bytes_len.get(),
-                gas_constants.max_transaction_size_in_bytes,
-            );
-            return Err(VMStatus::Error(StatusCode::EXCEEDED_MAX_TRANSACTION_SIZE));
-        }
+        if txn_data.transaction_size > txn_gas_params.max_transaction_size_in_bytes {
+            let data =
+                resolver.get_resource(&CORE_CODE_ADDRESS, &ApprovedExecutionHashes::struct_tag());
 
-        // Check is performed on `txn.raw_txn_bytes_len()` which is the same as
-        // `raw_bytes_len`
-        assume!(raw_bytes_len.get() <= gas_constants.max_transaction_size_in_bytes);
+            let valid = if let Ok(Some(data)) = data {
+                let approved_execution_hashes =
+                    bcs::from_bytes::<ApprovedExecutionHashes>(&data).ok();
+                let valid = approved_execution_hashes
+                    .map(|aeh| {
+                        aeh.entries
+                            .into_iter()
+                            .any(|(_, hash)| hash == txn_data.script_hash)
+                    })
+                    .unwrap_or(false);
+                valid
+                    // If it is valid ensure that it is only the approved payload that exceeds the
+                    // maximum. The (unknown) user input should be restricted to the original
+                    // maximum transaction size.
+                    && (txn_data.script_size + txn_gas_params.max_transaction_size_in_bytes
+                        > txn_data.transaction_size)
+                    // Since an approved transaction can be sent by anyone, the system is safer by
+                    // enforcing an upper limit on governance transactions just so something really
+                    // bad doesn't happen.
+                    && txn_data.transaction_size <= MAXIMUM_APPROVED_TRANSACTION_SIZE.into()
+            } else {
+                false
+            };
+
+            if !valid {
+                speculative_warn!(
+                    log_context,
+                    format!(
+                        "[VM] Transaction size too big {} (max {})",
+                        raw_bytes_len, txn_gas_params.max_transaction_size_in_bytes
+                    ),
+                );
+                return Err(VMStatus::error(
+                    StatusCode::EXCEEDED_MAX_TRANSACTION_SIZE,
+                    None,
+                ));
+            }
+        }
 
         // The submitted max gas units that the transaction can consume is greater than the
         // maximum number of gas units bound that we have set for any
         // transaction.
-        if txn_data.max_gas_amount().get() > gas_constants.maximum_number_of_gas_units.get() {
-            warn!(
-                *log_context,
-                "[VM] Gas unit error; max {}, submitted {}",
-                gas_constants.maximum_number_of_gas_units.get(),
-                txn_data.max_gas_amount().get(),
+        if txn_data.max_gas_amount() > txn_gas_params.maximum_number_of_gas_units {
+            speculative_warn!(
+                log_context,
+                format!(
+                    "[VM] Gas unit error; max {}, submitted {}",
+                    txn_gas_params.maximum_number_of_gas_units,
+                    txn_data.max_gas_amount()
+                ),
             );
-            return Err(VMStatus::Error(
+            return Err(VMStatus::error(
                 StatusCode::MAX_GAS_UNITS_EXCEEDS_MAX_GAS_UNITS_BOUND,
+                None,
             ));
         }
 
         // The submitted transactions max gas units needs to be at least enough to cover the
         // intrinsic cost of the transaction as calculated against the size of the
         // underlying `RawTransaction`
-        let min_txn_fee =
-            gas_constants.to_external_units(calculate_intrinsic_gas(raw_bytes_len, gas_constants));
-        if txn_data.max_gas_amount().get() < min_txn_fee.get() {
-            warn!(
-                *log_context,
-                "[VM] Gas unit error; min {}, submitted {}",
-                min_txn_fee.get(),
-                txn_data.max_gas_amount().get(),
+        let intrinsic_gas: Gas = txn_gas_params
+            .calculate_intrinsic_gas(raw_bytes_len)
+            .to_unit_round_up_with_params(txn_gas_params);
+
+        if txn_data.max_gas_amount() < intrinsic_gas {
+            speculative_warn!(
+                log_context,
+                format!(
+                    "[VM] Gas unit error; min {}, submitted {}",
+                    intrinsic_gas,
+                    txn_data.max_gas_amount()
+                ),
             );
-            return Err(VMStatus::Error(
+            return Err(VMStatus::error(
                 StatusCode::MAX_GAS_UNITS_BELOW_MIN_TRANSACTION_GAS_UNITS,
+                None,
             ));
         }
 
@@ -208,312 +301,323 @@ impl DiemVMImpl {
         // NB: MIN_PRICE_PER_GAS_UNIT may equal zero, but need not in the future. Hence why
         // we turn off the clippy warning.
         #[allow(clippy::absurd_extreme_comparisons)]
-        let below_min_bound =
-            txn_data.gas_unit_price().get() < gas_constants.min_price_per_gas_unit.get();
+        let below_min_bound = txn_data.gas_unit_price() < txn_gas_params.min_price_per_gas_unit;
         if below_min_bound {
-            warn!(
-                *log_context,
-                "[VM] Gas unit error; min {}, submitted {}",
-                gas_constants.min_price_per_gas_unit.get(),
-                txn_data.gas_unit_price().get(),
+            speculative_warn!(
+                log_context,
+                format!(
+                    "[VM] Gas unit error; min {}, submitted {}",
+                    txn_gas_params.min_price_per_gas_unit,
+                    txn_data.gas_unit_price()
+                ),
             );
-            return Err(VMStatus::Error(StatusCode::GAS_UNIT_PRICE_BELOW_MIN_BOUND));
+            return Err(VMStatus::error(
+                StatusCode::GAS_UNIT_PRICE_BELOW_MIN_BOUND,
+                None,
+            ));
         }
 
         // The submitted gas price is greater than the maximum gas unit price set by the VM.
-        if txn_data.gas_unit_price().get() > gas_constants.max_price_per_gas_unit.get() {
-            warn!(
-                *log_context,
-                "[VM] Gas unit error; min {}, submitted {}",
-                gas_constants.max_price_per_gas_unit.get(),
-                txn_data.gas_unit_price().get(),
+        if txn_data.gas_unit_price() > txn_gas_params.max_price_per_gas_unit {
+            speculative_warn!(
+                log_context,
+                format!(
+                    "[VM] Gas unit error; min {}, submitted {}",
+                    txn_gas_params.max_price_per_gas_unit,
+                    txn_data.gas_unit_price()
+                ),
             );
-            return Err(VMStatus::Error(StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND));
+            return Err(VMStatus::error(
+                StatusCode::GAS_UNIT_PRICE_ABOVE_MAX_BOUND,
+                None,
+            ));
         }
         Ok(())
     }
 
-    fn get_gas_currency_args(&self, account_currency_symbol: &IdentStr) -> Vec<TypeTag> {
-        if self.chain_info().currency_code_required {
-            vec![account_config::type_tag_for_currency_code(
-                account_currency_symbol.to_owned(),
-            )]
-        } else {
-            vec![]
-        }
-    }
-
     /// Run the prologue of a transaction by calling into either `SCRIPT_PROLOGUE_NAME` function
     /// or `MULTI_AGENT_SCRIPT_PROLOGUE_NAME` function stored in the `ACCOUNT_MODULE` on chain.
-    pub(crate) fn run_script_prologue<S: MoveResolver>(
+    pub(crate) fn run_script_prologue(
         &self,
-        session: &mut Session<S>,
+        session: &mut SessionExt,
         txn_data: &TransactionMetadata,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
-        let chain_specific_info = self.chain_info();
-        let gas_currency = self.get_gas_currency_args(account_currency_symbol);
         let txn_sequence_number = txn_data.sequence_number();
-        let txn_public_key = txn_data.authentication_key_preimage().to_vec();
-        let txn_gas_price = txn_data.gas_unit_price().get();
-        let txn_max_gas_units = txn_data.max_gas_amount().get();
+        let txn_authentication_key = txn_data.authentication_key().to_vec();
+        let txn_gas_price = txn_data.gas_unit_price();
+        let txn_max_gas_units = txn_data.max_gas_amount();
         let txn_expiration_timestamp_secs = txn_data.expiration_timestamp_secs();
         let chain_id = txn_data.chain_id();
-        let mut gas_status = GasStatus::new_unmetered();
-        let secondary_public_key_hashes: Vec<MoveValue> = txn_data
-            .secondary_authentication_key_preimages
+        let mut gas_meter = UnmeteredGasMeter;
+        let secondary_auth_keys: Vec<MoveValue> = txn_data
+            .secondary_authentication_keys
             .iter()
-            .map(|preimage| {
-                MoveValue::vector_u8(HashValue::sha3_256_of(&preimage.to_vec()).to_vec())
-            })
+            .map(|auth_key| MoveValue::vector_u8(auth_key.to_vec()))
             .collect();
-        let args = if self.get_diem_version()? >= DIEM_VERSION_3 && txn_data.is_multi_agent() {
-            vec![
+        let (prologue_function_name, args) = if let (Some(fee_payer), Some(fee_payer_auth_key)) = (
+            txn_data.fee_payer(),
+            txn_data.fee_payer_authentication_key.as_ref(),
+        ) {
+            let args = vec![
                 MoveValue::Signer(txn_data.sender),
                 MoveValue::U64(txn_sequence_number),
-                MoveValue::vector_u8(txn_public_key),
+                MoveValue::vector_u8(txn_authentication_key),
                 MoveValue::vector_address(txn_data.secondary_signers()),
-                MoveValue::Vector(secondary_public_key_hashes),
-                MoveValue::U64(txn_gas_price),
-                MoveValue::U64(txn_max_gas_units),
+                MoveValue::Vector(secondary_auth_keys),
+                MoveValue::Address(fee_payer),
+                MoveValue::vector_u8(fee_payer_auth_key.to_vec()),
+                MoveValue::U64(txn_gas_price.into()),
+                MoveValue::U64(txn_max_gas_units.into()),
                 MoveValue::U64(txn_expiration_timestamp_secs),
                 MoveValue::U8(chain_id.id()),
-            ]
-        } else {
-            vec![
+            ];
+            (&DIEM_TRANSACTION_VALIDATION.fee_payer_prologue_name, args)
+        } else if txn_data.is_multi_agent() {
+            let args = vec![
                 MoveValue::Signer(txn_data.sender),
                 MoveValue::U64(txn_sequence_number),
-                MoveValue::vector_u8(txn_public_key),
-                MoveValue::U64(txn_gas_price),
-                MoveValue::U64(txn_max_gas_units),
+                MoveValue::vector_u8(txn_authentication_key),
+                MoveValue::vector_address(txn_data.secondary_signers()),
+                MoveValue::Vector(secondary_auth_keys),
+                MoveValue::U64(txn_gas_price.into()),
+                MoveValue::U64(txn_max_gas_units.into()),
+                MoveValue::U64(txn_expiration_timestamp_secs),
+                MoveValue::U8(chain_id.id()),
+            ];
+            (
+                &DIEM_TRANSACTION_VALIDATION.multi_agent_prologue_name,
+                args,
+            )
+        } else {
+            let args = vec![
+                MoveValue::Signer(txn_data.sender),
+                MoveValue::U64(txn_sequence_number),
+                MoveValue::vector_u8(txn_authentication_key),
+                MoveValue::U64(txn_gas_price.into()),
+                MoveValue::U64(txn_max_gas_units.into()),
                 MoveValue::U64(txn_expiration_timestamp_secs),
                 MoveValue::U8(chain_id.id()),
                 MoveValue::vector_u8(txn_data.script_hash.clone()),
-            ]
+            ];
+            (&DIEM_TRANSACTION_VALIDATION.script_prologue_name, args)
         };
-        let prologue_function_name =
-            if self.get_diem_version()? >= DIEM_VERSION_3 && txn_data.is_multi_agent() {
-                &chain_specific_info.multi_agent_prologue_name
-            } else {
-                &chain_specific_info.script_prologue_name
-            };
         session
-            .execute_function(
-                &chain_specific_info.module_id(),
+            .execute_function_bypass_visibility(
+                &DIEM_TRANSACTION_VALIDATION.module_id(),
                 prologue_function_name,
-                gas_currency,
+                // TODO: Deprecate this once we remove gas currency on the Move side.
+                vec![],
                 serialize_values(&args),
-                &mut gas_status,
+                &mut gas_meter,
             )
             .map(|_return_vals| ())
             .map_err(expect_no_verification_errors)
-            .or_else(|err| convert_prologue_error(chain_specific_info, err, log_context))
+            .or_else(|err| convert_prologue_error(err, log_context))
     }
 
     /// Run the prologue of a transaction by calling into `MODULE_PROLOGUE_NAME` function stored
     /// in the `ACCOUNT_MODULE` on chain.
-    pub(crate) fn run_module_prologue<S: MoveResolver>(
+    pub(crate) fn run_module_prologue(
         &self,
-        session: &mut Session<S>,
+        session: &mut SessionExt,
         txn_data: &TransactionMetadata,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
-        let chain_specific_info = self.chain_info();
-        let gas_currency = self.get_gas_currency_args(account_currency_symbol);
         let txn_sequence_number = txn_data.sequence_number();
-        let txn_public_key = txn_data.authentication_key_preimage().to_vec();
-        let txn_gas_price = txn_data.gas_unit_price().get();
-        let txn_max_gas_units = txn_data.max_gas_amount().get();
+        let txn_authentication_key = txn_data.authentication_key();
+        let txn_gas_price = txn_data.gas_unit_price();
+        let txn_max_gas_units = txn_data.max_gas_amount();
         let txn_expiration_timestamp_secs = txn_data.expiration_timestamp_secs();
         let chain_id = txn_data.chain_id();
-        let mut gas_status = GasStatus::new_unmetered();
+        let mut gas_meter = UnmeteredGasMeter;
         session
-            .execute_function(
-                &chain_specific_info.module_id(),
-                &chain_specific_info.module_prologue_name,
-                gas_currency,
+            .execute_function_bypass_visibility(
+                &DIEM_TRANSACTION_VALIDATION.module_id(),
+                &DIEM_TRANSACTION_VALIDATION.module_prologue_name,
+                // TODO: Deprecate this once we remove gas currency on the Move side.
+                vec![],
                 serialize_values(&vec![
                     MoveValue::Signer(txn_data.sender),
                     MoveValue::U64(txn_sequence_number),
-                    MoveValue::vector_u8(txn_public_key),
-                    MoveValue::U64(txn_gas_price),
-                    MoveValue::U64(txn_max_gas_units),
+                    MoveValue::vector_u8(txn_authentication_key.to_vec()),
+                    MoveValue::U64(txn_gas_price.into()),
+                    MoveValue::U64(txn_max_gas_units.into()),
                     MoveValue::U64(txn_expiration_timestamp_secs),
                     MoveValue::U8(chain_id.id()),
                 ]),
-                &mut gas_status,
+                &mut gas_meter,
             )
             .map(|_return_vals| ())
             .map_err(expect_no_verification_errors)
-            .or_else(|err| convert_prologue_error(chain_specific_info, err, log_context))
+            .or_else(|err| convert_prologue_error(err, log_context))
+    }
+
+    /// Run the prologue for a multisig transaction. This needs to verify that:
+    /// 1. The the multisig tx exists
+    /// 2. It has received enough approvals to meet the signature threshold of the multisig account
+    /// 3. If only the payload hash was stored on chain, the provided payload in execution should
+    /// match that hash.
+    pub(crate) fn run_multisig_prologue(
+        &self,
+        session: &mut SessionExt,
+        txn_data: &TransactionMetadata,
+        payload: &Multisig,
+        log_context: &AdapterLogSchema,
+    ) -> Result<(), VMStatus> {
+        let unreachable_error = VMStatus::error(StatusCode::UNREACHABLE, None);
+        let provided_payload = if let Some(payload) = &payload.transaction_payload {
+            bcs::to_bytes(&payload).map_err(|_| unreachable_error.clone())?
+        } else {
+            // Default to empty bytes if payload is not provided.
+            bcs::to_bytes::<Vec<u8>>(&vec![]).map_err(|_| unreachable_error)?
+        };
+
+        session
+            .execute_function_bypass_visibility(
+                &MULTISIG_ACCOUNT_MODULE,
+                VALIDATE_MULTISIG_TRANSACTION,
+                vec![],
+                serialize_values(&vec![
+                    MoveValue::Signer(txn_data.sender),
+                    MoveValue::Address(payload.multisig_address),
+                    MoveValue::vector_u8(provided_payload),
+                ]),
+                &mut UnmeteredGasMeter,
+            )
+            .map(|_return_vals| ())
+            .map_err(expect_no_verification_errors)
+            .or_else(|err| convert_prologue_error(err, log_context))
+    }
+
+    fn run_epiloque(
+        &self,
+        session: &mut SessionExt,
+        gas_remaining: Gas,
+        txn_data: &TransactionMetadata,
+    ) -> VMResult<()> {
+        let txn_sequence_number = txn_data.sequence_number();
+        let txn_gas_price = txn_data.gas_unit_price();
+        let txn_max_gas_units = txn_data.max_gas_amount();
+        // We can unconditionally do this as this condition can only be true if the prologue
+        // accepted it, in which case the gas payer feature is enabled.
+        if let Some(fee_payer) = txn_data.fee_payer() {
+            session.execute_function_bypass_visibility(
+                &DIEM_TRANSACTION_VALIDATION.module_id(),
+                &DIEM_TRANSACTION_VALIDATION.user_epilogue_gas_payer_name,
+                vec![],
+                serialize_values(&vec![
+                    MoveValue::Signer(txn_data.sender),
+                    MoveValue::Address(fee_payer),
+                    MoveValue::U64(txn_sequence_number),
+                    MoveValue::U64(txn_gas_price.into()),
+                    MoveValue::U64(txn_max_gas_units.into()),
+                    MoveValue::U64(gas_remaining.into()),
+                ]),
+                &mut UnmeteredGasMeter,
+            )
+        } else {
+            // Regular tx, run the normal epilogue
+            session.execute_function_bypass_visibility(
+                &DIEM_TRANSACTION_VALIDATION.module_id(),
+                &DIEM_TRANSACTION_VALIDATION.user_epilogue_name,
+                vec![],
+                serialize_values(&vec![
+                    MoveValue::Signer(txn_data.sender),
+                    MoveValue::U64(txn_sequence_number),
+                    MoveValue::U64(txn_gas_price.into()),
+                    MoveValue::U64(txn_max_gas_units.into()),
+                    MoveValue::U64(gas_remaining.into()),
+                ]),
+                &mut UnmeteredGasMeter,
+            )
+        }
+        .map(|_return_vals| ())
+        .map_err(expect_no_verification_errors)
     }
 
     /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
     /// in the `ACCOUNT_MODULE` on chain.
-    pub(crate) fn run_success_epilogue<S: MoveResolver>(
+    pub(crate) fn run_success_epilogue(
         &self,
-        session: &mut Session<S>,
-        gas_status: &mut GasStatus,
+        session: &mut SessionExt,
+        gas_remaining: Gas,
         txn_data: &TransactionMetadata,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
         fail_point!("move_adapter::run_success_epilogue", |_| {
-            Err(VMStatus::Error(
+            Err(VMStatus::error(
                 StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
+                None,
             ))
         });
 
-        let gas_currency = self.get_gas_currency_args(account_currency_symbol);
-        let chain_specific_info = self.chain_info();
-        let txn_sequence_number = txn_data.sequence_number();
-        let txn_gas_price = txn_data.gas_unit_price().get();
-        let txn_max_gas_units = txn_data.max_gas_amount().get();
-        let gas_remaining = gas_status.remaining_gas().get();
-        session
-            .execute_function(
-                &chain_specific_info.module_id(),
-                &chain_specific_info.user_epilogue_name,
-                gas_currency,
-                serialize_values(&vec![
-                    MoveValue::Signer(txn_data.sender),
-                    MoveValue::U64(txn_sequence_number),
-                    MoveValue::U64(txn_gas_price),
-                    MoveValue::U64(txn_max_gas_units),
-                    MoveValue::U64(gas_remaining),
-                ]),
-                gas_status,
-            )
-            .map(|_return_vals| ())
-            .map_err(expect_no_verification_errors)
-            .or_else(|err| convert_epilogue_error(chain_specific_info, err, log_context))
+        self.run_epiloque(session, gas_remaining, txn_data)
+            .or_else(|err| convert_epilogue_error(err, log_context))
     }
 
     /// Run the failure epilogue of a transaction by calling into `USER_EPILOGUE_NAME` function
     /// stored in the `ACCOUNT_MODULE` on chain.
-    pub(crate) fn run_failure_epilogue<S: MoveResolver>(
+    pub(crate) fn run_failure_epilogue(
         &self,
-        session: &mut Session<S>,
-        gas_status: &mut GasStatus,
+        session: &mut SessionExt,
+        gas_remaining: Gas,
         txn_data: &TransactionMetadata,
-        account_currency_symbol: &IdentStr,
         log_context: &AdapterLogSchema,
     ) -> Result<(), VMStatus> {
-        let gas_currency = self.get_gas_currency_args(account_currency_symbol);
-        let chain_specific_info = self.chain_info();
-        let txn_sequence_number = txn_data.sequence_number();
-        let txn_gas_price = txn_data.gas_unit_price().get();
-        let txn_max_gas_units = txn_data.max_gas_amount().get();
-        let gas_remaining = gas_status.remaining_gas().get();
-        session
-            .execute_function(
-                &chain_specific_info.module_id(),
-                &chain_specific_info.user_epilogue_name,
-                gas_currency,
-                serialize_values(&vec![
-                    MoveValue::Signer(txn_data.sender),
-                    MoveValue::U64(txn_sequence_number),
-                    MoveValue::U64(txn_gas_price),
-                    MoveValue::U64(txn_max_gas_units),
-                    MoveValue::U64(gas_remaining),
-                ]),
-                gas_status,
-            )
-            .map(|_return_vals| ())
-            .map_err(expect_no_verification_errors)
+        self.run_epiloque(session, gas_remaining, txn_data)
             .or_else(|e| {
                 expect_only_successful_execution(
                     e,
-                    chain_specific_info.user_epilogue_name.as_str(),
+                    DIEM_TRANSACTION_VALIDATION.user_epilogue_name.as_str(),
                     log_context,
                 )
             })
     }
 
-    /// Run the prologue of a transaction by calling into `PROLOGUE_NAME` function stored
-    /// in the `WRITESET_MODULE` on chain.
-    pub(crate) fn run_writeset_prologue<S: MoveResolver>(
+    pub(crate) fn extract_abort_info(
         &self,
-        session: &mut Session<S>,
-        txn_data: &TransactionMetadata,
-        log_context: &AdapterLogSchema,
-    ) -> Result<(), VMStatus> {
-        let txn_sequence_number = txn_data.sequence_number();
-        let txn_public_key = txn_data.authentication_key_preimage().to_vec();
-        let txn_expiration_timestamp_secs = txn_data.expiration_timestamp_secs();
-        let chain_id = txn_data.chain_id();
-        let chain_specific_info = self.chain_info();
-
-        let mut gas_status = GasStatus::new_unmetered();
-        session
-            .execute_function(
-                &chain_specific_info.module_id(),
-                &chain_specific_info.writeset_prologue_name,
-                vec![],
-                serialize_values(&vec![
-                    MoveValue::Signer(txn_data.sender),
-                    MoveValue::U64(txn_sequence_number),
-                    MoveValue::vector_u8(txn_public_key),
-                    MoveValue::U64(txn_expiration_timestamp_secs),
-                    MoveValue::U8(chain_id.id()),
-                ]),
-                &mut gas_status,
-            )
-            .map(|_return_vals| ())
-            .map_err(expect_no_verification_errors)
-            .or_else(|err| convert_prologue_error(chain_specific_info, err, log_context))
+        module: &ModuleId,
+        abort_code: u64,
+    ) -> Option<AbortInfo> {
+        if let Some(m) = self.extract_module_metadata(module) {
+            m.extract_abort_info(abort_code)
+        } else {
+            None
+        }
     }
 
-    /// Run the epilogue of a transaction by calling into `WRITESET_EPILOGUE_NAME` function stored
-    /// in the `WRITESET_MODULE` on chain.
-    pub(crate) fn run_writeset_epilogue<S: MoveResolver>(
+    pub(crate) fn extract_module_metadata(
         &self,
-        session: &mut Session<S>,
-        txn_data: &TransactionMetadata,
-        should_trigger_reconfiguration: bool,
-        log_context: &AdapterLogSchema,
-    ) -> Result<(), VMStatus> {
-        let mut gas_status = GasStatus::new_unmetered();
-        let chain_specific_info = self.chain_info();
-        session
-            .execute_function(
-                &chain_specific_info.module_id(),
-                &chain_specific_info.writeset_epilogue_name,
-                vec![],
-                serialize_values(&vec![
-                    MoveValue::Signer(txn_data.sender),
-                    MoveValue::U64(txn_data.sequence_number),
-                    MoveValue::Bool(should_trigger_reconfiguration),
-                ]),
-                &mut gas_status,
-            )
-            .map(|_return_vals| ())
-            .map_err(expect_no_verification_errors)
-            .or_else(|e| {
-                expect_only_successful_execution(
-                    e,
-                    chain_specific_info.writeset_epilogue_name.as_str(),
-                    log_context,
-                )
-            })
+        module: &ModuleId,
+    ) -> Option<RuntimeModuleMetadataV1> {
+        if self.features.is_enabled(FeatureFlag::VM_BINARY_FORMAT_V6) {
+            diem_framework::get_vm_metadata(&self.move_vm, module)
+        } else {
+            diem_framework::get_vm_metadata_v0(&self.move_vm, module)
+        }
     }
 
-    pub fn new_session<'r, R: MoveResolver>(&self, r: &'r R) -> Session<'r, '_, R> {
-        self.move_vm.new_session(r)
+    pub fn new_session<'r>(
+        &self,
+        resolver: &'r impl MoveResolverExt,
+        session_id: SessionId,
+        aggregator_enabled: bool,
+    ) -> SessionExt<'r, '_> {
+        self.move_vm
+            .new_session(resolver, session_id, aggregator_enabled)
     }
 
-    pub fn load_module<'r, R: MoveResolver>(
+    pub fn load_module(
         &self,
         module_id: &ModuleId,
-        remote: &'r R,
-    ) -> VMResult<()> {
-        self.move_vm.load_module(module_id, remote)
+        resolver: &impl MoveResolverExt,
+    ) -> VMResult<Arc<CompiledModule>> {
+        self.move_vm.load_module(module_id, resolver)
     }
 }
 
-/// Internal APIs for the Diem VM, primarily used for testing.
+/// Internal APIs for the VM, primarily used for testing.
 #[derive(Clone, Copy)]
 pub struct DiemVMInternals<'a>(&'a DiemVMImpl);
 
@@ -523,148 +627,38 @@ impl<'a> DiemVMInternals<'a> {
     }
 
     /// Returns the internal Move VM instance.
-    pub fn move_vm(self) -> &'a MoveVM {
+    pub fn move_vm(self) -> &'a MoveVmExt {
         &self.0.move_vm
     }
 
     /// Returns the internal gas schedule if it has been loaded, or an error if it hasn't.
-    pub fn gas_schedule(self, log_context: &AdapterLogSchema) -> Result<&'a CostTable, VMStatus> {
-        self.0.get_gas_schedule(log_context)
+    pub fn gas_params(
+        self,
+        log_context: &AdapterLogSchema,
+    ) -> Result<&'a DiemGasParameters, VMStatus> {
+        self.0.get_gas_parameters(log_context)
     }
 
     /// Returns the version of Move Runtime.
-    pub fn diem_version(self) -> Result<DiemVersion, VMStatus> {
-        self.0.get_diem_version()
-    }
-
-    /// Executes the given code within the context of a transaction.
-    ///
-    /// The `TransactionDataCache` can be used as a `ChainState`.
-    ///
-    /// If you don't care about the transaction metadata, use `TransactionMetadata::default()`.
-    pub fn with_txn_data_cache<T, S: StateView>(
-        self,
-        state_view: &S,
-        f: impl for<'txn, 'r> FnOnce(Session<'txn, 'r, RemoteStorage<S>>) -> T,
-    ) -> T {
-        let remote_storage = RemoteStorage::new(state_view);
-        let session = self.move_vm().new_session(&remote_storage);
-        f(session)
+    pub fn version(self) -> Result<Version, VMStatus> {
+        self.0.get_version()
     }
 }
 
-pub fn convert_changeset_and_events_cached<C: AccessPathCache>(
-    ap_cache: &mut C,
-    changeset: MoveChangeSet,
-    events: Vec<MoveEvent>,
-) -> Result<(WriteSet, Vec<ContractEvent>), VMStatus> {
-    // TODO: Cache access path computations if necessary.
-    let mut ops = vec![];
-
-    for (addr, account_changeset) in changeset.into_inner() {
-        let (modules, resources) = account_changeset.into_inner();
-        for (struct_tag, blob_opt) in resources {
-            let ap = ap_cache.get_resource_path(addr, struct_tag);
-            let op = match blob_opt {
-                None => WriteOp::Deletion,
-                Some(blob) => WriteOp::Value(blob),
-            };
-            ops.push((ap, op))
-        }
-
-        for (name, blob_opt) in modules {
-            let ap = ap_cache.get_module_path(ModuleId::new(addr, name));
-            let op = match blob_opt {
-                None => WriteOp::Deletion,
-                Some(blob) => WriteOp::Value(blob),
-            };
-
-            ops.push((ap, op))
-        }
-    }
-
-    let ws = WriteSetMut::new(ops)
-        .freeze()
-        .map_err(|_| VMStatus::Error(StatusCode::DATA_FORMAT_ERROR))?;
-
-    let events = events
-        .into_iter()
-        .map(|(guid, seq_num, ty_tag, blob)| {
-            let key = EventKey::try_from(guid.as_slice())
-                .map_err(|_| VMStatus::Error(StatusCode::EVENT_KEY_MISMATCH))?;
-            Ok(ContractEvent::new(key, seq_num, ty_tag, blob))
-        })
-        .collect::<Result<Vec<_>, VMStatus>>()?;
-
-    Ok((ws, events))
-}
-
-pub fn convert_changeset_and_events(
-    changeset: MoveChangeSet,
-    events: Vec<MoveEvent>,
-) -> Result<(WriteSet, Vec<ContractEvent>), VMStatus> {
-    convert_changeset_and_events_cached(&mut (), changeset, events)
-}
-
-pub(crate) fn charge_global_write_gas_usage<R: MoveResolver>(
-    gas_status: &mut GasStatus,
-    session: &Session<R>,
-    sender: &AccountAddress,
-) -> Result<(), VMStatus> {
-    let total_cost = session.num_mutated_accounts(sender)
-        * gas_status
-            .cost_table()
-            .gas_constants
-            .global_memory_per_byte_write_cost
-            .mul(gas_status.cost_table().gas_constants.default_account_size)
-            .get();
-    gas_status
-        .deduct_gas(InternalGasUnits::new(total_cost))
-        .map_err(|p_err| p_err.finish(Location::Undefined).into_vm_status())
-}
-
-pub(crate) fn get_transaction_output<A: AccessPathCache, S: MoveResolver>(
+pub(crate) fn get_transaction_output<A: AccessPathCache>(
     ap_cache: &mut A,
-    session: Session<S>,
-    gas_left: GasUnits<GasCarrier>,
-    txn_data: &TransactionMetadata,
-    status: KeptVMStatus,
-) -> Result<TransactionOutput, VMStatus> {
-    let gas_used: u64 = txn_data.max_gas_amount().sub(gas_left).get();
+    session: SessionExt,
+    fee_statement: FeeStatement,
+    status: ExecutionStatus,
+    change_set_configs: &ChangeSetConfigs,
+) -> Result<VMOutput, VMStatus> {
+    let change_set = session.finish(ap_cache, change_set_configs)?;
 
-    let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
-    let (write_set, events) = convert_changeset_and_events_cached(ap_cache, changeset, events)?;
-
-    Ok(TransactionOutput::new(
-        write_set,
-        events,
-        gas_used,
+    Ok(VMOutput::new(
+        change_set,
+        fee_statement,
         TransactionStatus::Keep(status),
     ))
-}
-
-pub(crate) fn get_gas_currency_code(txn: &SignedTransaction) -> Result<Identifier, VMStatus> {
-    let currency_code_string = txn.gas_currency_code();
-    match account_config::from_currency_code_string(currency_code_string) {
-        Ok(code) => Ok(code),
-        Err(_) => Err(VMStatus::Error(StatusCode::INVALID_GAS_SPECIFIER)),
-    }
-}
-
-pub(crate) fn get_currency_info<S: MoveResolver>(
-    currency_code: &IdentStr,
-    remote_cache: &S,
-) -> Result<CurrencyInfoResource, VMStatus> {
-    if let Ok(Some(blob)) = remote_cache.get_resource(
-        &account_config::diem_root_address(),
-        &CurrencyInfoResource::struct_tag_for(currency_code.to_owned()),
-    ) {
-        let x = bcs::from_bytes::<CurrencyInfoResource>(&blob)
-            .map_err(|_| VMStatus::Error(StatusCode::CURRENCY_INFO_DOES_NOT_EXIST))?;
-        Ok(x)
-    } else {
-        Err(VMStatus::Error(StatusCode::CURRENCY_INFO_DOES_NOT_EXIST))
-    }
 }
 
 #[test]
@@ -676,6 +670,6 @@ fn vm_thread_safe() {
 
     assert_send::<DiemVM>();
     assert_sync::<DiemVM>();
-    assert_send::<MoveVM>();
-    assert_sync::<MoveVM>();
+    assert_send::<MoveVmExt>();
+    assert_sync::<MoveVmExt>();
 }

@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
@@ -8,22 +9,19 @@ use std::{fmt, str::FromStr};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Metadata {
     /// The level of verbosity of the event
+    #[serde(skip_serializing)]
     level: Level,
 
     /// The part of the system where the event occurred
-    target: &'static str,
+    package: &'static str,
 
     /// The name of the Rust module where the event occurred
+    // do not emit this field into the json logs since source.location is already more useful
+    #[serde(skip)]
     module_path: &'static str,
 
-    /// The name of the source code file where the event occurred
+    /// The source code file path and line number together as 'file_path:line'
     file: &'static str,
-
-    /// The line number in the source code file where the event occurred
-    line: u32,
-
-    /// The file name and line number together 'file:line'
-    location: &'static str,
 }
 
 impl Metadata {
@@ -31,17 +29,13 @@ impl Metadata {
         level: Level,
         target: &'static str,
         module_path: &'static str,
-        file: &'static str,
-        line: u32,
-        location: &'static str,
+        source_path: &'static str,
     ) -> Self {
         Self {
             level,
-            target,
+            package: target,
             module_path,
-            file,
-            line,
-            location,
+            file: source_path,
         }
     }
 
@@ -54,23 +48,15 @@ impl Metadata {
     }
 
     pub fn target(&self) -> &'static str {
-        self.target
+        self.package
     }
 
     pub fn module_path(&self) -> &'static str {
         self.module_path
     }
 
-    pub fn file(&self) -> &'static str {
+    pub fn source_path(&self) -> &'static str {
         self.file
-    }
-
-    pub fn line(&self) -> u32 {
-        self.line
-    }
-
-    pub fn location(&self) -> &'static str {
-        self.location
     }
 }
 
@@ -124,6 +110,7 @@ pub struct LevelParseError;
 
 impl FromStr for Level {
     type Err = LevelParseError;
+
     fn from_str(level: &str) -> Result<Level, Self::Err> {
         LOG_LEVEL_NAMES
             .iter()

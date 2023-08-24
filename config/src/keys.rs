@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This file implements a KeyPair data structure.
@@ -12,22 +13,24 @@
 //! while ignored during serialization.
 //!
 
-use diem_crypto::PrivateKey;
+use diem_crypto::{
+    CryptoMaterialError, PrivateKey, ValidCryptoMaterial, ValidCryptoMaterialStringExt,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// ConfigKey places a clonable wrapper around PrivateKeys for config purposes only. The only time
-/// configs have keys is either for testing or for low security requirements. Diem recommends that
+/// configs have keys is either for testing or for low security requirements. We recommend that
 /// keys be stored in key managers. If we make keys unclonable, then the configs must be mutable
 /// and that becomes a requirement strictly as a result of supporting test environments, which is
 /// undesirable. Hence this internal wrapper allows for keys to be clonable but only from configs.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigKey<T: PrivateKey + Serialize> {
     #[serde(bound(deserialize = "T: Deserialize<'de>"))]
-    pub(crate) key: T,
+    key: T,
 }
 
-impl<T: DeserializeOwned + PrivateKey + Serialize> ConfigKey<T> {
-    pub(crate) fn new(key: T) -> Self {
+impl<T: DeserializeOwned + PrivateKey + ValidCryptoMaterial + Serialize> ConfigKey<T> {
+    pub fn new(key: T) -> Self {
         Self { key }
     }
 
@@ -37,6 +40,10 @@ impl<T: DeserializeOwned + PrivateKey + Serialize> ConfigKey<T> {
 
     pub fn public_key(&self) -> T::PublicKeyMaterial {
         diem_crypto::PrivateKey::public_key(&self.key)
+    }
+
+    pub fn from_encoded_string(str: &str) -> Result<Self, CryptoMaterialError> {
+        Ok(Self::new(T::from_encoded_string(str)?))
     }
 }
 

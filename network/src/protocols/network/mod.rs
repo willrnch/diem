@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Convenience Network API for Diem
@@ -13,27 +14,26 @@ use crate::{
     transport::ConnectionMetadata,
     ProtocolId,
 };
-use async_trait::async_trait;
-use bytes::Bytes;
-use channel::diem_channel;
+use diem_channels::{diem_channel, message_queues::QueueStyle};
 use diem_logger::prelude::*;
+use diem_short_hex_str::AsShortHexStr;
 use diem_types::{network_address::NetworkAddress, PeerId};
+use bytes::Bytes;
 use futures::{
     channel::oneshot,
-    future,
-    stream::{FilterMap, FusedStream, Map, Select, Stream, StreamExt},
+    stream::{FusedStream, Map, Select, Stream, StreamExt},
     task::{Context, Poll},
 };
+use futures_util::FutureExt;
 use pin_project::pin_project;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use short_hex_str::AsShortHexStr;
-use std::{cmp::min, iter::FromIterator, marker::PhantomData, pin::Pin, time::Duration};
-
-use super::wire::handshake::v1::ProtocolIdSet;
-use std::fmt::Debug;
+use serde::{de::DeserializeOwned, Serialize};
+use std::{cmp::min, fmt::Debug, marker::PhantomData, pin::Pin, time::Duration};
 
 pub trait Message: DeserializeOwned + Serialize {}
 impl<T: DeserializeOwned + Serialize> Message for T {}
+
+// TODO: do we want to make this configurable?
+const MAX_DESERIALIZATION_QUEUE_SIZE_PER_PEER: usize = 50;
 
 /// Events received by network clients in a validator
 ///
@@ -72,7 +72,7 @@ impl<TMessage: PartialEq> PartialEq for Event<TMessage> {
             // ignore oneshot::Sender in comparison
             (RpcRequest(pid1, msg1, proto1, _), RpcRequest(pid2, msg2, proto2, _)) => {
                 pid1 == pid2 && msg1 == msg2 && proto1 == proto2
-            }
+            },
             (NewPeer(metadata1), NewPeer(metadata2)) => metadata1 == metadata2,
             (LostPeer(metadata1), LostPeer(metadata2)) => metadata1 == metadata2,
             _ => false,
@@ -80,52 +80,68 @@ impl<TMessage: PartialEq> PartialEq for Event<TMessage> {
     }
 }
 
-/// Configuration needed for DiemNet applications to register with the network
-/// builder. Supports client-only, service-only, and p2p (both) applications.
-// TODO(philiphayes): separate configs for client & server?
-#[derive(Clone, Default)]
-pub struct AppConfig {
-    /// The set of protocols needed for this application.
-    pub protocols: ProtocolIdSet,
-    /// The config for the inbound message queue from network to the application.
-    /// Used for specifying the queue style (e.g. FIFO vs LIFO) and sub-queue max
-    /// capacity.
-    // TODO(philiphayes): only relevant for services
-    // TODO(philiphayes): in the future, use a Service trait here instead?
-    pub inbound_queue: Option<diem_channel::Config>,
+/// Configuration needed for the client side of DiemNet applications
+#[derive(Clone)]
+pub struct NetworkClientConfig {
+    /// Direct send protocols for the application (sorted by preference, highest to lowest)
+    pub direct_send_protocols_and_preferences: Vec<ProtocolId>,
+    /// RPC protocols for the application (sorted by preference, highest to lowest)
+    pub rpc_protocols_and_preferences: Vec<ProtocolId>,
 }
 
-impl AppConfig {
-    /// DiemNet client configuration. Requires the set of protocols used by the
-    /// client in its requests.
-    pub fn client(protocols: impl IntoIterator<Item = ProtocolId>) -> Self {
-        Self {
-            protocols: ProtocolIdSet::from_iter(protocols),
-            inbound_queue: None,
-        }
-    }
-
-    /// DiemNet service configuration. Requires both the set of protocols this
-    /// service can handle and the queue configuration.
-    pub fn service(
-        protocols: impl IntoIterator<Item = ProtocolId>,
-        inbound_queue: diem_channel::Config,
+impl NetworkClientConfig {
+    pub fn new(
+        direct_send_protocols_and_preferences: Vec<ProtocolId>,
+        rpc_protocols_and_preferences: Vec<ProtocolId>,
     ) -> Self {
         Self {
-            protocols: ProtocolIdSet::from_iter(protocols),
-            inbound_queue: Some(inbound_queue),
+            direct_send_protocols_and_preferences,
+            rpc_protocols_and_preferences,
         }
     }
+}
 
-    /// DiemNet peer-to-peer service configuration. A peer-to-peer service is both
-    /// a client and a service.
-    pub fn p2p(
-        protocols: impl IntoIterator<Item = ProtocolId>,
-        inbound_queue: diem_channel::Config,
+/// Configuration needed for the service side of DiemNet applications
+#[derive(Clone)]
+pub struct NetworkServiceConfig {
+    /// Direct send protocols for the application (sorted by preference, highest to lowest)
+    pub direct_send_protocols_and_preferences: Vec<ProtocolId>,
+    /// RPC protocols for the application (sorted by preference, highest to lowest)
+    pub rpc_protocols_and_preferences: Vec<ProtocolId>,
+    /// The inbound queue config (from the network to the application)
+    pub inbound_queue_config: diem_channel::Config,
+}
+
+impl NetworkServiceConfig {
+    pub fn new(
+        direct_send_protocols_and_preferences: Vec<ProtocolId>,
+        rpc_protocols_and_preferences: Vec<ProtocolId>,
+        inbound_queue_config: diem_channel::Config,
     ) -> Self {
         Self {
-            protocols: ProtocolIdSet::from_iter(protocols),
-            inbound_queue: Some(inbound_queue),
+            direct_send_protocols_and_preferences,
+            rpc_protocols_and_preferences,
+            inbound_queue_config,
+        }
+    }
+}
+
+/// Configuration needed for DiemNet applications to register with the network
+/// builder. Supports client and service side.
+#[derive(Clone)]
+pub struct NetworkApplicationConfig {
+    pub network_client_config: NetworkClientConfig,
+    pub network_service_config: NetworkServiceConfig,
+}
+
+impl NetworkApplicationConfig {
+    pub fn new(
+        network_client_config: NetworkClientConfig,
+        network_service_config: NetworkServiceConfig,
+    ) -> Self {
+        Self {
+            network_client_config,
+            network_service_config,
         }
     }
 }
@@ -141,11 +157,7 @@ impl AppConfig {
 pub struct NetworkEvents<TMessage> {
     #[pin]
     event_stream: Select<
-        FilterMap<
-            diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
-            future::Ready<Option<Event<TMessage>>>,
-            fn(PeerManagerNotification) -> future::Ready<Option<Event<TMessage>>>,
-        >,
+        diem_channel::Receiver<PeerId, Event<TMessage>>,
         Map<
             diem_channel::Receiver<PeerId, ConnectionNotification>,
             fn(ConnectionNotification) -> Event<TMessage>,
@@ -159,22 +171,66 @@ pub trait NewNetworkEvents {
     fn new(
         peer_mgr_notifs_rx: diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
         connection_notifs_rx: diem_channel::Receiver<PeerId, ConnectionNotification>,
+        max_parallel_deserialization_tasks: Option<usize>,
     ) -> Self;
 }
 
-impl<TMessage: Message> NewNetworkEvents for NetworkEvents<TMessage> {
+impl<TMessage: Message + Send + 'static> NewNetworkEvents for NetworkEvents<TMessage> {
     fn new(
         peer_mgr_notifs_rx: diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
         connection_notifs_rx: diem_channel::Receiver<PeerId, ConnectionNotification>,
+        max_parallel_deserialization_tasks: Option<usize>,
     ) -> Self {
-        let data_event_stream = peer_mgr_notifs_rx.filter_map(
-            peer_mgr_notif_to_event
-                as fn(PeerManagerNotification) -> future::Ready<Option<Event<TMessage>>>,
+        // Create a channel for deserialized messages
+        let (deserialized_message_sender, deserialized_message_receiver) = diem_channel::new(
+            QueueStyle::FIFO,
+            MAX_DESERIALIZATION_QUEUE_SIZE_PER_PEER,
+            None,
         );
+
+        // Deserialize the peer manager notifications in parallel (for each
+        // network application) and send them to the receiver. Note: this
+        // may cause out of order message delivery, but applications
+        // should already be handling this.
+        tokio::spawn(async move {
+            peer_mgr_notifs_rx
+                .for_each_concurrent(
+                    max_parallel_deserialization_tasks,
+                    move |peer_manager_notification| {
+                        // Get the peer ID for the notification
+                        let deserialized_message_sender = deserialized_message_sender.clone();
+                        let peer_id_for_notification = peer_manager_notification.get_peer_id();
+
+                        // Spawn a new blocking task to deserialize the message
+                        tokio::task::spawn_blocking(move || {
+                            if let Some(deserialized_message) =
+                                peer_mgr_notif_to_event(peer_manager_notification)
+                            {
+                                if let Err(error) = deserialized_message_sender
+                                    .push(peer_id_for_notification, deserialized_message)
+                                {
+                                    warn!(
+                                        "Failed to send deserialized message to receiver: {:?}",
+                                        error
+                                    );
+                                }
+                            }
+                        })
+                        .map(|_| ())
+                    },
+                )
+                .await
+        });
+
+        // Process the control messages
         let control_event_stream = connection_notifs_rx
             .map(control_msg_to_event as fn(ConnectionNotification) -> Event<TMessage>);
+
         Self {
-            event_stream: ::futures::stream::select(data_event_stream, control_event_stream),
+            event_stream: ::futures::stream::select(
+                deserialized_message_receiver,
+                control_event_stream,
+            ),
             _marker: PhantomData,
         }
     }
@@ -195,18 +251,17 @@ impl<TMessage> Stream for NetworkEvents<TMessage> {
 /// Deserialize inbound direct send and rpc messages into the application `TMessage`
 /// type, logging and dropping messages that fail to deserialize.
 fn peer_mgr_notif_to_event<TMessage: Message>(
-    notif: PeerManagerNotification,
-) -> future::Ready<Option<Event<TMessage>>> {
-    let maybe_event = match notif {
+    notification: PeerManagerNotification,
+) -> Option<Event<TMessage>> {
+    match notification {
         PeerManagerNotification::RecvRpc(peer_id, rpc_req) => {
             request_to_network_event(peer_id, &rpc_req)
                 .map(|msg| Event::RpcRequest(peer_id, msg, rpc_req.protocol_id, rpc_req.res_tx))
-        }
+        },
         PeerManagerNotification::RecvMessage(peer_id, request) => {
             request_to_network_event(peer_id, &request).map(|msg| Event::Message(peer_id, msg))
-        }
-    };
-    future::ready(maybe_event)
+        },
+    }
 }
 
 /// Converts a `SerializedRequest` into a network `Event` for sending to other nodes
@@ -226,7 +281,7 @@ fn request_to_network_event<TMessage: Message, Request: SerializedRequest>(
                 data_prefix = hex::encode(&data[..min(16, data.len())]),
             );
             None
-        }
+        },
     }
 }
 
@@ -253,8 +308,7 @@ impl<TMessage> FusedStream for NetworkEvents<TMessage> {
 /// a thin wrapper on `diem_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>`,
 /// mostly focused on providing a more ergonomic API. However, network applications will usually
 /// provide their own thin wrapper around `NetworkSender` that narrows the API to the specific
-/// interface they need. For instance, `mempool` only requires direct-send functionality so its
-/// `MempoolNetworkSender` only exposes a `send_to` function.
+/// interface they need.
 ///
 /// Provide Protobuf wrapper over `[peer_manager::PeerManagerRequestSender]`
 #[derive(Clone, Debug)]
@@ -351,30 +405,6 @@ impl<TMessage: Message> NetworkSender<TMessage> {
     }
 }
 
-/// A simplified version of `NetworkSender` that doesn't use `ProtocolId` in the input
-/// It was already being implemented for every application, but is now standardized
-#[async_trait]
-pub trait ApplicationNetworkSender<TMessage: Send>: Clone {
-    fn send_to(&self, _recipient: PeerId, _message: TMessage) -> Result<(), NetworkError> {
-        unimplemented!()
-    }
-
-    fn send_to_many(
-        &self,
-        _recipients: impl Iterator<Item = PeerId>,
-        _message: TMessage,
-    ) -> Result<(), NetworkError> {
-        unimplemented!()
-    }
-
-    async fn send_rpc(
-        &self,
-        recipient: PeerId,
-        req_msg: TMessage,
-        timeout: Duration,
-    ) -> Result<TMessage, RpcError>;
-}
-
 /// Generalized functionality for any request across `DirectSend` and `Rpc`.
 pub trait SerializedRequest {
     fn protocol_id(&self) -> ProtocolId;
@@ -382,7 +412,7 @@ pub trait SerializedRequest {
 
     /// Converts the `SerializedMessage` into its deserialized version of `TMessage` based on the
     /// `ProtocolId`.  See: [`ProtocolId::from_bytes`]
-    fn to_message<'a, TMessage: Deserialize<'a>>(&'a self) -> anyhow::Result<TMessage> {
+    fn to_message<TMessage: DeserializeOwned>(&self) -> anyhow::Result<TMessage> {
         self.protocol_id().from_bytes(self.data())
     }
 }

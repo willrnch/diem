@@ -1,51 +1,73 @@
 [package]
-name = "forge"
+name = "diem-forge"
+description = "Diem end to end test framework"
 version = "0.0.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Forged in Fire"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-anyhow = { version = "1.0.52", features = ["backtrace"] }
-async-trait = "0.1.42"
-base64 = "0.13.0"
-futures = "0.3.12"
-hyper = { version = "0.14.4", features = ["full"] }
-hyper-proxy = "0.9.1"
-hyper-tls = "0.5.0"
-itertools = "0.10.0"
-k8s-openapi = { version = "0.11.0", default-features = false, features = ["v1_15"] }
-kube = "0.51.0"
-rand = "0.8.3"
-rand_core = "0.6.2"
-rayon = "1.5.0"
-regex = "1.4.3"
-reqwest = { version = "0.11.2", features = ["blocking", "json"] }
-rusoto_core = "0.46.0"
-rusoto_credential = "0.46.0"
-rusoto_eks = "0.46.0"
-rusoto_sts = "0.46.0"
-serde = { version = "1.0.124", features = ["derive"] }
-serde_json = "1.0.64"
-structopt = "0.3.21"
-tempfile = "3.2.0"
-termcolor = "1.1.2"
-tokio = { version = "1.8.1", features = ["full"] }
-url = "2.2.2"
+again = { workspace = true }
+anyhow = { workspace = true, features = ["backtrace"] }
+diem = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-cli-common = { workspace = true }
+diem-config = { workspace = true }
+diem-db = { workspace = true }
+diem-framework = { workspace = true }
+diem-genesis = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-infallible = { workspace = true }
+diem-inspection-service = { workspace = true }
+diem-logger = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-retrier = { workspace = true }
+diem-sdk = { workspace = true }
+diem-secure-storage = { workspace = true }
+diem-short-hex-str = { workspace = true }
+diem-state-sync-driver = { workspace = true }
+diem-transaction-emitter-lib = { workspace = true }
+diem-transaction-generator-lib = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["env", "unstable-styles"] }
+either = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hyper = { workspace = true }
+hyper-tls = { workspace = true }
+itertools = { workspace = true }
+json-patch = { workspace = true }
+k8s-openapi = { version = "0.13.1", default-features = false, features = [
+    "v1_22",
+] }
+kube = { version = "0.65.0", default-features = false, features = [
+    "jsonpatch",
+    "client",
+    "rustls-tls",
+] }
+num_cpus = { workspace = true }
+once_cell = { workspace = true }
+prometheus-http-query = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+termcolor = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
 
-debug-interface = { path = "../../crates/debug-interface" }
-diem-config = { path = "../../config" }
-diem-framework-releases = { path = "../../diem-move/diem-framework/DPN/releases" }
-diem-genesis-tool = { path = "../../config/management/genesis" }
-diem-logger = { path = "../../crates/diem-logger" }
-diem-retrier = { path = "../../crates/diem-retrier" }
-diem-sdk = { path = "../../sdk" }
-diem-rest-client = { path = "../../crates/diem-rest-client"}
-diem-secure-storage = { path = "../../secure/storage" }
-diem-transaction-builder = { path = "../../sdk/transaction-builder" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-transaction-emitter = { path = "../../crates/transaction-emitter" }
+[features]
+default = []
+testing = ["diem-global-constants/testing"]

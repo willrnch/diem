@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -8,9 +9,9 @@ use crate::{
     persistent_liveness_storage::PersistentLivenessStorage,
 };
 use anyhow::bail;
-use consensus_types::{
+use diem_consensus_types::{
     executed_block::ExecutedBlock, quorum_cert::QuorumCert,
-    timeout_2chain::TwoChainTimeoutCertificate, timeout_certificate::TimeoutCertificate,
+    timeout_2chain::TwoChainTimeoutCertificate,
 };
 use diem_crypto::HashValue;
 use diem_logger::prelude::*;
@@ -21,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-/// This structure is a wrapper of [`ExecutedBlock`](crate::consensus_types::block::ExecutedBlock)
+/// This structure is a wrapper of [`ExecutedBlock`](diem_consensus_types::executed_block::ExecutedBlock)
 /// that adds `children` field to know the parent-child relationship between blocks.
 struct LinkableBlock {
     /// Executed block that has raw block data and execution output.
@@ -76,14 +77,12 @@ pub struct BlockTree {
 
     /// The quorum certificate of highest_certified_block
     highest_quorum_cert: Arc<QuorumCert>,
-    /// The highest timeout certificate (if any).
-    highest_timeout_cert: Option<Arc<TimeoutCertificate>>,
     /// The highest 2-chain timeout certificate (if any).
     highest_2chain_timeout_cert: Option<Arc<TwoChainTimeoutCertificate>>,
     /// The quorum certificate that has highest commit info.
     highest_ordered_cert: Arc<QuorumCert>,
     /// The quorum certificate that has highest commit decision info.
-    highest_ledger_info: LedgerInfoWithSignatures,
+    highest_commit_cert: Arc<QuorumCert>,
     /// Map of block id to its completed quorum certificate (2f + 1 votes)
     id_to_quorum_cert: HashMap<HashValue, Arc<QuorumCert>>,
     /// To keep the IDs of the elements that have been pruned from the tree but not cleaned up yet.
@@ -97,9 +96,8 @@ impl BlockTree {
         root: ExecutedBlock,
         root_quorum_cert: QuorumCert,
         root_ordered_cert: QuorumCert,
-        root_commit_ledger_info: LedgerInfoWithSignatures,
+        root_commit_cert: QuorumCert,
         max_pruned_blocks_in_mem: usize,
-        highest_timeout_cert: Option<Arc<TimeoutCertificate>>,
         highest_2chain_timeout_cert: Option<Arc<TwoChainTimeoutCertificate>>,
     ) -> Self {
         assert_eq!(
@@ -128,9 +126,8 @@ impl BlockTree {
             commit_root_id: root_id, // initially we set commit_root_id = root_id
             highest_certified_block_id: root_id,
             highest_quorum_cert: Arc::clone(&root_quorum_cert),
-            highest_timeout_cert,
             highest_ordered_cert: Arc::new(root_ordered_cert),
-            highest_ledger_info: root_commit_ledger_info,
+            highest_commit_cert: Arc::new(root_commit_cert),
             id_to_quorum_cert,
             pruned_block_ids,
             max_pruned_blocks_in_mem,
@@ -200,10 +197,6 @@ impl BlockTree {
         Arc::clone(&self.highest_quorum_cert)
     }
 
-    pub(super) fn highest_timeout_cert(&self) -> Option<Arc<TimeoutCertificate>> {
-        self.highest_timeout_cert.clone()
-    }
-
     pub(super) fn highest_2chain_timeout_cert(&self) -> Option<Arc<TwoChainTimeoutCertificate>> {
         self.highest_2chain_timeout_cert.clone()
     }
@@ -213,17 +206,12 @@ impl BlockTree {
         self.highest_2chain_timeout_cert.replace(tc);
     }
 
-    /// Replace highest timeout cert with the given value.
-    pub(super) fn replace_timeout_cert(&mut self, tc: Arc<TimeoutCertificate>) {
-        self.highest_timeout_cert.replace(tc);
-    }
-
     pub(super) fn highest_ordered_cert(&self) -> Arc<QuorumCert> {
         Arc::clone(&self.highest_ordered_cert)
     }
 
-    pub(super) fn highest_ledger_info(&self) -> LedgerInfoWithSignatures {
-        self.highest_ledger_info.clone()
+    pub(super) fn highest_commit_cert(&self) -> Arc<QuorumCert> {
+        Arc::clone(&self.highest_commit_cert)
     }
 
     pub(super) fn get_quorum_cert_for_block(
@@ -258,12 +246,10 @@ impl BlockTree {
         }
     }
 
-    fn update_highest_ledger_info(&mut self, new_ledger_info_with_sig: LedgerInfoWithSignatures) {
-        if new_ledger_info_with_sig.commit_info().round()
-            > self.highest_ledger_info.commit_info().round()
-        {
-            self.highest_ledger_info = new_ledger_info_with_sig;
-            self.update_commit_root(self.highest_ledger_info.commit_info().id());
+    fn update_highest_commit_cert(&mut self, new_commit_cert: QuorumCert) {
+        if new_commit_cert.commit_info().round() > self.highest_commit_cert.commit_info().round() {
+            self.highest_commit_cert = Arc::new(new_commit_cert);
+            self.update_commit_root(self.highest_commit_cert.commit_info().id());
         }
     }
 
@@ -290,7 +276,7 @@ impl BlockTree {
                     self.highest_certified_block_id = block.id();
                     self.highest_quorum_cert = Arc::clone(&qc);
                 }
-            }
+            },
             None => bail!("Block {} not found", block_id),
         }
 
@@ -392,11 +378,11 @@ impl BlockTree {
             match self.get_block(&cur_block_id) {
                 Some(ref block) if block.round() <= root_round => {
                     break;
-                }
+                },
                 Some(block) => {
                     cur_block_id = block.parent_id();
                     res.push(block);
-                }
+                },
                 None => return None,
             }
         }
@@ -427,17 +413,18 @@ impl BlockTree {
         self.max_pruned_blocks_in_mem
     }
 
-    pub(super) fn get_all_block_id(&self) -> Vec<HashValue> {
-        self.id_to_block.keys().cloned().collect()
-    }
-
     /// Update the counters for committed blocks and prune them from the in-memory and persisted store.
     pub fn commit_callback(
         &mut self,
         storage: Arc<dyn PersistentLivenessStorage>,
         blocks_to_commit: &[Arc<ExecutedBlock>],
-        commit_proof: LedgerInfoWithSignatures,
+        finality_proof: QuorumCert,
+        commit_decision: LedgerInfoWithSignatures,
     ) {
+        let commit_proof = finality_proof
+            .create_merged_with_executed_state(commit_decision)
+            .expect("Inconsistent commit proof and evaluation decision, cannot commit block");
+
         let block_to_commit = blocks_to_commit.last().unwrap().clone();
         update_counters_for_committed_blocks(blocks_to_commit);
         let current_round = self.commit_root().round();
@@ -453,10 +440,10 @@ impl BlockTree {
             // it's fine to fail here, as long as the commit succeeds, the next restart will clean
             // up dangling blocks, and we need to prune the tree to keep the root consistent with
             // executor.
-            error!(error = ?e, "fail to delete block");
+            warn!(error = ?e, "fail to delete block");
         }
         self.process_pruned_blocks(id_to_remove);
-        self.update_highest_ledger_info(commit_proof);
+        self.update_highest_commit_cert(commit_proof);
     }
 }
 

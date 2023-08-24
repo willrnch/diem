@@ -1,13 +1,13 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Global logger definition and functions
 
-use crate::{counters::STRUCT_LOG_COUNT, Event, Metadata};
-
+use crate::{counters::STRUCT_LOG_COUNT, error, Event, Metadata};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use tracing_subscriber::Layer;
+use tracing_subscriber::prelude::*;
 
 /// The global `Logger`
 static LOGGER: OnceCell<Arc<dyn Logger>> = OnceCell::new();
@@ -41,17 +41,39 @@ pub(crate) fn enabled(metadata: &Metadata) -> bool {
 }
 
 /// Sets the global `Logger` exactly once
-pub fn set_global_logger(logger: Arc<dyn Logger>) {
+pub fn set_global_logger(logger: Arc<dyn Logger>, tokio_console_port: Option<u16>) {
     if LOGGER.set(logger).is_err() {
         eprintln!("Global logger has already been set");
+        error!("Global logger has already been set");
+        return;
     }
-    let _ = tracing::subscriber::set_global_default(
-        crate::tracing_adapter::TracingToDiemLoggerLayer
-            .with_subscriber(tracing_subscriber::Registry::default()),
-    );
+
+    // If tokio-console is enabled, all tracing::log events are captured by the
+    // tokio-tracing infrastructure. Otherwise, diem-logger intercepts all
+    // tracing::log events. In both scenarios *all* diem-logger::log events are
+    // captured by the diem-logger (as usual).
+    #[cfg(feature = "tokio-console")]
+    {
+        if let Some(tokio_console_port) = tokio_console_port {
+            let console_layer = console_subscriber::ConsoleLayer::builder()
+                .server_addr(([0, 0, 0, 0], tokio_console_port))
+                .spawn();
+
+            tracing_subscriber::registry().with(console_layer).init();
+            return;
+        }
+    }
+    if tokio_console_port.is_none() {
+        let _ = tracing::subscriber::set_global_default(
+            crate::tracing_adapter::TracingToDiemDataLayer
+                .with_subscriber(tracing_subscriber::Registry::default()),
+        );
+    } else {
+        error!("tokio_console_port was set but has no effect! Build the crate with the 'tokio-console' feature enabled!");
+    }
 }
 
-/// Flush the global `Logger`
+/// Flush the global `Logger`. Note this is expensive, only use off the critical path.
 pub fn flush() {
     if let Some(logger) = LOGGER.get() {
         logger.flush();

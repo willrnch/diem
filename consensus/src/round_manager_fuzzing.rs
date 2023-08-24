@@ -1,25 +1,37 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     block_storage::BlockStore,
     liveness::{
-        proposal_generator::ProposalGenerator,
+        proposal_generator::{
+            ChainHealthBackoffConfig, PipelineBackpressureConfig, ProposalGenerator,
+        },
         rotating_proposer_election::RotatingProposer,
         round_state::{ExponentialTimeInterval, NewRoundEvent, NewRoundReason, RoundState},
     },
     metrics_safety_rules::MetricsSafetyRules,
     network::NetworkSender,
-    network_interface::ConsensusNetworkSender,
+    network_interface::{ConsensusNetworkClient, DIRECT_SEND, RPC},
+    payload_manager::PayloadManager,
     persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
     round_manager::RoundManager,
-    test_utils::{EmptyStateComputer, MockStorage, MockTransactionManager},
+    test_utils::{EmptyStateComputer, MockPayloadManager, MockStorage},
     util::{mock_time_service::SimulatedTimeService, time_service::TimeService},
 };
-use channel::{self, diem_channel, message_queues::QueueStyle};
-use consensus_types::proposal_msg::ProposalMsg;
+use diem_channels::{self, diem_channel, message_queues::QueueStyle};
+use diem_config::{config::ConsensusConfig, network_id::NetworkId};
+use diem_consensus_types::proposal_msg::ProposalMsg;
 use diem_infallible::Mutex;
+use diem_network::{
+    application::{interface::NetworkClient, storage::PeersAndMetadata},
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::{network, network::NewNetworkSender},
+};
+use diem_safety_rules::{test_utils, SafetyRules, TSafetyRules};
 use diem_types::{
+    aggregate_signature::AggregateSignature,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -29,13 +41,9 @@ use diem_types::{
     validator_verifier::ValidatorVerifier,
 };
 use futures::{channel::mpsc, executor::block_on};
-use network::{
-    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
-    protocols::network::NewNetworkSender,
-};
+use maplit::hashmap;
 use once_cell::sync::Lazy;
-use safety_rules::{test_utils, SafetyRules, TSafetyRules};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::runtime::Runtime;
 
 // This generates a proposal for round 1
@@ -47,6 +55,8 @@ pub fn generate_corpus_proposal() -> Vec<u8> {
                 round: 1,
                 reason: NewRoundReason::QCReady,
                 timeout: std::time::Duration::new(5, 0),
+                prev_round_votes: Vec::new(),
+                prev_round_timeout_votes: None,
             })
             .await;
         // serialize and return proposal
@@ -72,16 +82,17 @@ fn build_empty_store(
         10, // max pruned blocks in mem
         Arc::new(SimulatedTimeService::new()),
         10,
+        Arc::from(PayloadManager::DirectMempool),
     ))
 }
 
 // helpers for safety rule initialization
 fn make_initial_epoch_change_proof(signer: &ValidatorSigner) -> EpochChangeProof {
     let validator_info =
-        ValidatorInfo::new_with_test_network_keys(signer.author(), signer.public_key(), 1);
+        ValidatorInfo::new_with_test_network_keys(signer.author(), signer.public_key(), 1, 0);
     let validator_set = ValidatorSet::new(vec![validator_info]);
     let li = LedgerInfo::mock_genesis(Some(validator_set));
-    let lis = LedgerInfoWithSignatures::new(li, BTreeMap::new());
+    let lis = LedgerInfoWithSignatures::new(li, AggregateSignature::empty());
     EpochChangeProof::new(vec![lis], false)
 }
 
@@ -89,7 +100,7 @@ fn make_initial_epoch_change_proof(signer: &ValidatorSigner) -> EpochChangeProof
 fn create_round_state() -> RoundState {
     let base_timeout = std::time::Duration::new(60, 0);
     let time_interval = Box::new(ExponentialTimeInterval::fixed(base_timeout));
-    let (round_timeout_sender, _) = channel::new_test(1_024);
+    let (round_timeout_sender, _) = diem_channels::new_test(1_024);
     let time_service = Arc::new(SimulatedTimeService::new());
     RoundState::new(time_interval, time_service, round_timeout_sender)
 }
@@ -108,17 +119,25 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: remove
     let proof = make_initial_epoch_change_proof(&signer);
-    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer), false, false);
+    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer));
     safety_rules.initialize(&proof).unwrap();
 
     // TODO: mock channels
     let (network_reqs_tx, _network_reqs_rx) = diem_channel::new(QueueStyle::FIFO, 8, None);
     let (connection_reqs_tx, _) = diem_channel::new(QueueStyle::FIFO, 8, None);
-    let network_sender = ConsensusNetworkSender::new(
+    let network_sender = network::NetworkSender::new(
         PeerManagerRequestSender::new(network_reqs_tx),
         ConnectionRequestSender::new(connection_reqs_tx),
     );
-    let (self_sender, _self_receiver) = channel::new_test(8);
+    let network_client = NetworkClient::new(
+        DIRECT_SEND.into(),
+        RPC.into(),
+        hashmap! {NetworkId::Validator => network_sender},
+        PeersAndMetadata::new(&[NetworkId::Validator]),
+    );
+    let consensus_network_client = ConsensusNetworkClient::new(network_client);
+
+    let (self_sender, _self_receiver) = diem_channels::new_test(8);
 
     let epoch_state = EpochState {
         epoch: 1,
@@ -126,7 +145,7 @@ fn create_node_for_fuzzing() -> RoundManager {
     };
     let network = NetworkSender::new(
         signer.author(),
-        network_sender,
+        consensus_network_client,
         self_sender,
         epoch_state.verifier.clone(),
     );
@@ -136,15 +155,21 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: remove
     let time_service = Arc::new(SimulatedTimeService::new());
-    time_service.sleep(Duration::from_millis(1));
+    block_on(time_service.sleep(Duration::from_millis(1)));
 
     // TODO: remove
     let proposal_generator = ProposalGenerator::new(
         signer.author(),
         block_store.clone(),
-        Arc::new(MockTransactionManager::new(None)),
+        Arc::new(MockPayloadManager::new(None)),
         time_service,
+        Duration::ZERO,
         1,
+        1024,
+        10,
+        PipelineBackpressureConfig::new_no_backoff(),
+        ChainHealthBackoffConfig::new_no_backoff(),
+        false,
     );
 
     //
@@ -152,6 +177,8 @@ fn create_node_for_fuzzing() -> RoundManager {
 
     // TODO: have two different nodes, one for proposing, one for accepting a proposal
     let proposer_election = Box::new(RotatingProposer::new(vec![signer.author()], 1));
+
+    let (round_manager_tx, _) = diem_channel::new(QueueStyle::LIFO, 1, None);
 
     // event processor
     RoundManager::new(
@@ -166,8 +193,9 @@ fn create_node_for_fuzzing() -> RoundManager {
         ))),
         network,
         storage,
-        false,
         OnChainConsensusConfig::default(),
+        round_manager_tx,
+        ConsensusConfig::default(),
     )
 }
 
@@ -183,7 +211,7 @@ pub fn fuzz_proposal(data: &[u8]) {
                 panic!();
             }
             return;
-        }
+        },
     };
 
     let proposal = match proposal.verify_well_formed() {
@@ -194,7 +222,7 @@ pub fn fuzz_proposal(data: &[u8]) {
                 panic!();
             }
             return;
-        }
+        },
     };
 
     block_on(async move {

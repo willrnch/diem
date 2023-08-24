@@ -1,6 +1,6 @@
 script {
-    use DiemFramework::DiemTransactionPublishingOption;
+    use diem_framework::transaction_publishing_option;
     fun main(diem_root: signer) {
-        DiemTransactionPublishingOption::halt_all_transactions(&diem_root);
+        transaction_publishing_option::halt_all_transactions(&diem_root);
     }
 }

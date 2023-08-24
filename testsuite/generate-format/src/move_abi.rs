@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_types::transaction;
@@ -17,7 +18,7 @@ pub fn get_registry() -> Result<Registry> {
     // 1. Record samples for types with custom deserializers.
 
     // 2. Trace the main entry point(s) + every enum separately.
-    tracer.trace_type::<transaction::ScriptABI>(&samples)?;
+    tracer.trace_type::<transaction::EntryABI>(&samples)?;
     tracer.trace_type::<language_storage::TypeTag>(&samples)?;
     tracer.registry()
 }

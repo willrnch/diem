@@ -1,14 +1,18 @@
 [package]
-name = "proxy"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-proxy"
 description = "Diem proxy"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-ipnet = "2.3"
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
+ipnet = { workspace = true }
+
+

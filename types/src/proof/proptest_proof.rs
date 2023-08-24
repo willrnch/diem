@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! All proofs generated in this module are not valid proofs. They are only for the purpose of
@@ -10,9 +11,7 @@ use crate::proof::{
     TransactionAccumulatorSummary,
 };
 use diem_crypto::{
-    hash::{
-        CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH,
-    },
+    hash::{CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
 use proptest::{collection::vec, prelude::*};
@@ -72,10 +71,7 @@ where
     }
 }
 
-impl<V> Arbitrary for SparseMerkleProof<V>
-where
-    V: std::fmt::Debug + CryptoHash,
-{
+impl Arbitrary for SparseMerkleProof {
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;
 

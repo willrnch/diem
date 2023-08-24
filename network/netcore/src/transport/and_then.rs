@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::transport::{ConnectionOrigin, Transport};
@@ -34,11 +35,11 @@ where
     // TODO don't require the error types to be the same
     Fut: Future<Output = Result<O, T::Error>> + Send,
 {
-    type Output = O;
     type Error = T::Error;
-    type Listener = AndThenStream<T::Listener, F>;
     type Inbound = AndThenFuture<T::Inbound, Fut, F>;
+    type Listener = AndThenStream<T::Listener, F>;
     type Outbound = AndThenFuture<T::Outbound, Fut, F>;
+    type Output = O;
 
     fn listen_on(
         &self,
@@ -154,18 +155,18 @@ where
 {
     type Output = Result<O2, E>;
 
-    fn poll(self: Pin<&mut Self>, mut context: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
         let mut this = self.project();
         loop {
             let (output, (f, addr, origin)) = match this.chain.as_mut().project() {
                 // Step 1: Drive Fut1 to completion
-                AndThenChainProj::First(fut1, data) => match fut1.poll(&mut context) {
+                AndThenChainProj::First(fut1, data) => match fut1.poll(context) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(output)) => (output, data.take().expect("must be initialized")),
                 },
                 // Step 4: Drive Fut2 to completion
-                AndThenChainProj::Second(fut2) => return fut2.poll(&mut context),
+                AndThenChainProj::Second(fut2) => return fut2.poll(context),
                 AndThenChainProj::Empty => unreachable!(),
             };
 

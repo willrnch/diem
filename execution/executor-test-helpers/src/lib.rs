@@ -1,33 +1,27 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod integration_test_impl;
 
-use diem_config::{config::NodeConfig, utils};
+use diem_config::config::NodeConfig;
 use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     HashValue,
 };
+use diem_executor::db_bootstrapper::{generate_waypoint, maybe_bootstrap};
+use diem_executor_types::StateComputeResult;
+use diem_storage_interface::DbReaderWriter;
 use diem_types::{
     account_address::AccountAddress,
     block_info::BlockInfo,
-    block_metadata::BlockMetadata,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    ledger_info::{generate_ledger_info_with_sig, LedgerInfo, LedgerInfoWithSignatures},
     test_helpers::transaction_test_helpers::get_test_signed_txn,
     transaction::{Transaction, TransactionPayload},
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
 };
-use diem_vm::{DiemVM, VMExecutor};
-use diemdb::DiemDB;
-use executor::db_bootstrapper::{generate_waypoint, maybe_bootstrap};
-use executor_types::StateComputeResult;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    thread::JoinHandle,
-};
-use storage_interface::DbReaderWriter;
-use storage_service::start_storage_service_with_db;
+use diem_vm::VMExecutor;
 
 /// Helper function for test to blindly bootstrap without waypoint.
 pub fn bootstrap_genesis<V: VMExecutor>(
@@ -39,16 +33,6 @@ pub fn bootstrap_genesis<V: VMExecutor>(
     Ok(waypoint)
 }
 
-pub fn start_storage_service() -> (NodeConfig, JoinHandle<()>, DbReaderWriter) {
-    let (mut config, _genesis_key) = diem_genesis_tool::test_config();
-    let server_port = utils::get_available_port();
-    config.storage.address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
-    let (db, db_rw) = DbReaderWriter::wrap(DiemDB::new_for_test(&config.storage.dir()));
-    bootstrap_genesis::<DiemVM>(&db_rw, utils::get_genesis_txn(&config).unwrap()).unwrap();
-    let handle = start_storage_service_with_db(&config, db);
-    (config, handle, db_rw)
-}
-
 pub fn gen_block_id(index: u8) -> HashValue {
     HashValue::new([index; HashValue::LENGTH])
 }
@@ -57,7 +41,7 @@ pub fn gen_ledger_info_with_sigs(
     epoch: u64,
     output: &StateComputeResult,
     commit_block_id: HashValue,
-    signer: Vec<&ValidatorSigner>,
+    signer: &[ValidatorSigner],
 ) -> LedgerInfoWithSignatures {
     let ledger_info = LedgerInfo::new(
         BlockInfo::new(
@@ -71,11 +55,7 @@ pub fn gen_ledger_info_with_sigs(
         ),
         HashValue::zero(),
     );
-    let signatures = signer
-        .iter()
-        .map(|s| (s.author(), s.sign(&ledger_info)))
-        .collect();
-    LedgerInfoWithSignatures::new(ledger_info, signatures)
+    generate_ledger_info_with_sig(signer, ledger_info)
 }
 
 pub fn extract_signer(config: &mut NodeConfig) -> ValidatorSigner {
@@ -83,16 +63,6 @@ pub fn extract_signer(config: &mut NodeConfig) -> ValidatorSigner {
     ValidatorSigner::new(
         sr_test.author,
         sr_test.consensus_key.as_ref().unwrap().private_key(),
-    )
-}
-
-pub fn gen_block_metadata(index: u8, proposer: AccountAddress) -> BlockMetadata {
-    BlockMetadata::new(
-        gen_block_id(index),
-        index as u64,
-        index as u64,
-        vec![],
-        proposer,
     )
 }
 

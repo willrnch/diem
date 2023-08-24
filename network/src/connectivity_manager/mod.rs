@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! The ConnectivityManager actor is responsible for ensuring that we are
@@ -27,6 +28,7 @@
 //! using a relay protocol.
 
 use crate::{
+    application::storage::PeersAndMetadata,
     counters,
     logging::NetworkSchema,
     peer_manager::{self, conn_notifs_channel, ConnectionRequestSender, PeerManagerError},
@@ -39,27 +41,27 @@ use diem_config::{
 use diem_crypto::x25519;
 use diem_infallible::RwLock;
 use diem_logger::prelude::*;
+use diem_netcore::transport::ConnectionOrigin;
+use diem_num_variants::NumVariants;
+use diem_short_hex_str::AsShortHexStr;
 use diem_time_service::{TimeService, TimeServiceTrait};
-use diem_types::{network_address::NetworkAddress, PeerId};
+use diem_types::{account_address::AccountAddress, network_address::NetworkAddress, PeerId};
 use futures::{
     channel::oneshot,
     future::{BoxFuture, FutureExt},
     stream::{FuturesUnordered, StreamExt},
 };
-use netcore::transport::ConnectionOrigin;
-use num_variants::NumVariants;
 use rand::{
     prelude::{SeedableRng, SmallRng},
     seq::SliceRandom,
 };
 use serde::Serialize;
-use short_hex_str::AsShortHexStr;
 use std::{
-    cmp::min,
+    cmp::{min, Ordering},
     collections::{hash_map::Entry, HashMap, HashSet},
     fmt, mem,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio_retry::strategy::jitter;
 
@@ -75,13 +77,18 @@ mod test;
 /// around the same time at startup.
 const MAX_CONNECTION_DELAY_JITTER: Duration = Duration::from_millis(100);
 
+/// The amount of time to try other peers until dialing this peer again.
+///
+/// It's currently set to 5 minutes to ensure rotation through all (or most) peers
+const TRY_DIAL_BACKOFF_TIME: Duration = Duration::from_secs(300);
+
 /// The ConnectivityManager actor.
 pub struct ConnectivityManager<TBackoff> {
     network_context: NetworkContext,
     /// A handle to a time service for easily mocking time-related operations.
     time_service: TimeService,
-    /// Nodes which are eligible to join the network.
-    eligible: Arc<RwLock<PeerSet>>,
+    /// Peers and metadata
+    peers_and_metadata: Arc<PeersAndMetadata>,
     /// PeerId and address of remote peers to which this peer is connected.
     connected: HashMap<PeerId, ConnectionMetadata>,
     /// All information about peers from discovery sources.
@@ -91,7 +98,7 @@ pub struct ConnectivityManager<TBackoff> {
     /// Channel to receive notifications from PeerManager.
     connection_notifs_rx: conn_notifs_channel::Receiver,
     /// Channel over which we receive requests from other actors.
-    requests_rx: channel::Receiver<ConnectivityRequest>,
+    requests_rx: diem_channels::Receiver<ConnectivityRequest>,
     /// Peers queued to be dialed, potentially with some delay. The dial can be canceled by
     /// sending over (or dropping) the associated oneshot sender.
     dial_queue: HashMap<PeerId, oneshot::Sender<()>>,
@@ -122,6 +129,7 @@ pub struct ConnectivityManager<TBackoff> {
 pub enum DiscoverySource {
     OnChainValidatorSet,
     File,
+    Rest,
     Config,
 }
 
@@ -133,15 +141,12 @@ impl fmt::Debug for DiscoverySource {
 
 impl fmt::Display for DiscoverySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                DiscoverySource::OnChainValidatorSet => "OnChainValidatorSet",
-                DiscoverySource::File => "File",
-                DiscoverySource::Config => "Config",
-            }
-        )
+        write!(f, "{}", match self {
+            DiscoverySource::OnChainValidatorSet => "OnChainValidatorSet",
+            DiscoverySource::File => "File",
+            DiscoverySource::Config => "Config",
+            DiscoverySource::Rest => "Rest",
+        })
     }
 }
 
@@ -162,6 +167,10 @@ pub enum ConnectivityRequest {
 struct DiscoveredPeerSet(HashMap<PeerId, DiscoveredPeer>);
 
 impl DiscoveredPeerSet {
+    fn get_mut(&mut self, peer_id: &PeerId) -> Option<&mut DiscoveredPeer> {
+        self.0.get_mut(peer_id)
+    }
+
     fn try_remove_empty(&mut self, peer_id: &PeerId) -> bool {
         match self.0.entry(*peer_id) {
             Entry::Occupied(entry) => {
@@ -172,7 +181,7 @@ impl DiscoveredPeerSet {
                 } else {
                     false
                 }
-            }
+            },
             Entry::Vacant(_) => true,
         }
     }
@@ -188,14 +197,26 @@ impl DiscoveredPeerSet {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+/// Represents all the information for a discovered peer
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct DiscoveredPeer {
     role: PeerRole,
     addrs: Addresses,
     keys: PublicKeys,
+    /// The last time the node was dialed
+    last_dial_time: SystemTime,
 }
 
 impl DiscoveredPeer {
+    pub fn new(role: PeerRole) -> Self {
+        Self {
+            role,
+            addrs: Addresses::default(),
+            keys: PublicKeys::default(),
+            last_dial_time: SystemTime::UNIX_EPOCH,
+        }
+    }
+
     /// Peers without keys are not able to be mutually authenticated to
     pub fn is_eligible(&self) -> bool {
         !self.keys.is_empty()
@@ -204,6 +225,36 @@ impl DiscoveredPeer {
     /// Peers without addresses can't be dialed to
     pub fn is_eligible_to_be_dialed(&self) -> bool {
         self.is_eligible() && !self.addrs.is_empty()
+    }
+
+    /// Updates the last time we tried to connect to this node
+    pub fn set_last_dial_time(&mut self, time: SystemTime) {
+        self.last_dial_time = time;
+    }
+
+    /// Based on input, backoff on amount of time to dial a peer again
+    pub fn has_dialed_recently(&self, backoff_duration: Duration) -> bool {
+        if let Ok(duration_since_last_dial) = self.last_dial_time.elapsed() {
+            duration_since_last_dial < backoff_duration
+        } else {
+            false
+        }
+    }
+}
+
+impl PartialOrd for DiscoveredPeer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let self_dialed_recently = self.has_dialed_recently(TRY_DIAL_BACKOFF_TIME);
+        let other_dialed_recently = other.has_dialed_recently(TRY_DIAL_BACKOFF_TIME);
+
+        // Less recently dialed is prioritized over recently dialed
+        if !self_dialed_recently && other_dialed_recently {
+            Some(Ordering::Less)
+        } else if self_dialed_recently && !other_dialed_recently {
+            Some(Ordering::Greater)
+        } else {
+            self.role.partial_cmp(&other.role)
+        }
     }
 }
 
@@ -253,21 +304,27 @@ where
     pub fn new(
         network_context: NetworkContext,
         time_service: TimeService,
-        eligible: Arc<RwLock<PeerSet>>,
+        peers_and_metadata: Arc<PeersAndMetadata>,
         seeds: PeerSet,
         connection_reqs_tx: ConnectionRequestSender,
         connection_notifs_rx: conn_notifs_channel::Receiver,
-        requests_rx: channel::Receiver<ConnectivityRequest>,
+        requests_rx: diem_channels::Receiver<ConnectivityRequest>,
         connectivity_check_interval: Duration,
         backoff_strategy: TBackoff,
         max_delay: Duration,
         outbound_connection_limit: Option<usize>,
         mutual_authentication: bool,
     ) -> Self {
+        // Verify that the trusted peers set exists and that it is empty
+        let trusted_peers = peers_and_metadata
+            .get_trusted_peers(&network_context.network_id())
+            .unwrap_or_else(|error| {
+                panic!("Trusted peers must exist, but found error: {:?}", error)
+            });
         assert!(
-            eligible.read().is_empty(),
-            "Eligible peers must be initially empty. eligible: {:?}",
-            eligible
+            trusted_peers.read().is_empty(),
+            "Trusted peers must be empty. Found: {:?}",
+            trusted_peers
         );
 
         info!(
@@ -278,7 +335,7 @@ where
         let mut connmgr = Self {
             network_context,
             time_service,
-            eligible,
+            peers_and_metadata,
             connected: HashMap::new(),
             discovered_peers: DiscoveredPeerSet::default(),
             connection_reqs_tx,
@@ -331,7 +388,9 @@ where
                     // Shutdown the connectivity manager when the PeerManager
                     // shuts down.
                     match maybe_notif {
-                        Some(notif) => self.handle_control_notification(notif),
+                        Some(notif) => {
+                            self.handle_control_notification(notif.clone());
+                        },
                         None => break,
                     }
                 },
@@ -354,49 +413,73 @@ where
         );
     }
 
+    /// Returns the trusted peers for the current network context.
+    /// If no set exists, an error is logged and None is returned.
+    fn get_trusted_peers(&self) -> Option<Arc<RwLock<PeerSet>>> {
+        let network_id = self.network_context.network_id();
+        match self.peers_and_metadata.get_trusted_peers(&network_id) {
+            Ok(trusted_peers) => Some(trusted_peers),
+            Err(error) => {
+                error!(
+                    NetworkSchema::new(&self.network_context),
+                    "Failed to find trusted peers for network context: {:?}, error: {:?}",
+                    self.network_context,
+                    error
+                );
+                None
+            },
+        }
+    }
+
     /// Disconnect from all peers that are no longer eligible.
     ///
     /// For instance, a validator might leave the validator set after a
     /// reconfiguration. If we are currently connected to this validator, calling
     /// this function will close our connection to it.
     async fn close_stale_connections(&mut self) {
-        let eligible = self.eligible.read().clone();
-        let stale_connections: Vec<_> = self
-            .connected
-            .iter()
-            .filter(|(peer_id, _)| !eligible.contains_key(peer_id))
-            .filter_map(|(peer_id, metadata)| {
-                // If we're using server only auth, we need to not evict unknown peers
-                // TODO: We should prevent `Unknown` from discovery sources
-                if !self.mutual_authentication
-                    && metadata.origin == ConnectionOrigin::Inbound
-                    && metadata.role == PeerRole::Unknown
-                {
-                    None
-                } else {
-                    Some(*peer_id)
-                }
-            })
-            .collect();
-        for p in stale_connections.into_iter() {
-            info!(
-                NetworkSchema::new(&self.network_context).remote_peer(&p),
-                "{} Closing stale connection to peer {}",
-                self.network_context,
-                p.short_str()
-            );
+        if let Some(trusted_peers) = self.get_trusted_peers() {
+            // Identify stale peer connections
+            let trusted_peers = trusted_peers.read().clone();
+            let stale_peers = self
+                .connected
+                .iter()
+                .filter(|(peer_id, _)| !trusted_peers.contains_key(peer_id))
+                .filter_map(|(peer_id, metadata)| {
+                    // If we're using server only auth, we need to not evict unknown peers
+                    // TODO: We should prevent `Unknown` from discovery sources
+                    if !self.mutual_authentication
+                        && metadata.origin == ConnectionOrigin::Inbound
+                        && (metadata.role == PeerRole::ValidatorFullNode
+                            || metadata.role == PeerRole::Unknown)
+                    {
+                        None
+                    } else {
+                        Some(*peer_id) // The peer is stale
+                    }
+                });
 
-            // Close existing connection.
-            if let Err(e) = self.connection_reqs_tx.disconnect_peer(p).await {
+            // Close existing connections to stale peers
+            for stale_peer in stale_peers {
                 info!(
-                    NetworkSchema::new(&self.network_context)
-                        .remote_peer(&p),
-                    error = %e,
-                    "{} Failed to close stale connection to peer {} : {}",
+                    NetworkSchema::new(&self.network_context).remote_peer(&stale_peer),
+                    "{} Closing stale connection to peer {}",
                     self.network_context,
-                    p.short_str(),
-                    e
+                    stale_peer.short_str()
                 );
+
+                if let Err(disconnect_error) =
+                    self.connection_reqs_tx.disconnect_peer(stale_peer).await
+                {
+                    info!(
+                        NetworkSchema::new(&self.network_context)
+                            .remote_peer(&stale_peer),
+                        error = %disconnect_error,
+                        "{} Failed to close stale connection to peer {}, error: {}",
+                        self.network_context,
+                        stale_peer.short_str(),
+                        disconnect_error
+                    );
+                }
             }
         }
     }
@@ -407,22 +490,26 @@ where
     /// reconfiguration. If there is a pending dial to this validator, calling
     /// this function will remove it from the dial queue.
     async fn cancel_stale_dials(&mut self) {
-        let eligible = self.eligible.read().clone();
-        let stale_dials: Vec<_> = self
-            .dial_queue
-            .keys()
-            .filter(|peer_id| !eligible.contains_key(peer_id))
-            .cloned()
-            .collect();
+        if let Some(trusted_peers) = self.get_trusted_peers() {
+            // Identify stale peer dials
+            let trusted_peers = trusted_peers.read().clone();
+            let stale_peer_dials: Vec<AccountAddress> = self
+                .dial_queue
+                .keys()
+                .filter(|peer_id| !trusted_peers.contains_key(peer_id))
+                .cloned()
+                .collect();
 
-        for p in stale_dials.into_iter() {
-            debug!(
-                NetworkSchema::new(&self.network_context).remote_peer(&p),
-                "{} Cancelling stale dial {}",
-                self.network_context,
-                p.short_str()
-            );
-            self.dial_queue.remove(&p);
+            // Remove the stale dials from the dial queue
+            for stale_peer_dial in stale_peer_dials {
+                debug!(
+                    NetworkSchema::new(&self.network_context).remote_peer(&stale_peer_dial),
+                    "{} Cancelling stale dial {}",
+                    self.network_context,
+                    stale_peer_dial.short_str()
+                );
+                self.dial_queue.remove(&stale_peer_dial);
+            }
         }
     }
 
@@ -446,23 +533,25 @@ where
             .iter()
             .filter(|(peer_id, peer)| {
                 peer.is_eligible_to_be_dialed() // The node is eligible to dial
-                && !self.connected.contains_key(peer_id) // The node is not already connected.
-                && !self.dial_queue.contains_key(peer_id) // There is no pending dial to this node.
-                && roles_to_dial.contains(&peer.role) // We can dial this role
+                    && !self.connected.contains_key(peer_id) // The node is not already connected.
+                    && !self.dial_queue.contains_key(peer_id) // There is no pending dial to this node.
+                    && roles_to_dial.contains(&peer.role) // We can dial this role
             })
             .collect();
 
         // Prioritize by PeerRole
         // Shuffle so we don't get stuck on certain peers
         eligible.shuffle(&mut self.rng);
-        eligible.sort_by(|(_, peer), (_, other)| peer.role.cmp(&other.role));
 
-        let num_eligible = eligible.len();
+        // Sort by peer priority
+        eligible
+            .sort_by(|(_, peer), (_, other)| peer.partial_cmp(other).unwrap_or(Ordering::Equal));
 
         // Limit the number of dialed connections from a Full Node
         // This does not limit the number of incoming connections
         // It enforces that a full node cannot have more outgoing connections than `connection_limit`
         // including in flight dials.
+        let num_eligible = eligible.len();
         let to_connect = if let Some(conn_limit) = self.outbound_connection_limit {
             let outbound_connections = self
                 .connected
@@ -478,6 +567,7 @@ where
             num_eligible
         };
 
+        // Take peers to connect to in priority order
         eligible
             .iter()
             .take(to_connect)
@@ -516,18 +606,6 @@ where
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
-        info!(
-            NetworkSchema::new(&self.network_context)
-                .remote_peer(&peer_id)
-                .network_address(&addr),
-            delay = dial_delay,
-            "{} Create dial future to {} at {} after {:?}",
-            self.network_context,
-            peer_id.short_str(),
-            addr,
-            dial_delay
-        );
-
         let network_context = self.network_context;
         // Create future which completes by either dialing after calculated
         // delay or on cancellation.
@@ -557,6 +635,11 @@ where
             peer_id
         };
         pending_dials.push(f.boxed());
+
+        // Update last dial time
+        if let Some(discovered_peer) = self.discovered_peers.get_mut(&peer_id) {
+            discovered_peer.set_last_dial_time(SystemTime::now())
+        }
         self.dial_queue.insert(peer_id, cancel_tx);
     }
 
@@ -614,13 +697,13 @@ where
                     src,
                 );
                 self.handle_update_discovered_peers(src, discovered_peers);
-            }
+            },
             ConnectivityRequest::GetDialQueueSize(sender) => {
                 sender.send(self.dial_queue.len()).unwrap();
-            }
+            },
             ConnectivityRequest::GetConnectedSize(sender) => {
                 sender.send(self.connected.len()).unwrap();
-            }
+            },
         }
     }
 
@@ -672,11 +755,7 @@ where
                 .discovered_peers
                 .0
                 .entry(peer_id)
-                .or_insert(DiscoveredPeer {
-                    role: discovered_peer.role,
-                    addrs: Addresses::default(),
-                    keys: PublicKeys::default(),
-                });
+                .or_insert_with(|| DiscoveredPeer::new(discovered_peer.role));
             let mut peer_updated = false;
             // Update peer's pubkeys
             if peer.keys.update(src, discovered_peer.keys) {
@@ -725,10 +804,12 @@ where
 
             // Swap in the new eligible peers set. Drop the old set after releasing
             // the write lock.
-            let _old_eligible = {
-                let mut eligible = self.eligible.write();
-                mem::replace(&mut *eligible, new_eligible)
-            };
+            if let Some(trusted_peers) = self.get_trusted_peers() {
+                let _old_eligible = {
+                    let mut trusted_peers = trusted_peers.write();
+                    mem::replace(&mut *trusted_peers, new_eligible)
+                };
+            }
         }
     }
 
@@ -747,7 +828,7 @@ where
                 // Cancel possible queued dial to this peer.
                 self.dial_states.remove(&peer_id);
                 self.dial_queue.remove(&peer_id);
-            }
+            },
             peer_manager::ConnectionNotification::LostPeer(metadata, _context, _reason) => {
                 let peer_id = metadata.remote_peer_id;
                 if let Some(stored_metadata) = self.connected.get(&peer_id) {
@@ -778,8 +859,14 @@ where
                         metadata.addr
                     );
                 }
-            }
+            },
         }
+    }
+
+    #[cfg(test)]
+    /// Returns the set of connected peers (for test purposes)
+    fn get_connected_peers(&self) -> HashMap<PeerId, ConnectionMetadata> {
+        self.connected.clone()
     }
 }
 
@@ -800,7 +887,7 @@ fn log_dial_result(
                 peer_id.short_str(),
                 addr
             );
-        }
+        },
         DialResult::Cancelled => {
             info!(
                 NetworkSchema::new(&network_context).remote_peer(&peer_id),
@@ -808,7 +895,7 @@ fn log_dial_result(
                 network_context,
                 peer_id.short_str()
             );
-        }
+        },
         DialResult::Failed(err) => match err {
             PeerManagerError::AlreadyConnected(a) => {
                 info!(
@@ -820,7 +907,7 @@ fn log_dial_result(
                     peer_id.short_str(),
                     a
                 );
-            }
+            },
             e => {
                 info!(
                     NetworkSchema::new(&network_context)
@@ -833,7 +920,7 @@ fn log_dial_result(
                     addr,
                     e
                 );
-            }
+            },
         },
     }
 }

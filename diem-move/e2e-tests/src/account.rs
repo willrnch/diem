@@ -1,51 +1,30 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Test infrastructure for modeling Diem accounts.
 
 use crate::gas_costs;
-use anyhow::{Error, Result};
 use diem_crypto::ed25519::*;
 use diem_keygen::KeyGen;
 use diem_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{
-        self, from_currency_code_string, type_tag_for_currency_code, BalanceResource,
-        DiemAccountResource, RoleId, XDX_NAME, XUS_NAME,
-    },
+    account_config::{self, AccountResource, CoinStoreResource},
     chain_id::ChainId,
-    event::EventHandle,
+    event::{EventHandle, EventKey},
+    state_store::state_key::StateKey,
     transaction::{
-        authenticator::AuthenticationKey, Module, ModuleBundle, RawTransaction, Script,
-        ScriptFunction, SignedTransaction, TransactionPayload, WriteSetPayload,
+        authenticator::AuthenticationKey, EntryFunction, Module, ModuleBundle, RawTransaction,
+        Script, SignedTransaction, TransactionPayload,
     },
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use move_core_types::{
-    identifier::{IdentStr, Identifier},
-    language_storage::{ResourceKey, StructTag},
-    move_resource::MoveStructType,
-    value::{MoveStructLayout, MoveTypeLayout},
-};
-use move_vm_types::values::{Struct, Value};
-use std::{collections::BTreeMap, str::FromStr};
-use vm_genesis::GENESIS_KEYPAIR;
+use diem_vm_genesis::GENESIS_KEYPAIR;
+use move_core_types::move_resource::MoveStructType;
 
 // TTL is 86400s. Initial time was set to 0.
-pub const DEFAULT_EXPIRATION_TIME: u64 = 40_000;
-
-pub fn xus_currency_code() -> Identifier {
-    from_currency_code_string(XUS_NAME).unwrap()
-}
-
-pub fn xdx_currency_code() -> Identifier {
-    from_currency_code_string(XDX_NAME).unwrap()
-}
-
-pub fn currency_code(code: &str) -> Identifier {
-    from_currency_code_string(code).unwrap()
-}
+pub const DEFAULT_EXPIRATION_TIME: u64 = 4_000_000;
 
 /// Details about a Diem account.
 ///
@@ -69,13 +48,13 @@ impl Account {
     /// [`FakeExecutor::add_account_data`][crate::executor::FakeExecutor::add_account_data].
     /// This function returns distinct values upon every call.
     pub fn new() -> Self {
-        let (privkey, pubkey) = KeyGen::from_os_rng().generate_keypair();
+        let (privkey, pubkey) = KeyGen::from_os_rng().generate_ed25519_keypair();
         Self::with_keypair(privkey, pubkey)
     }
 
     /// Creates a new account in memory given a random seed.
     pub fn new_from_seed(seed: &mut KeyGen) -> Self {
-        let (privkey, pubkey) = seed.generate_keypair();
+        let (privkey, pubkey) = seed.generate_ed25519_keypair();
         Self::with_keypair(privkey, pubkey)
     }
 
@@ -110,8 +89,8 @@ impl Account {
 
     /// Creates a new account in memory representing an account created in the genesis transaction.
     ///
-    /// The address will be [`address`], which should be an address for a genesis account and
-    /// the account will use [`GENESIS_KEYPAIR`][struct@GENESIS_KEYPAIR] as its keypair.
+    /// The address will be `address`, which should be an address for a genesis account and
+    /// the account will use [`GENESIS_KEYPAIR`][static@@GENESIS_KEYPAIR] as its keypair.
     pub fn new_genesis_account(address: AccountAddress) -> Self {
         Account {
             addr: address,
@@ -122,20 +101,10 @@ impl Account {
 
     /// Creates a new account representing the diem root account in memory.
     ///
-    /// The address will be [`diem_root_address`][account_config::diem_root_address], and
-    /// the account will use [`GENESIS_KEYPAIR`][struct@GENESIS_KEYPAIR] as its keypair.
+    /// The address will be [`diem_test_root_address`][account_config::diem_test_root_address], and
+    /// the account will use [`GENESIS_KEYPAIR`][static@GENESIS_KEYPAIR] as its keypair.
     pub fn new_diem_root() -> Self {
-        Self::new_genesis_account(account_config::diem_root_address())
-    }
-
-    pub fn new_testing_dd() -> Self {
-        Self::new_genesis_account(account_config::testnet_dd_account_address())
-    }
-
-    /// Creates a new account representing treasury compliance in memory.
-    /// The account will use [`GENESIS_KEYPAIR`][struct@GENESIS_KEYPAIR] as its keypair.
-    pub fn new_blessed_tc() -> Self {
-        Self::new_genesis_account(account_config::treasury_compliance_account_address())
+        Self::new_genesis_account(account_config::diem_test_root_address())
     }
 
     /// Returns the address of the account. This is a hash of the public key the account was created
@@ -150,23 +119,16 @@ impl Account {
     ///
     /// Use this to retrieve or publish the Account blob.
     pub fn make_account_access_path(&self) -> AccessPath {
-        self.make_access_path(DiemAccountResource::struct_tag())
+        AccessPath::resource_access_path(self.addr, AccountResource::struct_tag())
+            .expect("access path in test")
     }
 
-    /// Returns the AccessPath that describes the Account balance resource instance.
+    /// Returns the AccessPath that describes the Account's CoinStore resource instance.
     ///
-    /// Use this to retrieve or publish the Account balance blob.
-    pub fn make_balance_access_path(&self, balance_currency_code: Identifier) -> AccessPath {
-        let type_tag = type_tag_for_currency_code(balance_currency_code);
-        // TODO/XXX: Convert this to BalanceResource::struct_tag once that takes type args
-        self.make_access_path(BalanceResource::struct_tag_for_currency(type_tag))
-    }
-
-    // TODO: plug in the account type
-    pub fn make_access_path(&self, tag: StructTag) -> AccessPath {
-        // TODO: we need a way to get the type (FatStructType) of the Account in place
-        let resource_tag = ResourceKey::new(self.addr, tag);
-        AccessPath::resource_access_path(resource_tag)
+    /// Use this to retrieve or publish the Account CoinStore blob.
+    pub fn make_coin_store_access_path(&self) -> AccessPath {
+        AccessPath::resource_access_path(self.addr, CoinStoreResource::struct_tag())
+            .expect("access path in  test")
     }
 
     /// Changes the keys for this account to the provided ones.
@@ -180,11 +142,6 @@ impl Account {
     /// This is the same as the account's address if the keys have never been rotated.
     pub fn auth_key(&self) -> Vec<u8> {
         AuthenticationKey::ed25519(&self.pubkey).to_vec()
-    }
-
-    /// Return the first 16 bytes of the account's auth key
-    pub fn auth_key_prefix(&self) -> Vec<u8> {
-        AuthenticationKey::ed25519(&self.pubkey).prefix().to_vec()
     }
 
     pub fn transaction(&self) -> TransactionBuilder {
@@ -201,11 +158,11 @@ impl Default for Account {
 pub struct TransactionBuilder {
     pub sender: Account,
     pub secondary_signers: Vec<Account>,
+    pub fee_payer: Option<Account>,
     pub sequence_number: Option<u64>,
     pub program: Option<TransactionPayload>,
     pub max_gas_amount: Option<u64>,
     pub gas_unit_price: Option<u64>,
-    pub gas_currency_code: Option<String>,
     pub chain_id: Option<ChainId>,
     pub ttl: Option<u64>,
 }
@@ -215,11 +172,11 @@ impl TransactionBuilder {
         Self {
             sender,
             secondary_signers: Vec::new(),
+            fee_payer: None,
             sequence_number: None,
             program: None,
             max_gas_amount: None,
             gas_unit_price: None,
-            gas_currency_code: None,
             chain_id: None,
             ttl: None,
         }
@@ -227,6 +184,11 @@ impl TransactionBuilder {
 
     pub fn secondary_signers(mut self, secondary_signers: Vec<Account>) -> Self {
         self.secondary_signers = secondary_signers;
+        self
+    }
+
+    pub fn fee_payer(mut self, fee_payer: Account) -> Self {
+        self.fee_payer = Some(fee_payer);
         self
     }
 
@@ -250,18 +212,13 @@ impl TransactionBuilder {
         self
     }
 
-    pub fn script_function(mut self, f: ScriptFunction) -> Self {
-        self.program = Some(TransactionPayload::ScriptFunction(f));
+    pub fn entry_function(mut self, f: EntryFunction) -> Self {
+        self.program = Some(TransactionPayload::EntryFunction(f));
         self
     }
 
     pub fn module(mut self, m: Module) -> Self {
         self.program = Some(TransactionPayload::ModuleBundle(ModuleBundle::from(m)));
-        self
-    }
-
-    pub fn write_set(mut self, w: WriteSetPayload) -> Self {
-        self.program = Some(TransactionPayload::WriteSet(w));
         self
     }
 
@@ -272,11 +229,6 @@ impl TransactionBuilder {
 
     pub fn gas_unit_price(mut self, gas_unit_price: u64) -> Self {
         self.gas_unit_price = Some(gas_unit_price);
-        self
-    }
-
-    pub fn gas_currency_code(mut self, gas_currency_code: &str) -> Self {
-        self.gas_currency_code = Some(gas_currency_code.to_string());
         self
     }
 
@@ -292,8 +244,6 @@ impl TransactionBuilder {
             self.program.expect("transaction payload not set"),
             self.max_gas_amount.unwrap_or(gas_costs::TXN_RESERVED),
             self.gas_unit_price.unwrap_or(0),
-            self.gas_currency_code
-                .unwrap_or_else(|| XUS_NAME.to_owned()),
             self.ttl.unwrap_or(DEFAULT_EXPIRATION_TIME),
             ChainId::test(),
         )
@@ -306,8 +256,6 @@ impl TransactionBuilder {
             self.program.expect("transaction payload not set"),
             self.max_gas_amount.unwrap_or(gas_costs::TXN_RESERVED),
             self.gas_unit_price.unwrap_or(0),
-            self.gas_currency_code
-                .unwrap_or_else(|| XUS_NAME.to_owned()),
             self.ttl.unwrap_or(DEFAULT_EXPIRATION_TIME),
             self.chain_id.unwrap_or_else(ChainId::test),
         )
@@ -322,7 +270,7 @@ impl TransactionBuilder {
             .iter()
             .map(|signer| *signer.address())
             .collect();
-        let secondary_private_keys = self
+        let secondary_private_keys: Vec<&Ed25519PrivateKey> = self
             .secondary_signers
             .iter()
             .map(|signer| &signer.privkey)
@@ -333,8 +281,6 @@ impl TransactionBuilder {
             self.program.expect("transaction payload not set"),
             self.max_gas_amount.unwrap_or(gas_costs::TXN_RESERVED),
             self.gas_unit_price.unwrap_or(0),
-            self.gas_currency_code
-                .unwrap_or_else(|| XUS_NAME.to_owned()),
             self.ttl.unwrap_or(DEFAULT_EXPIRATION_TIME),
             ChainId::test(),
         )
@@ -346,22 +292,62 @@ impl TransactionBuilder {
         .unwrap()
         .into_inner()
     }
+
+    pub fn sign_fee_payer(self) -> SignedTransaction {
+        let secondary_signer_addresses: Vec<AccountAddress> = self
+            .secondary_signers
+            .iter()
+            .map(|signer| *signer.address())
+            .collect();
+        let secondary_private_keys: Vec<&Ed25519PrivateKey> = self
+            .secondary_signers
+            .iter()
+            .map(|signer| &signer.privkey)
+            .collect();
+        let fee_payer = self.fee_payer.unwrap();
+        RawTransaction::new(
+            *self.sender.address(),
+            self.sequence_number.expect("sequence number not set"),
+            self.program.expect("transaction payload not set"),
+            self.max_gas_amount.unwrap_or(gas_costs::TXN_RESERVED),
+            self.gas_unit_price.unwrap_or(0),
+            self.ttl.unwrap_or(DEFAULT_EXPIRATION_TIME),
+            ChainId::test(),
+        )
+        .sign_fee_payer(
+            &self.sender.privkey,
+            secondary_signer_addresses,
+            secondary_private_keys,
+            *fee_payer.address(),
+            &fee_payer.privkey,
+        )
+        .unwrap()
+        .into_inner()
+    }
 }
 
 //---------------------------------------------------------------------------
-// Balance resource represenation
+// CoinStore resource represenation
 //---------------------------------------------------------------------------
 
-/// Struct that represents an account balance resource for tests.
+/// Struct that represents an account CoinStore resource for tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Balance {
+pub struct CoinStore {
     coin: u64,
+    frozen: bool,
+    deposit_events: EventHandle,
+    withdraw_events: EventHandle,
 }
 
-impl Balance {
-    /// Create a new balance with amount `balance`
-    pub fn new(coin: u64) -> Self {
-        Self { coin }
+impl CoinStore {
+    /// Create a new CoinStore
+    pub fn new(coin: u64, deposit_events: EventHandle, withdraw_events: EventHandle) -> Self {
+        Self {
+            coin,
+            frozen: false,
+            deposit_events,
+            withdraw_events,
+        }
     }
 
     /// Retrieve the balance inside of this
@@ -369,109 +355,21 @@ impl Balance {
         self.coin
     }
 
-    /// Returns the Move Value for the account balance
-    pub fn to_value(&self) -> Value {
-        Value::struct_(Struct::pack(vec![Value::u64(self.coin)]))
-    }
-
-    /// Returns the value layout for the account balance
-    pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![MoveTypeLayout::U64])
-    }
-}
-
-//---------------------------------------------------------------------------
-// Account type represenation
-//---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccountRoleSpecifier {
-    DiemRoot,
-    TreasuryCompliance,
-    DesignatedDealer,
-    Validator,
-    ValidatorOperator,
-    ParentVASP,
-    ChildVASP,
-}
-
-impl AccountRoleSpecifier {
-    pub fn id(&self) -> u64 {
-        match self {
-            Self::DiemRoot => 0,
-            Self::TreasuryCompliance => 1,
-            Self::DesignatedDealer => 2,
-            Self::Validator => 3,
-            Self::ValidatorOperator => 4,
-            Self::ParentVASP => 5,
-            Self::ChildVASP => 6,
-        }
-    }
-
-    pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![MoveTypeLayout::U64])
-    }
-
-    pub fn to_value(&self) -> Value {
-        Value::struct_(Struct::pack(vec![Value::u64(self.id())]))
-    }
-
-    pub fn role_id_struct_tag() -> StructTag {
-        StructTag {
-            address: account_config::CORE_CODE_ADDRESS,
-            module: RoleId::module_identifier(),
-            name: RoleId::struct_identifier(),
-            type_params: vec![],
-        }
-    }
-}
-
-impl FromStr for AccountRoleSpecifier {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "vasp" => Ok(AccountRoleSpecifier::ParentVASP), // TODO: rename from vasp
-            "validator" => Ok(AccountRoleSpecifier::Validator),
-            "validator_operator" => Ok(AccountRoleSpecifier::ValidatorOperator),
-            other => Err(Error::msg(format!(
-                "Unrecognized account type specifier {} found.",
-                other
-            ))),
-        }
-    }
-}
-
-impl Default for AccountRoleSpecifier {
-    fn default() -> Self {
-        AccountRoleSpecifier::ParentVASP
+    /// Returns the Move Value for the account's CoinStore
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let coin_store = CoinStoreResource::new(
+            self.coin,
+            self.frozen,
+            self.deposit_events.clone(),
+            self.withdraw_events.clone(),
+        );
+        bcs::to_bytes(&coin_store).unwrap()
     }
 }
 
 //---------------------------------------------------------------------------
-// Account type resource represenation
+// Account resource represenation
 //---------------------------------------------------------------------------
-
-/// Struct that represents an account type for testing.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccountRole {
-    self_address: AccountAddress,
-    account_specifier: AccountRoleSpecifier,
-}
-
-impl AccountRole {
-    /// Create a new AccountRole testing account.
-    pub fn new(self_address: AccountAddress, account_specifier: AccountRoleSpecifier) -> Self {
-        Self {
-            self_address,
-            account_specifier,
-        }
-    }
-
-    pub fn account_specifier(&self) -> AccountRoleSpecifier {
-        self.account_specifier
-    }
-}
 
 /// Represents an account along with initial state about it.
 ///
@@ -479,18 +377,14 @@ impl AccountRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountData {
     account: Account,
-    withdrawal_capability: Option<WithdrawCapability>,
-    key_rotation_capability: Option<KeyRotationCapability>,
     sequence_number: u64,
-    sent_events: EventHandle,
-    received_events: EventHandle,
-
-    balances: BTreeMap<Identifier, Balance>,
-    account_role: AccountRole,
+    coin_register_events: EventHandle,
+    key_rotation_events: EventHandle,
+    coin_store: CoinStore,
 }
 
 fn new_event_handle(count: u64, address: AccountAddress) -> EventHandle {
-    EventHandle::new_from_address(&address, count)
+    EventHandle::new(EventKey::new(count, address), 0)
 }
 
 impl AccountData {
@@ -498,58 +392,23 @@ impl AccountData {
     ///
     /// This constructor is non-deterministic and should not be used against golden file.
     pub fn new(balance: u64, sequence_number: u64) -> Self {
-        Self::with_account(
-            Account::new(),
-            balance,
-            xus_currency_code(),
-            sequence_number,
-            AccountRoleSpecifier::ParentVASP,
-        )
+        Self::with_account(Account::new(), balance, sequence_number)
+    }
+
+    pub fn increment_sequence_number(&mut self) {
+        self.sequence_number += 1;
     }
 
     /// Creates a new `AccountData` with a new account.
     ///
     /// Most tests will want to use this constructor.
     pub fn new_from_seed(seed: &mut KeyGen, balance: u64, sequence_number: u64) -> Self {
-        Self::with_account(
-            Account::new_from_seed(seed),
-            balance,
-            xus_currency_code(),
-            sequence_number,
-            AccountRoleSpecifier::ParentVASP,
-        )
-    }
-
-    /// Creates a new `AccountData` with a new account, with XDX balance.
-    ///
-    /// Most tests will want to use this constructor.
-    pub fn new_xdx_from_seed(seed: &mut KeyGen, balance: u64, sequence_number: u64) -> Self {
-        Self::with_account(
-            Account::new_from_seed(seed),
-            balance,
-            xdx_currency_code(),
-            sequence_number,
-            AccountRoleSpecifier::ParentVASP,
-        )
+        Self::with_account(Account::new_from_seed(seed), balance, sequence_number)
     }
 
     /// Creates a new `AccountData` with the provided account.
-    pub fn with_account(
-        account: Account,
-        balance: u64,
-        balance_currency_code: Identifier,
-        sequence_number: u64,
-        account_specifier: AccountRoleSpecifier,
-    ) -> Self {
-        Self::with_account_and_event_counts(
-            account,
-            balance,
-            balance_currency_code,
-            sequence_number,
-            0,
-            0,
-            account_specifier,
-        )
+    pub fn with_account(account: Account, balance: u64, sequence_number: u64) -> Self {
+        Self::with_account_and_event_counts(account, balance, sequence_number, 0, 0)
     }
 
     /// Creates a new `AccountData` with the provided account.
@@ -557,48 +416,32 @@ impl AccountData {
         privkey: Ed25519PrivateKey,
         pubkey: Ed25519PublicKey,
         balance: u64,
-        balance_currency_code: Identifier,
         sequence_number: u64,
-        account_specifier: AccountRoleSpecifier,
     ) -> Self {
         let account = Account::with_keypair(privkey, pubkey);
-        Self::with_account(
-            account,
-            balance,
-            balance_currency_code,
-            sequence_number,
-            account_specifier,
-        )
+        Self::with_account(account, balance, sequence_number)
     }
 
     /// Creates a new `AccountData` with custom parameters.
     pub fn with_account_and_event_counts(
         account: Account,
         balance: u64,
-        balance_currency_code: Identifier,
         sequence_number: u64,
         sent_events_count: u64,
         received_events_count: u64,
-        account_specifier: AccountRoleSpecifier,
     ) -> Self {
-        let mut balances = BTreeMap::new();
-        balances.insert(balance_currency_code, Balance::new(balance));
         let addr = *account.address();
         Self {
-            account_role: AccountRole::new(*account.address(), account_specifier),
-            withdrawal_capability: Some(WithdrawCapability::new(addr)),
-            key_rotation_capability: Some(KeyRotationCapability::new(addr)),
             account,
-            balances,
+            coin_store: CoinStore::new(
+                balance,
+                new_event_handle(received_events_count, addr),
+                new_event_handle(sent_events_count, addr),
+            ),
             sequence_number,
-            sent_events: new_event_handle(sent_events_count, addr),
-            received_events: new_event_handle(received_events_count, addr),
+            coin_register_events: new_event_handle(0, addr),
+            key_rotation_events: new_event_handle(1, addr),
         }
-    }
-
-    /// Adds the balance held by this account to the one represented as balance_currency_code
-    pub fn add_balance_currency(&mut self, balance_currency_code: Identifier) {
-        self.balances.insert(balance_currency_code, Balance::new(0));
     }
 
     /// Changes the keys for this account to the provided ones.
@@ -606,74 +449,15 @@ impl AccountData {
         self.account.rotate_key(privkey, pubkey)
     }
 
-    pub fn sent_payment_event_layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![
-            MoveTypeLayout::U64,
-            MoveTypeLayout::Address,
-            MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8)),
-        ])
-    }
-
-    pub fn received_payment_event_type() -> MoveStructLayout {
-        MoveStructLayout::new(vec![
-            MoveTypeLayout::U64,
-            MoveTypeLayout::Address,
-            MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8)),
-        ])
-    }
-
-    pub fn event_handle_layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![
-            MoveTypeLayout::U64,
-            MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U8)),
-        ])
-    }
-
-    /// Returns the (Move value) layout of the DiemAccount::DiemAccount struct
-    pub fn layout() -> MoveStructLayout {
-        use MoveStructLayout as S;
-        use MoveTypeLayout as T;
-
-        S::new(vec![
-            T::Vector(Box::new(T::U8)),
-            T::Vector(Box::new(T::Struct(WithdrawCapability::layout()))),
-            T::Vector(Box::new(T::Struct(KeyRotationCapability::layout()))),
-            T::Struct(Self::event_handle_layout()),
-            T::Struct(Self::event_handle_layout()),
-            T::U64,
-        ])
-    }
-
-    /// Returns the account role specifier
-    pub fn account_role(&self) -> AccountRoleSpecifier {
-        self.account_role.account_specifier()
-    }
-
     /// Creates and returns the top-level resources to be published under the account
-    pub fn to_value(&self) -> (Value, Vec<(Identifier, Value)>, Value) {
-        // TODO: publish some concept of Account
-        let balances: Vec<_> = self
-            .balances
-            .iter()
-            .map(|(code, balance)| (code.clone(), balance.to_value()))
-            .collect();
-        let role_id = self.account_role.account_specifier.to_value();
-        let account = Value::struct_(Struct::pack(vec![
-            // TODO: this needs to compute the auth key instead
-            Value::vector_u8(AuthenticationKey::ed25519(&self.account.pubkey).to_vec()),
-            self.withdrawal_capability.as_ref().unwrap().value(),
-            self.key_rotation_capability.as_ref().unwrap().value(),
-            Value::struct_(Struct::pack(vec![
-                Value::u64(self.received_events.count()),
-                Value::vector_u8(self.received_events.key().to_vec()),
-            ])),
-            Value::struct_(Struct::pack(vec![
-                Value::u64(self.sent_events.count()),
-                Value::vector_u8(self.sent_events.key().to_vec()),
-            ])),
-            Value::u64(self.sequence_number),
-        ]));
-        (account, balances, role_id)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let account = AccountResource::new(
+            self.sequence_number,
+            AuthenticationKey::ed25519(&self.account.pubkey).to_vec(),
+            self.coin_register_events.clone(),
+            self.key_rotation_events.clone(),
+        );
+        bcs::to_bytes(&account).unwrap()
     }
 
     /// Returns the AccessPath that describes the Account resource instance.
@@ -683,54 +467,26 @@ impl AccountData {
         self.account.make_account_access_path()
     }
 
-    /// Returns the AccessPath that describes the Account balance resource instance.
+    /// Returns the AccessPath that describes the Account's CoinStore resource instance.
     ///
-    /// Use this to retrieve or publish the Account blob.
-    pub fn make_balance_access_path(&self, code: Identifier) -> AccessPath {
-        self.account.make_balance_access_path(code)
+    /// Use this to retrieve or publish the Account's CoinStore blob.
+    pub fn make_coin_store_access_path(&self) -> AccessPath {
+        self.account.make_coin_store_access_path()
     }
 
     /// Creates a writeset that contains the account data and can be patched to the storage
     /// directly.
     pub fn to_writeset(&self) -> WriteSet {
-        let (account_blob, balance_blobs, role_id_blob) = self.to_value();
-        let mut write_set = Vec::new();
-        let account = account_blob
-            .value_as::<Struct>()
-            .unwrap()
-            .simple_serialize(&AccountData::layout())
-            .unwrap();
-        write_set.push((self.make_account_access_path(), WriteOp::Value(account)));
-        for (code, balance_blob) in balance_blobs.into_iter() {
-            let balance = balance_blob
-                .value_as::<Struct>()
-                .unwrap()
-                .simple_serialize(&Balance::layout())
-                .unwrap();
-            write_set.push((self.make_balance_access_path(code), WriteOp::Value(balance)));
-        }
-
-        let freezing_bit = FreezingBit::value()
-            .value_as::<Struct>()
-            .unwrap()
-            .simple_serialize(&FreezingBit::layout())
-            .unwrap();
-        write_set.push((
-            self.account
-                .make_access_path(account_config::FreezingBit::struct_tag()),
-            WriteOp::Value(freezing_bit),
-        ));
-
-        let role_id = role_id_blob
-            .value_as::<Struct>()
-            .unwrap()
-            .simple_serialize(&AccountRoleSpecifier::layout())
-            .unwrap();
-        write_set.push((
-            self.account
-                .make_access_path(AccountRoleSpecifier::role_id_struct_tag()),
-            WriteOp::Value(role_id),
-        ));
+        let write_set = vec![
+            (
+                StateKey::access_path(self.make_account_access_path()),
+                WriteOp::Modification(self.to_bytes()),
+            ),
+            (
+                StateKey::access_path(self.make_coin_store_access_path()),
+                WriteOp::Modification(self.coin_store.to_bytes()),
+            ),
+        ];
 
         WriteSetMut::new(write_set).freeze().unwrap()
     }
@@ -754,8 +510,8 @@ impl AccountData {
     }
 
     /// Returns the initial balance.
-    pub fn balance(&self, currency_code: &IdentStr) -> u64 {
-        self.balances.get(currency_code).unwrap().coin()
+    pub fn balance(&self) -> u64 {
+        self.coin_store.coin()
     }
 
     /// Returns the initial sequence number.
@@ -764,77 +520,22 @@ impl AccountData {
     }
 
     /// Returns the unique key for this sent events stream.
-    pub fn sent_events_key(&self) -> &[u8] {
-        self.sent_events.key().as_bytes()
+    pub fn sent_events_key(&self) -> &EventKey {
+        self.coin_store.withdraw_events.key()
     }
 
     /// Returns the initial sent events count.
     pub fn sent_events_count(&self) -> u64 {
-        self.sent_events.count()
+        self.coin_store.withdraw_events.count()
     }
 
     /// Returns the unique key for this received events stream.
-    pub fn received_events_key(&self) -> &[u8] {
-        self.received_events.key().as_bytes()
+    pub fn received_events_key(&self) -> &EventKey {
+        self.coin_store.deposit_events.key()
     }
 
     /// Returns the initial received events count.
     pub fn received_events_count(&self) -> u64 {
-        self.received_events.count()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WithdrawCapability {
-    account_address: AccountAddress,
-}
-impl WithdrawCapability {
-    pub fn new(account_address: AccountAddress) -> Self {
-        Self { account_address }
-    }
-
-    pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![MoveTypeLayout::Address])
-    }
-
-    pub fn value(&self) -> Value {
-        Value::vector_for_testing_only(vec![Value::struct_(Struct::pack(vec![Value::address(
-            self.account_address,
-        )]))])
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeyRotationCapability {
-    account_address: AccountAddress,
-}
-impl KeyRotationCapability {
-    pub fn new(account_address: AccountAddress) -> Self {
-        Self { account_address }
-    }
-
-    pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![MoveTypeLayout::Address])
-    }
-
-    pub fn value(&self) -> Value {
-        Value::vector_for_testing_only(vec![Value::struct_(Struct::pack(vec![Value::address(
-            self.account_address,
-        )]))])
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FreezingBit {
-    is_frozen: bool,
-}
-
-impl FreezingBit {
-    pub fn layout() -> MoveStructLayout {
-        MoveStructLayout::new(vec![MoveTypeLayout::Bool])
-    }
-
-    pub fn value() -> Value {
-        Value::struct_(Struct::pack(vec![Value::bool(false)]))
+        self.coin_store.deposit_events.count()
     }
 }

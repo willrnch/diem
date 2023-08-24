@@ -1,17 +1,13 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Defines Forge Tests
-pub mod event_fetcher;
-pub mod fullnode;
-pub mod nft_transaction;
-pub mod replay_tooling;
-pub mod rest_api;
-pub mod scripts_and_modules;
-pub mod transaction;
-pub mod verifying_client;
+extern crate core;
 
-// Converted to local Forge backend
+#[cfg(test)]
+mod diem;
+#[cfg(test)]
+mod diem_cli;
 #[cfg(test)]
 mod client;
 #[cfg(test)]
@@ -19,21 +15,33 @@ mod consensus;
 #[cfg(test)]
 mod full_nodes;
 #[cfg(test)]
+mod fullnode;
+#[cfg(test)]
 mod genesis;
 #[cfg(test)]
-mod key_manager;
+mod indexer;
+#[cfg(test)]
+mod inspection_service;
 #[cfg(test)]
 mod network;
 #[cfg(test)]
-mod operational_tooling;
+mod rest_api;
 #[cfg(test)]
-mod release_flow;
+mod rosetta;
 #[cfg(test)]
 mod state_sync;
 #[cfg(test)]
-mod state_sync_v2;
-#[cfg(test)]
 mod storage;
+#[cfg(test)]
+mod test_smoke_tests;
+#[cfg(test)]
+mod transaction;
+#[cfg(test)]
+mod txn_broadcast;
+#[cfg(test)]
+mod txn_emitter;
+#[cfg(test)]
+mod upgrade;
 
 #[cfg(test)]
 mod smoke_test_environment;

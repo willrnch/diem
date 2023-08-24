@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{CryptoKVStorage, Error, GetResponse, KVStorage};
@@ -17,7 +18,7 @@ use std::{
 /// intended for single threads (or must be wrapped by a Arc<RwLock<>>). This provides no permission
 /// checks and simply offers a proof of concept to unblock building of applications without more
 /// complex data stores. Internally, it reads and writes all data to a file, which means that it
-/// must make copies of all key material which violates the Diem code base. It violates it because
+/// must make copies of all key material which violates the code base. It violates it because
 /// the anticipation is that data stores would securely handle key material. This should not be used
 /// in production.
 pub struct OnDiskStorage {
@@ -33,7 +34,8 @@ impl OnDiskStorage {
 
     fn new_with_time_service(file_path: PathBuf, time_service: TimeService) -> Self {
         if !file_path.exists() {
-            File::create(&file_path).expect("Unable to create storage");
+            File::create(&file_path)
+                .unwrap_or_else(|_| panic!("Unable to create storage at path: {:?}", file_path));
         }
 
         // The parent will be one when only a filename is supplied. Therefore use the current

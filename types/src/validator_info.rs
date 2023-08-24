@@ -1,10 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(any(test, feature = "fuzzing"))]
 use crate::network_address::NetworkAddress;
 use crate::{account_address::AccountAddress, validator_config::ValidatorConfig};
-use diem_crypto::ed25519::Ed25519PublicKey;
+use diem_crypto::bls12381;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
@@ -21,14 +22,11 @@ pub struct ValidatorInfo {
     // The validator's account address. AccountAddresses are initially derived from the account
     // auth pubkey; however, the auth key can be rotated, so one should not rely on this
     // initial property.
-    account_address: AccountAddress,
+    pub account_address: AccountAddress,
     // Voting power of this validator
     consensus_voting_power: u64,
     // Validator config
     config: ValidatorConfig,
-    // The time of last recofiguration invoked by this validator
-    // in microseconds
-    last_config_update_time: u64,
 }
 
 impl fmt::Display for ValidatorInfo {
@@ -51,28 +49,28 @@ impl ValidatorInfo {
             account_address,
             consensus_voting_power,
             config,
-            last_config_update_time: 0,
         }
     }
 
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn new_with_test_network_keys(
         account_address: AccountAddress,
-        consensus_public_key: Ed25519PublicKey,
+        consensus_public_key: bls12381::PublicKey,
         consensus_voting_power: u64,
+        validator_index: u64,
     ) -> Self {
         let addr = NetworkAddress::mock();
         let config = ValidatorConfig::new(
             consensus_public_key,
             bcs::to_bytes(&vec![addr.clone()]).unwrap(),
             bcs::to_bytes(&vec![addr]).unwrap(),
+            validator_index,
         );
 
         Self {
             account_address,
             consensus_voting_power,
             config,
-            last_config_update_time: 0,
         }
     }
 
@@ -83,7 +81,7 @@ impl ValidatorInfo {
     }
 
     /// Returns the key for validating signed messages from this validator
-    pub fn consensus_public_key(&self) -> &Ed25519PublicKey {
+    pub fn consensus_public_key(&self) -> &bls12381::PublicKey {
         &self.config.consensus_public_key
     }
 

@@ -1,14 +1,15 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::counters;
 use diem_logger::prelude::*;
+use async_trait::async_trait;
 use futures::{
     future::{AbortHandle, Abortable},
     Future, FutureExt, SinkExt,
 };
-use std::{pin::Pin, thread, time::Duration};
-
-use crate::counters;
+use std::{pin::Pin, time::Duration};
 use tokio::{runtime::Handle, time::sleep};
 
 /// Time service is an abstraction for operations that depend on time
@@ -18,6 +19,7 @@ use tokio::{runtime::Handle, time::sleep};
 /// Time service also supports opportunities for future optimizations
 /// For example instead of scheduling O(N) tasks in TaskExecutor we could have more optimal code
 /// that only keeps single task in TaskExecutor
+#[async_trait]
 pub trait TimeService: Send + Sync {
     /// Sends message to given sender after timeout, returns a handle that could use to cancel the task.
     fn run_after(&self, timeout: Duration, task: Box<dyn ScheduledTask>) -> AbortHandle;
@@ -32,20 +34,14 @@ pub trait TimeService: Send + Sync {
     /// time_service::sleep(Y).await;
     /// Z = time_service::get_current_timestamp();
     /// assert(Z >= X + Y)
-    fn sleep(&self, t: Duration);
+    async fn sleep(&self, t: Duration);
 
     /// Wait until the Duration t since UNIX_EPOCH pass at least 1ms.
-    fn wait_until(&self, t: Duration) {
+    async fn wait_until(&self, t: Duration) {
         while let Some(mut wait_duration) = t.checked_sub(self.get_current_timestamp()) {
             wait_duration += Duration::from_millis(1);
-            if wait_duration > Duration::from_secs(10) {
-                error!(
-                    "[TimeService] long wait time {} seconds required",
-                    wait_duration.as_secs()
-                );
-            }
             counters::WAIT_DURATION_S.observe_duration(wait_duration);
-            self.sleep(wait_duration);
+            self.sleep(wait_duration).await;
         }
     }
 }
@@ -62,7 +58,7 @@ pub struct SendTask<T>
 where
     T: Send + 'static,
 {
-    sender: Option<channel::Sender<T>>,
+    sender: Option<diem_channels::Sender<T>>,
     message: Option<T>,
 }
 
@@ -71,7 +67,7 @@ where
     T: Send + 'static,
 {
     /// Makes new SendTask for given sender and message and wraps it to Box
-    pub fn make(sender: channel::Sender<T>, message: T) -> Box<dyn ScheduledTask> {
+    pub fn make(sender: diem_channels::Sender<T>, message: T) -> Box<dyn ScheduledTask> {
         Box::new(SendTask {
             sender: Some(sender),
             message: Some(message),
@@ -108,6 +104,7 @@ impl ClockTimeService {
     }
 }
 
+#[async_trait]
 impl TimeService for ClockTimeService {
     fn run_after(&self, timeout: Duration, mut t: Box<dyn ScheduledTask>) -> AbortHandle {
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -126,8 +123,8 @@ impl TimeService for ClockTimeService {
         diem_infallible::duration_since_epoch()
     }
 
-    fn sleep(&self, t: Duration) {
-        thread::sleep(t)
+    async fn sleep(&self, t: Duration) {
+        sleep(t).await
     }
 }
 
@@ -136,7 +133,7 @@ async fn test_time_service_abort() {
     use futures::StreamExt;
 
     let time_service = ClockTimeService::new(tokio::runtime::Handle::current());
-    let (tx, mut rx) = channel::new_test(10);
+    let (tx, mut rx) = diem_channels::new_test(10);
     let task1 = SendTask::make(tx.clone(), 1);
     let task2 = SendTask::make(tx.clone(), 2);
     let handle1 = time_service.run_after(Duration::from_millis(100), task1);

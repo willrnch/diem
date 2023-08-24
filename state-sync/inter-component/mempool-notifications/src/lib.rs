@@ -1,10 +1,11 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use async_trait::async_trait;
 use diem_types::{account_address::AccountAddress, transaction::Transaction};
+use async_trait::async_trait;
 use futures::{
     channel::{mpsc, oneshot},
     stream::FusedStream,
@@ -22,7 +23,7 @@ use tokio::time::timeout;
 
 const MEMPOOL_NOTIFICATION_CHANNEL_SIZE: usize = 1;
 
-#[derive(Clone, Debug, Deserialize, Error, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
 pub enum Error {
     #[error("Commit notification failed: {0}")]
     CommitNotificationError(String),
@@ -93,13 +94,10 @@ impl MempoolNotificationSender for MempoolNotifier {
             })
             .collect();
 
-        // Only send a notification if user transactions have been committed
-        if user_transactions.is_empty() {
-            return Ok(());
-        }
-
         // Construct a oneshot channel to receive a mempool response
         let (callback, callback_receiver) = oneshot::channel();
+        // Mempool needs to be notified about all transactions (user and non-user transactions).
+        // See https://github.com/aptos-labs/diem-core/issues/1882 for more details.
         let commit_notification = MempoolCommitNotification {
             transactions: user_transactions,
             block_timestamp_usecs,
@@ -216,7 +214,6 @@ enum MempoolNotificationResponse {
 #[cfg(test)]
 mod tests {
     use crate::{CommittedTransaction, Error, MempoolNotificationSender};
-    use claim::{assert_matches, assert_ok};
     use diem_crypto::{ed25519::Ed25519PrivateKey, HashValue, PrivateKey, SigningKey, Uniform};
     use diem_types::{
         account_address::AccountAddress,
@@ -228,8 +225,9 @@ mod tests {
         },
         write_set::WriteSetMut,
     };
+    use claims::{assert_matches, assert_ok};
     use futures::{executor::block_on, FutureExt, StreamExt};
-    use tokio::runtime::{Builder, Runtime};
+    use tokio::runtime::Runtime;
 
     #[test]
     fn test_mempool_not_listening() {
@@ -264,35 +262,23 @@ mod tests {
     }
 
     #[test]
-    fn test_no_transactions() {
+    fn test_no_transaction_filtering() {
         // Create runtime and mempool notifier
         let runtime = create_runtime();
         let _enter = runtime.enter();
         let (mempool_notifier, _mempool_listener) = crate::new_mempool_notifier_listener_pair();
 
-        // Send a notification and verify no timeout because no notification was sent!
-        let notify_result = block_on(mempool_notifier.notify_new_commit(vec![], 0, 1000));
-        assert_ok!(notify_result);
-    }
-
-    #[test]
-    fn test_transaction_filtering() {
-        // Create runtime and mempool notifier
-        let runtime = create_runtime();
-        let _enter = runtime.enter();
-        let (mempool_notifier, _mempool_listener) = crate::new_mempool_notifier_listener_pair();
-
-        // Create several transactions that should be filtered out
+        // Create several non-user transactions
         let mut transactions = vec![];
         for _ in 0..5 {
             transactions.push(create_block_metadata_transaction());
             transactions.push(create_genesis_transaction());
         }
 
-        // Send a notification and verify no timeout because no notification was sent!
+        // Send a notification and verify we get a timeout because mempool didn't respond
         let notify_result =
             block_on(mempool_notifier.notify_new_commit(transactions.clone(), 0, 1000));
-        assert_ok!(notify_result);
+        assert_matches!(notify_result, Err(Error::TimeoutWaitingForMempool));
 
         // Send another notification with a single user transaction now included.
         transactions.push(create_user_transaction());
@@ -318,18 +304,17 @@ mod tests {
         match mempool_listener.select_next_some().now_or_never() {
             Some(mempool_commit_notification) => match user_transaction {
                 Transaction::UserTransaction(signed_transaction) => {
-                    assert_eq!(
-                        mempool_commit_notification.transactions,
-                        vec![CommittedTransaction {
+                    assert_eq!(mempool_commit_notification.transactions, vec![
+                        CommittedTransaction {
                             sender: signed_transaction.sender(),
                             sequence_number: signed_transaction.sequence_number(),
-                        }]
-                    );
+                        }
+                    ]);
                     assert_eq!(
                         mempool_commit_notification.block_timestamp_usecs,
                         block_timestamp_usecs
                     );
-                }
+                },
                 result => panic!("Expected user transaction but got: {:?}", result),
             },
             result => panic!("Expected mempool commit notification but got: {:?}", result),
@@ -372,14 +357,13 @@ mod tests {
             transaction_payload,
             0,
             0,
-            "".into(),
             0,
             ChainId::new(10),
         );
         let signed_transaction = SignedTransaction::new(
             raw_transaction.clone(),
             public_key,
-            private_key.sign(&raw_transaction),
+            private_key.sign(&raw_transaction).unwrap(),
         );
 
         Transaction::UserTransaction(signed_transaction)
@@ -388,10 +372,12 @@ mod tests {
     fn create_block_metadata_transaction() -> Transaction {
         Transaction::BlockMetadata(BlockMetadata::new(
             HashValue::new([0; HashValue::LENGTH]),
-            1,
+            0,
             300000001,
-            vec![],
             AccountAddress::random(),
+            vec![0],
+            vec![],
+            1,
         ))
     }
 
@@ -405,6 +391,6 @@ mod tests {
     }
 
     fn create_runtime() -> Runtime {
-        Builder::new_multi_thread().enable_all().build().unwrap()
+        diem_runtimes::spawn_named_runtime("test".into(), None)
     }
 }

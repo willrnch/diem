@@ -1,35 +1,34 @@
 [package]
-name = "network-builder"
+name = "diem-network-builder"
+description = "Diem network builder for constructing a network"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem Onchain Discovery Protocol"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-async-trait = "0.1.42"
-futures = "0.3.12"
-rand = "0.8.3"
-serde = { version = "1.0.124", default-features = false }
-tokio = { version = "1.8.1", features = ["full"] }
-
-channel = { path = "../../crates/channel" }
-bcs = "0.1.2"
-diem-config = { path = "../../config" }
-diem-crypto = { path = "../../crates/diem-crypto" }
-diem-infallible = { path = "../../crates/diem-infallible" }
-diem-logger = { path = "../../crates/diem-logger" }
-diem-network-address-encryption = {path = "../../config/management/network-address-encryption"}
-diem-secure-storage = { path = "../../secure/storage" }
-diem-time-service = { path = "../../crates/diem-time-service", features = ["async"] }
-diem-types = { path = "../../types" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-event-notifications = { path = "../../state-sync/inter-component/event-notifications" }
-netcore = { path = "../netcore" }
-network = { path = "../." }
-network-discovery = { path = "../discovery" }
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-event-notifications = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-netcore = { workspace = true }
+diem-network = { workspace = true }
+diem-network-discovery = { workspace = true }
+diem-secure-storage = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+bcs = { workspace = true }
+futures = { workspace = true }
+maplit = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }

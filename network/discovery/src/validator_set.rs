@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -10,13 +11,12 @@ use diem_config::{
     network_id::NetworkContext,
 };
 use diem_crypto::x25519;
+use diem_event_notifications::ReconfigNotificationListener;
 use diem_logger::prelude::*;
-use diem_network_address_encryption::Error;
+use diem_network::{counters::inc_by_with_context, logging::NetworkSchema};
+use diem_short_hex_str::AsShortHexStr;
 use diem_types::on_chain_config::{OnChainConfigPayload, ValidatorSet};
-use event_notifications::ReconfigNotificationListener;
 use futures::Stream;
-use network::{counters::inc_by_with_context, logging::NetworkSchema};
-use short_hex_str::AsShortHexStr;
 use std::{
     collections::HashSet,
     pin::Pin,
@@ -106,7 +106,7 @@ impl Stream for ValidatorSetStream {
 }
 
 /// Extracts a set of ConnectivityRequests from a ValidatorSet which are appropriate for a network with type role.
-fn extract_validator_set_updates(
+pub(crate) fn extract_validator_set_updates(
     network_context: NetworkContext,
     node_set: ValidatorSet,
 ) -> PeerSet {
@@ -120,8 +120,8 @@ fn extract_validator_set_updates(
             let config = info.into_config();
 
             let addrs = if is_validator {
-                bcs::from_bytes(&config.validator_network_addresses)
-                    .map_err(|e| Error::AddressDeserialization(peer_id, e.to_string()))
+                config
+                    .validator_network_addresses()
                     .map_err(anyhow::Error::from)
             } else {
                 config
@@ -154,18 +154,14 @@ fn extract_validator_set_updates(
 mod tests {
     use super::*;
     use crate::DiscoveryChangeListener;
-    use channel::{diem_channel, message_queues::QueueStyle};
+    use diem_channels::{diem_channel, message_queues::QueueStyle};
     use diem_config::config::HANDSHAKE_VERSION;
-    use diem_crypto::{
-        ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
-        x25519::PrivateKey,
-        PrivateKey as PK, Uniform,
-    };
+    use diem_crypto::{bls12381, x25519::PrivateKey, PrivateKey as PK, Uniform};
+    use diem_event_notifications::ReconfigNotification;
     use diem_types::{
         network_address::NetworkAddress, on_chain_config::OnChainConfig,
         validator_config::ValidatorConfig, validator_info::ValidatorInfo, PeerId,
     };
-    use event_notifications::ReconfigNotification;
     use futures::executor::block_on;
     use rand::{rngs::StdRng, SeedableRng};
     use std::{collections::HashMap, sync::Arc, time::Instant};
@@ -176,16 +172,16 @@ mod tests {
 
     #[test]
     fn metric_if_key_mismatch() {
-        diem_logger::DiemLogger::init_for_testing();
+        diem_logger::Logger::init_for_testing();
         let runtime = Runtime::new().unwrap();
-        let consensus_private_key = Ed25519PrivateKey::generate_for_testing();
+        let consensus_private_key = bls12381::PrivateKey::generate_for_testing();
         let consensus_pubkey = consensus_private_key.public_key();
         let pubkey = test_pubkey([0u8; 32]);
         let different_pubkey = test_pubkey([1u8; 32]);
         let peer_id = diem_types::account_address::from_identity_public_key(pubkey);
 
         // Build up the Reconfig Listener
-        let (conn_mgr_reqs_tx, _rx) = channel::new_test(1);
+        let (conn_mgr_reqs_tx, _rx) = diem_channels::new_test(1);
         let (mut reconfig_sender, reconfig_events) = diem_channel::new(QueueStyle::LIFO, 1, None);
         let reconfig_listener = ReconfigNotificationListener {
             notification_receiver: reconfig_events,
@@ -238,9 +234,9 @@ mod tests {
 
     fn send_pubkey_update(
         peer_id: PeerId,
-        consensus_pubkey: Ed25519PublicKey,
+        consensus_pubkey: bls12381::PublicKey,
         pubkey: x25519::PublicKey,
-        reconfig_tx: &mut channel::diem_channel::Sender<(), ReconfigNotification>,
+        reconfig_tx: &mut diem_channels::diem_channel::Sender<(), ReconfigNotification>,
     ) {
         let validator_address =
             NetworkAddress::mock().append_prod_protos(pubkey, HANDSHAKE_VERSION);
@@ -254,6 +250,7 @@ mod tests {
                 consensus_pubkey,
                 validator_encoded_addresses,
                 fullnode_encoded_addresses,
+                0,
             ),
         );
         let validator_set = ValidatorSet::new(vec![validator]);
@@ -264,13 +261,10 @@ mod tests {
         );
         let payload = OnChainConfigPayload::new(1, Arc::new(configs));
         reconfig_tx
-            .push(
-                (),
-                ReconfigNotification {
-                    version: 1,
-                    on_chain_configs: payload,
-                },
-            )
+            .push((), ReconfigNotification {
+                version: 1,
+                on_chain_configs: payload,
+            })
             .unwrap();
     }
 

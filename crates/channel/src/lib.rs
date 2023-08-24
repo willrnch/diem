@@ -1,19 +1,20 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 //! Provides an mpsc (multi-producer single-consumer) channel wrapped in an
-//! [`IntGauge`](diem_metrics::IntGauge) that counts the number of currently
-//! queued items. While there is only one [`channel::Receiver`], there can be
-//! many [`channel::Sender`]s, which are also cheap to clone.
+//! [`IntGauge`] that counts the number of currently
+//! queued items. While there is only one [`Receiver`], there can be
+//! many [`Sender`]s, which are also cheap to clone.
 //!
-//! This channel differs from our other channel implementation, [`channel::diem_channel`],
+//! This channel differs from our other channel implementation, [`diem_channel`],
 //! in that it is just a single queue (vs. different queues for different keys)
 //! with backpressure (senders will block if the queue is full instead of evicting
 //! another item in the queue) that only implements FIFO (vs. LIFO or KLAST).
 
-use diem_metrics::IntGauge;
+use diem_metrics_core::IntGauge;
 use futures::{
     channel::mpsc,
     sink::Sink,
@@ -62,11 +63,11 @@ impl<T> Sink<T> for Sender<T> {
     type Error = mpsc::SendError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        (*self).inner.poll_ready(cx)
+        (self).inner.poll_ready(cx)
     }
 
     fn start_send(mut self: Pin<&mut Self>, msg: T) -> Result<(), Self::Error> {
-        (*self).inner.start_send(msg).map(|_| self.gauge.inc())
+        (self).inner.start_send(msg).map(|_| self.gauge.inc())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -80,8 +81,7 @@ impl<T> Sink<T> for Sender<T> {
 
 impl<T> Sender<T> {
     pub fn try_send(&mut self, msg: T) -> Result<(), mpsc::SendError> {
-        (*self)
-            .inner
+        self.inner
             .try_send(msg)
             .map(|_| self.gauge.inc())
             .map_err(mpsc::TrySendError::into_send_error)

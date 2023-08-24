@@ -1,39 +1,82 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides mock dbreader for tests.
 
 use crate::{DbReader, DbWriter};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use diem_types::{
-    account_address::AccountAddress, account_config::AccountResource, account_state::AccountState,
-    account_state_blob::AccountStateBlob,
+    account_address::AccountAddress,
+    account_config::AccountResource,
+    account_state::AccountState,
+    event::EventHandle,
+    proof::SparseMerkleProofExt,
+    state_store::{
+        state_key::{StateKey, StateKeyInner},
+        state_value::StateValue,
+    },
+    transaction::Version,
 };
 use move_core_types::move_resource::MoveResource;
-use std::convert::TryFrom;
 
 /// This is a mock of the DbReaderWriter in tests.
 pub struct MockDbReaderWriter;
 
 impl DbReader for MockDbReaderWriter {
-    fn get_latest_account_state(
+    fn get_latest_state_checkpoint_version(&self) -> Result<Option<Version>> {
+        // return a dummy version for tests
+        Ok(Some(1))
+    }
+
+    fn get_state_proof_by_version_ext(
         &self,
-        _address: AccountAddress,
-    ) -> Result<Option<AccountStateBlob>> {
-        Ok(Some(get_mock_account_state_blob()))
+        _state_key: &StateKey,
+        _version: Version,
+    ) -> Result<SparseMerkleProofExt> {
+        Ok(SparseMerkleProofExt::new(None, vec![]))
+    }
+
+    fn get_state_value_by_version(
+        &self,
+        state_key: &StateKey,
+        _: Version,
+    ) -> Result<Option<StateValue>> {
+        match state_key.inner() {
+            StateKeyInner::AccessPath(access_path) => {
+                let account_state = get_mock_account_state();
+                Ok(account_state
+                    .get(&access_path.path)
+                    .cloned()
+                    .map(StateValue::from))
+            },
+            StateKeyInner::Raw(raw_key) => Ok(Some(StateValue::from(raw_key.to_owned()))),
+            _ => Err(anyhow!("Not supported state key type {:?}", state_key)),
+        }
+    }
+
+    fn get_state_value_with_version_by_version(
+        &self,
+        state_key: &StateKey,
+        version: Version,
+    ) -> Result<Option<(Version, StateValue)>> {
+        Ok(self
+            .get_state_value_by_version(state_key, version)?
+            .map(|value| (version, value)))
     }
 }
 
-fn get_mock_account_state_blob() -> AccountStateBlob {
-    let account_resource = AccountResource::new(0, vec![], AccountAddress::random());
+fn get_mock_account_state() -> AccountState {
+    let account_resource =
+        AccountResource::new(0, vec![], EventHandle::random(0), EventHandle::random(0));
 
-    let mut account_state = AccountState::default();
-    account_state.insert(
-        AccountResource::resource_path(),
-        bcs::to_bytes(&account_resource).unwrap(),
-    );
-
-    AccountStateBlob::try_from(&account_state).unwrap()
+    AccountState::new(
+        AccountAddress::random(),
+        std::collections::BTreeMap::from([(
+            AccountResource::resource_path(),
+            bcs::to_bytes(&account_resource).unwrap(),
+        )]),
+    )
 }
 
 impl DbWriter for MockDbReaderWriter {}

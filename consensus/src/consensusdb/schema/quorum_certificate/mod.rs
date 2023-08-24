@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for consensus quorum certificate (of a block).
@@ -9,14 +10,16 @@
 //! | block_hash |  QuorumCert  |
 //! ```
 
-use super::QC_CF_NAME;
 use anyhow::Result;
-use consensus_types::quorum_cert::QuorumCert;
+use diem_consensus_types::quorum_cert::QuorumCert;
 use diem_crypto::HashValue;
-use schemadb::{
+use diem_schemadb::{
     define_schema,
     schema::{KeyCodec, ValueCodec},
+    ColumnFamilyName,
 };
+
+pub const QC_CF_NAME: ColumnFamilyName = "quorum_certificate";
 
 define_schema!(QCSchema, HashValue, QuorumCert, QC_CF_NAME);
 

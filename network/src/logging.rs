@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //!
@@ -8,7 +9,7 @@
 //! use diem_config::network_id::NetworkContext;
 //! use diem_logger::info;
 //! use diem_types::{PeerId, network_address::NetworkAddress};
-//! use network::logging::NetworkSchema;
+//! use diem_network::logging::NetworkSchema;
 //!
 //! info!(
 //!   NetworkSchema::new(&NetworkContext::mock())
@@ -26,8 +27,8 @@ use crate::{
 };
 use diem_config::network_id::NetworkContext;
 use diem_logger::Schema;
+use diem_netcore::transport::ConnectionOrigin;
 use diem_types::{network_address::NetworkAddress, PeerId};
-use netcore::transport::ConnectionOrigin;
 
 #[derive(Schema)]
 pub struct NetworkSchema<'a> {
@@ -36,6 +37,7 @@ pub struct NetworkSchema<'a> {
     connection_origin: Option<&'a ConnectionOrigin>,
     #[schema(display)]
     discovery_source: Option<&'a DiscoverySource>,
+    message: Option<String>,
     #[schema(display)]
     network_address: Option<&'a NetworkAddress>,
     network_context: &'a NetworkContext,
@@ -49,6 +51,7 @@ impl<'a> NetworkSchema<'a> {
             connection_id: None,
             connection_origin: None,
             discovery_source: None,
+            message: None,
             network_address: None,
             network_context,
             remote_peer: None,

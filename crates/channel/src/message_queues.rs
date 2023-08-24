@@ -1,7 +1,8 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use diem_metrics::IntCounterVec;
+use diem_metrics_core::IntCounterVec;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::{Debug, Formatter, Result},
@@ -143,7 +144,7 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
                     let oldest = key_message_queue.pop_front();
                     key_message_queue.push_back(message);
                     oldest
-                }
+                },
             }
         } else {
             key_message_queue.push_back(message);
@@ -158,7 +159,7 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
             Some(v) => v,
             _ => {
                 return None;
-            }
+            },
         };
 
         let (message, is_q_empty) = self.pop_from_key_queue(&key);
@@ -189,7 +190,7 @@ impl<K: Eq + Hash + Clone, T> PerKeyQueue<K, T> {
             //
             // See: common/channel/src/bin/many_keys_stress_test.rs
             //
-            // For more context, see: https://github.com/diem/diem/issues/5543
+            // For more context, see: https://github.com/aptos-labs/diem-core/issues/5543
             self.num_popped_since_gc += 1;
             if self.num_popped_since_gc >= POPS_PER_GC {
                 self.num_popped_since_gc = 0;

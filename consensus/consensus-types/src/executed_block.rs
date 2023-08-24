@@ -1,19 +1,21 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     block::Block,
     common::{Payload, Round},
     quorum_cert::QuorumCert,
-    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
+    vote_proposal::VoteProposal,
 };
 use diem_crypto::hash::HashValue;
+use diem_executor_types::StateComputeResult;
 use diem_types::{
+    account_address::AccountAddress,
     block_info::BlockInfo,
     contract_event::ContractEvent,
-    transaction::{Transaction, TransactionStatus},
+    transaction::{SignedTransaction, Transaction, TransactionStatus},
 };
-use executor_types::StateComputeResult;
 use std::fmt::{Debug, Display, Formatter};
 
 /// ExecutedBlocks are managed in a speculative tree, the committed blocks form a chain. Besides
@@ -93,25 +95,49 @@ impl ExecutedBlock {
         )
     }
 
-    pub fn maybe_signed_vote_proposal(&self, decoupled_execution: bool) -> MaybeSignedVoteProposal {
-        MaybeSignedVoteProposal {
-            vote_proposal: VoteProposal::new(
-                self.compute_result().extension_proof(),
-                self.block.clone(),
-                self.compute_result().epoch_state().clone(),
-                decoupled_execution,
-            ),
-            signature: self.compute_result().signature().clone(),
-        }
+    pub fn vote_proposal(&self, decoupled_execution: bool) -> VoteProposal {
+        VoteProposal::new(
+            self.compute_result().extension_proof(),
+            self.block.clone(),
+            self.compute_result().epoch_state().clone(),
+            decoupled_execution,
+        )
     }
 
-    pub fn transactions_to_commit(&self) -> Vec<Transaction> {
+    pub fn transactions_to_commit(
+        &self,
+        validators: &[AccountAddress],
+        txns: Vec<SignedTransaction>,
+        block_gas_limit: Option<u64>,
+    ) -> Vec<Transaction> {
         // reconfiguration suffix don't execute
+
         if self.is_reconfiguration_suffix() {
             return vec![];
         }
+
+        let mut txns_with_state_checkpoint =
+            self.block
+                .transactions_to_execute(validators, txns, block_gas_limit);
+        if block_gas_limit.is_some() && !self.state_compute_result.has_reconfiguration() {
+            // After the per-block gas limit change,
+            // insert state checkpoint at the position
+            // 1) after last txn if there is no Retry
+            // 2) before the first Retry
+            if let Some(pos) = self
+                .state_compute_result
+                .compute_status()
+                .iter()
+                .position(|s| s.is_retry())
+            {
+                txns_with_state_checkpoint.insert(pos, Transaction::StateCheckpoint(self.id()));
+            } else {
+                txns_with_state_checkpoint.push(Transaction::StateCheckpoint(self.id()));
+            }
+        }
+
         itertools::zip_eq(
-            self.block.transactions_to_execute(),
+            txns_with_state_checkpoint,
             self.state_compute_result.compute_status(),
         )
         .filter_map(|(txn, status)| match status {

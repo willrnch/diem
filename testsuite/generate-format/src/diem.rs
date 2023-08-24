@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use diem_crypto::{
@@ -8,7 +9,9 @@ use diem_crypto::{
     traits::{SigningKey, Uniform},
 };
 use diem_crypto_derive::{BCSCryptoHash, CryptoHasher};
-use diem_types::{contract_event, event, transaction, write_set};
+use diem_types::{
+    contract_event, event, state_store::state_key::StateKey, transaction, write_set,
+};
 use move_core_types::language_storage;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -34,7 +37,7 @@ fn trace_crypto_values(tracer: &mut Tracer, samples: &mut Samples) -> Result<()>
     let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
     let private_key = Ed25519PrivateKey::generate(&mut rng);
     let public_key: Ed25519PublicKey = (&private_key).into();
-    let signature = private_key.sign(&message);
+    let signature = private_key.sign(&message).unwrap();
 
     tracer.trace_value(samples, &hashed_message)?;
     tracer.trace_value(samples, &public_key)?;
@@ -55,17 +58,12 @@ pub fn get_registry() -> Result<Registry> {
     // 2. Trace the main entry point(s) + every enum separately.
     tracer.trace_type::<contract_event::ContractEvent>(&samples)?;
     tracer.trace_type::<language_storage::TypeTag>(&samples)?;
-    tracer.trace_type::<transaction::metadata::Metadata>(&samples)?;
-    tracer.trace_type::<transaction::metadata::GeneralMetadata>(&samples)?;
-    tracer.trace_type::<transaction::metadata::TravelRuleMetadata>(&samples)?;
-    tracer.trace_type::<transaction::metadata::RefundMetadata>(&samples)?;
-    tracer.trace_type::<transaction::metadata::RefundReason>(&samples)?;
-    tracer.trace_type::<transaction::metadata::CoinTradeMetadata>(&samples)?;
     tracer.trace_type::<transaction::Transaction>(&samples)?;
     tracer.trace_type::<transaction::TransactionArgument>(&samples)?;
-    tracer.trace_type::<transaction::VecBytes>(&samples)?;
     tracer.trace_type::<transaction::TransactionPayload>(&samples)?;
     tracer.trace_type::<transaction::WriteSetPayload>(&samples)?;
+    tracer.trace_type::<StateKey>(&samples)?;
+
     tracer.trace_type::<transaction::authenticator::AccountAuthenticator>(&samples)?;
     tracer.trace_type::<transaction::authenticator::TransactionAuthenticator>(&samples)?;
     tracer.trace_type::<write_set::WriteOp>(&samples)?;

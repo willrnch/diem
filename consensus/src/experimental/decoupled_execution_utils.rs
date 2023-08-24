@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,7 +7,7 @@ use crate::{
         buffer_manager::{create_channel, BufferManager, OrderedBlocks, ResetRequest},
         execution_phase::{ExecutionPhase, ExecutionRequest, ExecutionResponse},
         persisting_phase::{PersistingPhase, PersistingRequest},
-        pipeline_phase::PipelinePhase,
+        pipeline_phase::{CountedRequest, PipelinePhase},
         signing_phase::{SigningPhase, SigningRequest, SigningResponse},
     },
     metrics_safety_rules::MetricsSafetyRules,
@@ -14,12 +15,12 @@ use crate::{
     round_manager::VerifiedEvent,
     state_replication::StateComputer,
 };
-use channel::diem_channel::Receiver;
-use consensus_types::common::Author;
+use diem_channels::diem_channel::Receiver;
+use diem_consensus_types::common::Author;
 use diem_infallible::Mutex;
 use diem_types::{account_address::AccountAddress, validator_verifier::ValidatorVerifier};
 use futures::channel::mpsc::UnboundedReceiver;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 
 /// build channels and return phases and buffer manager
 pub fn prepare_phases_and_buffer_manager(
@@ -40,9 +41,11 @@ pub fn prepare_phases_and_buffer_manager(
 ) {
     // Execution Phase
     let (execution_phase_request_tx, execution_phase_request_rx) =
-        create_channel::<ExecutionRequest>();
+        create_channel::<CountedRequest<ExecutionRequest>>();
     let (execution_phase_response_tx, execution_phase_response_rx) =
         create_channel::<ExecutionResponse>();
+
+    let ongoing_tasks = Arc::new(AtomicU64::new(0));
 
     let execution_phase_processor = ExecutionPhase::new(execution_proxy);
     let execution_phase = PipelinePhase::new(
@@ -52,7 +55,8 @@ pub fn prepare_phases_and_buffer_manager(
     );
 
     // Signing Phase
-    let (signing_phase_request_tx, signing_phase_request_rx) = create_channel::<SigningRequest>();
+    let (signing_phase_request_tx, signing_phase_request_rx) =
+        create_channel::<CountedRequest<SigningRequest>>();
     let (signing_phase_response_tx, signing_phase_response_rx) =
         create_channel::<SigningResponse>();
 
@@ -65,7 +69,7 @@ pub fn prepare_phases_and_buffer_manager(
 
     // Persisting Phase
     let (persisting_phase_request_tx, persisting_phase_request_rx) =
-        create_channel::<PersistingRequest>();
+        create_channel::<CountedRequest<PersistingRequest>>();
 
     let persisting_phase_processor = PersistingPhase::new(persisting_proxy);
     let persisting_phase = PipelinePhase::new(
@@ -90,6 +94,7 @@ pub fn prepare_phases_and_buffer_manager(
             block_rx,
             sync_rx,
             verifier,
+            ongoing_tasks,
         ),
     )
 }

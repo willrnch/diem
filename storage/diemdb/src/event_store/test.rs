@@ -1,8 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::DiemDB;
+use crate::{DiemDB, EventStore};
 use diem_crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
 use diem_proptest_helpers::Index;
 use diem_temppath::TempPath;
@@ -22,28 +23,12 @@ use proptest::{
 use rand::Rng;
 use std::collections::HashMap;
 
-fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashValue {
-    let mut cs = ChangeSet::new();
-    let root_hash = store.put_events(version, events, &mut cs).unwrap();
-    assert_eq!(
-        cs.counter_bumps(version).get(LedgerCounter::EventsCreated),
-        events.len()
-    );
-    store.db.write_schemas(cs.batch).unwrap();
-
-    root_hash
-}
-
-#[test]
-fn test_put_empty() {
-    let tmp_dir = TempPath::new();
-    let db = DiemDB::new_for_test(&tmp_dir);
-    let store = &db.event_store;
-    let mut cs = ChangeSet::new();
-    assert_eq!(
-        store.put_events(0, &[], &mut cs).unwrap(),
-        *ACCUMULATOR_PLACEHOLDER_HASH
-    );
+fn save(store: &EventStore, version: Version, events: &[ContractEvent]) {
+    let batch = SchemaBatch::new();
+    store
+        .put_events(version, events, /*skip_index=*/ true, &batch)
+        .unwrap();
+    store.event_db.write_schemas(batch).unwrap();
 }
 
 #[test]
@@ -52,33 +37,29 @@ fn test_error_on_get_from_empty() {
     let db = DiemDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
 
-    assert!(store
-        .get_event_with_proof_by_version_and_index(100, 0)
-        .is_err());
+    assert!(store.get_event_by_version_and_index(100, 0).is_err());
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
     #[test]
-    fn test_put_get_verify(events in vec(any::<ContractEvent>().no_shrink(), 1..100)) {
+    fn test_put_get(events in vec(any::<ContractEvent>().no_shrink(), 1..100)) {
         let tmp_dir = TempPath::new();
         let db = DiemDB::new_for_test(&tmp_dir);
         let store = &db.event_store;
 
-        let root_hash = save(store, 100, &events);
+        save(store, 100, &events);
 
-        // get and verify each and every event with proof
         for (idx, expected_event) in events.iter().enumerate() {
-            let (event, proof) = store
-                .get_event_with_proof_by_version_and_index(100, idx as u64)
+            let event = store
+                .get_event_by_version_and_index(100, idx as u64)
                 .unwrap();
             prop_assert_eq!(&event, expected_event);
-            proof.verify(root_hash, event.hash(), idx as u64).unwrap();
         }
         // error on index >= num_events
         prop_assert!(store
-            .get_event_with_proof_by_version_and_index(100, events.len() as u64)
+            .get_event_by_version_and_index(100, events.len() as u64)
             .is_err());
     }
 
@@ -154,12 +135,7 @@ fn traverse_events_by_key(
 
     event_keys
         .into_iter()
-        .map(|(_seq, ver, idx)| {
-            store
-                .get_event_with_proof_by_version_and_index(ver, idx)
-                .unwrap()
-                .0
-        })
+        .map(|(_seq, ver, idx)| store.get_event_by_version_and_index(ver, idx).unwrap())
         .collect()
 }
 
@@ -190,11 +166,13 @@ fn test_index_get_impl(event_batches: Vec<Vec<ContractEvent>>) {
     let db = DiemDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
 
-    let mut cs = ChangeSet::new();
+    let batch = SchemaBatch::new();
     event_batches.iter().enumerate().for_each(|(ver, events)| {
-        store.put_events(ver as u64, events, &mut cs).unwrap();
+        store
+            .put_events(ver as u64, events, /*skip_index=*/ false, &batch)
+            .unwrap();
     });
-    store.db.write_schemas(cs.batch);
+    store.event_db.write_schemas(batch);
     let ledger_version_plus_one = event_batches.len() as u64;
 
     assert_eq!(
@@ -267,6 +245,7 @@ fn test_index_get_impl(event_batches: Vec<Vec<ContractEvent>>) {
 
 prop_compose! {
     fn arb_new_block_events()(
+        hash in any::<AccountAddress>(),
         address in any::<AccountAddress>(),
         mut version in 1..10000u64,
         mut timestamp in 0..1000000u64, // initial timestamp
@@ -283,15 +262,19 @@ prop_compose! {
             version += v;
             timestamp += t;
             let new_block_event = NewBlockEvent::new(
+                hash,
+                0, // epoch
                 seq, // round
+                seq, // height
+                vec![], // prev block voters
                 address, // proposer
-                Vec::new(), // prev block voters
+                Vec::new(), // failed_proposers
                 timestamp,
             );
             let event = ContractEvent::new(
                 new_block_event_key(),
                 seq,
-                TypeTag::Struct(NewBlockEvent::struct_tag()),
+                TypeTag::Struct(Box::new(NewBlockEvent::struct_tag())),
                 bcs::to_bytes(&new_block_event).unwrap(),
             );
             seq += 1;
@@ -308,13 +291,13 @@ fn test_get_last_version_before_timestamp_impl(new_block_events: Vec<(Version, C
     assert!(store.get_last_version_before_timestamp(1000, 2000).is_err());
 
     // save events to db
-    let mut cs = ChangeSet::new();
+    let batch = SchemaBatch::new();
     new_block_events.iter().for_each(|(ver, event)| {
         store
-            .put_events(*ver as u64, &[event.clone()], &mut cs)
+            .put_events(*ver, &[event.clone()], /*skip_index=*/ false, &batch)
             .unwrap();
     });
-    store.db.write_schemas(cs.batch);
+    store.event_db.write_schemas(batch);
 
     let ledger_version = new_block_events.last().unwrap().0;
 
@@ -362,6 +345,8 @@ fn test_get_last_version_before_timestamp_impl(new_block_events: Vec<(Version, C
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
     #[test]
     fn test_get_last_version_before_timestamp(new_block_events in arb_new_block_events()) {
         test_get_last_version_before_timestamp_impl(new_block_events)

@@ -1,9 +1,9 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines traits and implementations of
 //! [cryptographic hash functions](https://en.wikipedia.org/wiki/Cryptographic_hash_function)
-//! for the Diem project.
 //!
 //! It is designed to help authors protect against two types of real world attacks:
 //!
@@ -21,9 +21,9 @@
 //!    same input to the hash function and therefore the same hash. This
 //!    creates a collision.
 //!
-//! Regarding (1), this library makes it easy for Diem developers to create as
+//! Regarding (1), this library makes it easy for developers to create as
 //! many new "hashable" Rust types as needed so that each Rust type hashed and signed
-//! in Diem has a unique meaning, that is, unambiguously captures the intent of a signer.
+//! has a unique meaning, that is, unambiguously captures the intent of a signer.
 //!
 //! Regarding (2), this library provides the `CryptoHasher` abstraction to easily manage
 //! cryptographic seeds for hashing. Hashing seeds aim to ensure that
@@ -101,12 +101,12 @@
 #![allow(clippy::integer_arithmetic)]
 use bytes::Bytes;
 use hex::FromHex;
-use mirai_annotations::*;
+use more_asserts::debug_assert_lt;
 use once_cell::sync::{Lazy, OnceCell};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use rand::{rngs::OsRng, Rng};
-use serde::{de, ser};
+use serde::{de, ser, Deserialize, Serialize};
 use std::{
     self,
     convert::{AsRef, TryFrom},
@@ -115,10 +115,10 @@ use std::{
 };
 use tiny_keccak::{Hasher, Sha3};
 
-/// A prefix used to begin the salt of every diem hashable structure. The salt
+/// A prefix used to begin the salt of every hashable structure. The salt
 /// consists in this global prefix, concatenated with the specified
 /// serialization name of the struct.
-pub(crate) const DIEM_HASH_PREFIX: &[u8] = b"DIEM::";
+pub(crate) const HASH_PREFIX: &[u8] = b"DIEM::";
 
 /// Output value of our hash function. Intentionally opaque for safety and modularity.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
@@ -206,7 +206,7 @@ impl HashValue {
 
     /// Returns the `index`-th bit in the bytes.
     pub fn bit(&self, index: usize) -> bool {
-        assume!(index < Self::LENGTH_IN_BITS); // assumed precondition
+        debug_assert!(index < Self::LENGTH_IN_BITS); // assumed precondition
         let pos = index / 8;
         let bit = 7 - index % 8;
         (self.hash[pos] >> bit) & 1 != 0
@@ -214,10 +214,16 @@ impl HashValue {
 
     /// Returns the `index`-th nibble in the bytes.
     pub fn nibble(&self, index: usize) -> u8 {
-        assume!(index < Self::LENGTH * 2); // assumed precondition
+        debug_assert!(index < Self::LENGTH * 2); // assumed precondition
         let pos = index / 2;
         let shift = if index % 2 == 0 { 4 } else { 0 };
-        (self.hash[pos] >> shift) & 0x0f
+        (self.hash[pos] >> shift) & 0x0F
+    }
+
+    /// Return the `index`-th byte in the bytes.
+    pub fn byte(&self, index: usize) -> u8 {
+        debug_assert!(index < Self::LENGTH); // assumed precondition
+        self.hash[index]
     }
 
     /// Returns a `HashValueBitIterator` over all the bits that represent this `HashValue`.
@@ -291,8 +297,12 @@ impl ser::Serialize for HashValue {
             // In order to preserve the Serde data model and help analysis tools,
             // make sure to wrap our value in a container with the same name
             // as the original type.
-            serializer
-                .serialize_newtype_struct("HashValue", serde_bytes::Bytes::new(&self.hash[..]))
+            #[derive(Serialize)]
+            #[serde(rename = "HashValue")]
+            struct Value<'a> {
+                hash: &'a [u8; HashValue::LENGTH],
+            }
+            Value { hash: &self.hash }.serialize(serializer)
         }
     }
 }
@@ -308,12 +318,15 @@ impl<'de> de::Deserialize<'de> for HashValue {
                 .map_err(<D::Error as ::serde::de::Error>::custom)
         } else {
             // See comment in serialize.
-            #[derive(::serde::Deserialize)]
+            #[derive(Deserialize)]
             #[serde(rename = "HashValue")]
-            struct Value<'a>(&'a [u8]);
+            struct Value {
+                hash: [u8; HashValue::LENGTH],
+            }
 
-            let value = Value::deserialize(deserializer)?;
-            Self::from_slice(value.0).map_err(<D::Error as ::serde::de::Error>::custom)
+            let value = Value::deserialize(deserializer)
+                .map_err(<D::Error as ::serde::de::Error>::custom)?;
+            Ok(Self::new(value.hash))
         }
     }
 }
@@ -432,9 +445,8 @@ impl<'a> HashValueBitIterator<'a> {
 
     /// Returns the `index`-th bit in the bytes.
     fn get_bit(&self, index: usize) -> bool {
-        assume!(index < self.pos.end); // assumed precondition
-        assume!(self.hash_bytes.len() == HashValue::LENGTH); // invariant
-        assume!(self.pos.end == self.hash_bytes.len() * 8); // invariant
+        debug_assert_eq!(self.hash_bytes.len(), HashValue::LENGTH); // invariant
+        debug_assert_lt!(index, HashValue::LENGTH_IN_BITS); // assumed precondition
         let pos = index / 8;
         let bit = 7 - index % 8;
         (self.hash_bytes[pos] >> bit) & 1 != 0
@@ -507,7 +519,7 @@ impl DefaultHasher {
     pub fn prefixed_hash(buffer: &[u8]) -> [u8; HashValue::LENGTH] {
         // The salt is initial material we prefix to actual value bytes for
         // domain separation. Its length is variable.
-        let salt: Vec<u8> = [DIEM_HASH_PREFIX, buffer].concat();
+        let salt: Vec<u8> = [HASH_PREFIX, buffer].concat();
         // The seed is a fixed-length hash of the salt, thereby preventing
         // suffix attacks on the domain separation bytes.
         HashValue::sha3_256_of(&salt[..]).hash
@@ -625,12 +637,12 @@ define_hasher! {
 }
 
 define_hasher! {
-    /// The hasher used to compute the hash of an internal node in the transaction accumulator.
+    /// The hasher used as a placeholder.
     (
-        VoteProposalHasher,
-        VOTE_PROPOSAL_HASHER,
-        VOTE_PROPOSAL_SEED,
-        b"VoteProposalHasher"
+        DummyHasher,
+        DUMMY_HASHER,
+        DUMMY_SEED,
+        b"Dummy"
     )
 }
 
@@ -663,9 +675,9 @@ pub static GENESIS_BLOCK_ID: Lazy<HashValue> = Lazy::new(|| {
     // This maintains the invariant that block.id() == block.hash(), for
     // the genesis block and allows us to (de/)serialize it consistently
     HashValue::new([
-        0x5e, 0x10, 0xba, 0xd4, 0x5b, 0x35, 0xed, 0x92, 0x9c, 0xd6, 0xd2, 0xc7, 0x09, 0x8b, 0x13,
-        0x5d, 0x02, 0xdd, 0x25, 0x9a, 0xe8, 0x8a, 0x8d, 0x09, 0xf4, 0xeb, 0x5f, 0xba, 0xe9, 0xa6,
-        0xf6, 0xe4,
+        0x5E, 0x10, 0xBA, 0xD4, 0x5B, 0x35, 0xED, 0x92, 0x9C, 0xD6, 0xD2, 0xC7, 0x09, 0x8B, 0x13,
+        0x5D, 0x02, 0xDD, 0x25, 0x9A, 0xE8, 0x8A, 0x8D, 0x09, 0xF4, 0xEB, 0x5F, 0xBA, 0xE9, 0xA6,
+        0xF6, 0xE4,
     ])
 });
 

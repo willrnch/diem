@@ -1,15 +1,18 @@
 [package]
 name = "diem-retrier"
+description = "Generic retry and exponential backoff"
 version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
-description = "Diem implementation for retries of operations"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
-tokio = { version = "1.8.1", features = ["time"] }
-diem-logger = { path = "../../crates/diem-logger"}
+diem-logger = { workspace = true }
+tokio = { workspace = true }
+

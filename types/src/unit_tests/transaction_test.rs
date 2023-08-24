@@ -1,21 +1,20 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     account_address::AccountAddress,
-    account_config::XUS_NAME,
     chain_id::ChainId,
     transaction::{
-        metadata, AccountTransactionsWithProof, GovernanceRole, RawTransaction, Script,
-        SignedTransaction, Transaction, TransactionInfo, TransactionListWithProof,
-        TransactionPayload, TransactionWithProof,
+        AccountTransactionsWithProof, RawTransaction, Script, SignedTransaction, Transaction,
+        TransactionInfo, TransactionListWithProof, TransactionPayload, TransactionWithProof,
     },
 };
-use bcs::test_helpers::assert_canonical_encode_decode;
 use diem_crypto::{
     ed25519::{self, Ed25519PrivateKey, Ed25519Signature},
     PrivateKey, Uniform,
 };
+use bcs::test_helpers::assert_canonical_encode_decode;
 use proptest::prelude::*;
 use std::convert::TryFrom;
 
@@ -28,58 +27,13 @@ fn test_invalid_signature() {
             Script::new(vec![], vec![], vec![]),
             0,
             0,
-            XUS_NAME.to_owned(),
             0,
             ChainId::test(),
         ),
         Ed25519PrivateKey::generate_for_testing().public_key(),
         Ed25519Signature::try_from(&[1u8; 64][..]).unwrap(),
     );
-    txn.check_signature()
-        .expect_err("signature checking should fail");
-}
-
-#[test]
-fn test_role_ordering() {
-    use GovernanceRole::*;
-    assert!(DiemRoot.priority() > TreasuryCompliance.priority());
-    assert!(DiemRoot.priority() > Validator.priority());
-    assert!(DiemRoot.priority() > ValidatorOperator.priority());
-    assert!(DiemRoot.priority() > DesignatedDealer.priority());
-
-    assert!(TreasuryCompliance.priority() > Validator.priority());
-    assert!(TreasuryCompliance.priority() > ValidatorOperator.priority());
-    assert!(TreasuryCompliance.priority() > DesignatedDealer.priority());
-
-    assert!(Validator.priority() == ValidatorOperator.priority());
-    assert!(Validator.priority() == DesignatedDealer.priority());
-}
-
-#[test]
-fn test_general_metadata_constructor_and_setters() {
-    let raw_to_subaddr = b"to_subaddr".to_vec();
-    let to_subaddress = Some(raw_to_subaddr.clone());
-    let raw_from_subaddr = b"from_subaddr".to_vec();
-    let from_subaddress = Some(raw_from_subaddr.clone());
-    let referenced_event = Some(1337);
-    let general_metadata =
-        metadata::GeneralMetadataV0::new(to_subaddress, from_subaddress, referenced_event);
-
-    assert!(
-        general_metadata
-            .to_subaddress()
-            .as_ref()
-            .expect("incorrect to_subaddress")
-            == &raw_to_subaddr
-    );
-    assert!(
-        general_metadata
-            .from_subaddress()
-            .as_ref()
-            .expect("incorrect from suabbdress")
-            == &raw_from_subaddr
-    );
-    assert!(general_metadata.referenced_event() == &referenced_event);
+    assert!(!txn.signature_is_valid(), "Signature checking should fail")
 }
 
 proptest! {

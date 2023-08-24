@@ -1,4 +1,5 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::storage::FileHandle;
@@ -19,7 +20,7 @@ pub struct StateSnapshotChunk {
     /// key of the last account in this chunk.
     pub last_key: HashValue,
     /// Repeated `len(record) + record` where `record` is BCS serialized tuple
-    /// `(key, account_state_blob)`
+    /// `(key, state_value)`
     pub blobs: FileHandle,
     /// BCS serialized `SparseMerkleRangeProof` that proves this chunk adds up to the root hash
     /// indicated in the backup (`StateSnapshotBackup::root_hash`).
@@ -31,6 +32,8 @@ pub struct StateSnapshotChunk {
 pub struct StateSnapshotBackup {
     /// Version at which this state snapshot is taken.
     pub version: Version,
+    /// Epoch in which this state snapshot is taken.
+    pub epoch: u64,
     /// Hash of the state tree root.
     pub root_hash: HashValue,
     /// All account blobs in chunks.

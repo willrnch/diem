@@ -1,39 +1,37 @@
-// Copyright (c) The Diem Core Contributors
+// Copyright © Diem Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     persistent_safety_storage::PersistentSafetyStorage, serializer::SerializerService, SafetyRules,
     TSafetyRules,
 };
-use consensus_types::{
+use diem_consensus_types::{
     block::Block,
     common::{Payload, Round},
     quorum_cert::QuorumCert,
-    timeout::Timeout,
-    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
+    timeout_2chain::{
+        TwoChainTimeout, TwoChainTimeoutCertificate, TwoChainTimeoutWithPartialSignatures,
+    },
     vote::Vote,
     vote_data::VoteData,
-    vote_proposal::{MaybeSignedVoteProposal, VoteProposal},
+    vote_proposal::VoteProposal,
 };
-use diem_crypto::{
-    ed25519::Ed25519PrivateKey,
-    hash::{CryptoHash, TransactionAccumulatorHasher},
-    traits::SigningKey,
-    Uniform,
-};
+use diem_crypto::hash::{CryptoHash, TransactionAccumulatorHasher};
 use diem_secure_storage::{InMemoryStorage, Storage};
 use diem_types::{
+    aggregate_signature::{AggregateSignature, PartialSignatures},
     block_info::BlockInfo,
     epoch_change::EpochChangeProof,
     epoch_state::EpochState,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    ledger_info::{LedgerInfo, LedgerInfoWithPartialSignatures, LedgerInfoWithSignatures},
     on_chain_config::ValidatorSet,
     proof::AccumulatorExtensionProof,
     validator_info::ValidatorInfo,
     validator_signer::ValidatorSigner,
+    validator_verifier::generate_validator_verifier,
     waypoint::Waypoint,
 };
-use std::collections::BTreeMap;
 
 pub type Proof = AccumulatorExtensionProof<TransactionAccumulatorHasher>;
 
@@ -43,12 +41,12 @@ pub fn empty_proof() -> Proof {
 
 pub fn make_genesis(signer: &ValidatorSigner) -> (EpochChangeProof, QuorumCert) {
     let validator_info =
-        ValidatorInfo::new_with_test_network_keys(signer.author(), signer.public_key(), 1);
+        ValidatorInfo::new_with_test_network_keys(signer.author(), signer.public_key(), 1, 0);
     let validator_set = ValidatorSet::new(vec![validator_info]);
     let li = LedgerInfo::mock_genesis(Some(validator_set));
     let block = Block::make_genesis_block_from_ledger_info(&li);
     let qc = QuorumCert::certificate_for_genesis_from_ledger_info(&li, block.id());
-    let lis = LedgerInfoWithSignatures::new(li, BTreeMap::new());
+    let lis = LedgerInfoWithSignatures::new(li, AggregateSignature::empty());
     let proof = EpochChangeProof::new(vec![lis], false);
     (proof, qc)
 }
@@ -59,9 +57,8 @@ pub fn make_proposal_with_qc_and_proof(
     proof: Proof,
     qc: QuorumCert,
     validator_signer: &ValidatorSigner,
-    exec_key: Option<&Ed25519PrivateKey>,
-) -> MaybeSignedVoteProposal {
-    let vote_proposal = VoteProposal::new(
+) -> VoteProposal {
+    VoteProposal::new(
         proof,
         Block::new_proposal(
             payload,
@@ -69,36 +66,37 @@ pub fn make_proposal_with_qc_and_proof(
             qc.certified_block().timestamp_usecs() + 1,
             qc,
             validator_signer,
-        ),
+            Vec::new(),
+        )
+        .unwrap(),
         None,
         false,
-    );
-    let signature = exec_key.map(|key| key.sign(&vote_proposal));
-    MaybeSignedVoteProposal {
-        vote_proposal,
-        signature,
-    }
+    )
 }
 
 pub fn make_proposal_with_qc(
     round: Round,
     qc: QuorumCert,
     validator_signer: &ValidatorSigner,
-    exec_key: Option<&Ed25519PrivateKey>,
-) -> MaybeSignedVoteProposal {
-    make_proposal_with_qc_and_proof(vec![], round, empty_proof(), qc, validator_signer, exec_key)
+) -> VoteProposal {
+    make_proposal_with_qc_and_proof(
+        Payload::empty(false),
+        round,
+        empty_proof(),
+        qc,
+        validator_signer,
+    )
 }
 
 pub fn make_proposal_with_parent_and_overrides(
     payload: Payload,
     round: Round,
-    parent: &MaybeSignedVoteProposal,
-    committed: Option<&MaybeSignedVoteProposal>,
+    parent: &VoteProposal,
+    committed: Option<&VoteProposal>,
     validator_signer: &ValidatorSigner,
     epoch: Option<u64>,
     next_epoch_state: Option<EpochState>,
-    exec_key: Option<&Ed25519PrivateKey>,
-) -> MaybeSignedVoteProposal {
+) -> VoteProposal {
     let block_epoch = match epoch {
         Some(e) => e,
         _ => parent.block().epoch(),
@@ -118,7 +116,7 @@ pub fn make_proposal_with_parent_and_overrides(
     let proof = Proof::new(
         parent_output.frozen_subtree_roots().clone(),
         parent_output.num_leaves(),
-        vec![Timeout::new(0, round).hash()],
+        vec![],
     );
 
     let proposed_block = BlockInfo::new(
@@ -158,7 +156,7 @@ pub fn make_proposal_with_parent_and_overrides(
                 next_epoch_state,
             );
             LedgerInfo::new(commit_block_info, vote_data.hash())
-        }
+        },
         None => LedgerInfo::new(BlockInfo::empty(), vote_data.hash()),
     };
 
@@ -167,26 +165,33 @@ pub fn make_proposal_with_parent_and_overrides(
         validator_signer.author(),
         ledger_info,
         validator_signer,
-    );
+    )
+    .unwrap();
 
-    let mut ledger_info_with_signatures =
-        LedgerInfoWithSignatures::new(vote.ledger_info().clone(), BTreeMap::new());
+    let mut ledger_info_with_signatures = LedgerInfoWithPartialSignatures::new(
+        vote.ledger_info().clone(),
+        PartialSignatures::empty(),
+    );
 
     ledger_info_with_signatures.add_signature(vote.author(), vote.signature().clone());
 
-    let qc = QuorumCert::new(vote_data, ledger_info_with_signatures);
+    let qc = QuorumCert::new(
+        vote_data,
+        ledger_info_with_signatures
+            .aggregate_signatures(&generate_validator_verifier(&[validator_signer.clone()]))
+            .unwrap(),
+    );
 
-    make_proposal_with_qc_and_proof(payload, round, proof, qc, validator_signer, exec_key)
+    make_proposal_with_qc_and_proof(payload, round, proof, qc, validator_signer)
 }
 
 pub fn make_proposal_with_parent(
     payload: Payload,
     round: Round,
-    parent: &MaybeSignedVoteProposal,
-    committed: Option<&MaybeSignedVoteProposal>,
+    parent: &VoteProposal,
+    committed: Option<&VoteProposal>,
     validator_signer: &ValidatorSigner,
-    exec_key: Option<&Ed25519PrivateKey>,
-) -> MaybeSignedVoteProposal {
+) -> VoteProposal {
     make_proposal_with_parent_and_overrides(
         payload,
         round,
@@ -195,7 +200,6 @@ pub fn make_proposal_with_parent(
         validator_signer,
         None,
         None,
-        exec_key,
     )
 }
 
@@ -205,16 +209,18 @@ pub fn make_timeout_cert(
     signer: &ValidatorSigner,
 ) -> TwoChainTimeoutCertificate {
     let timeout = TwoChainTimeout::new(1, round, hqc.clone());
-    let mut tc = TwoChainTimeoutCertificate::new(timeout.clone());
-    let signature = timeout.sign(signer);
-    tc.add(signer.author(), timeout, signature);
-    tc
+    let mut tc_partial = TwoChainTimeoutWithPartialSignatures::new(timeout.clone());
+    let signature = timeout.sign(signer).unwrap();
+    tc_partial.add(signer.author(), timeout, signature);
+    tc_partial
+        .aggregate_signatures(&generate_validator_verifier(&[signer.clone()]))
+        .unwrap()
 }
 
 pub fn validator_signers_to_ledger_info(signers: &[&ValidatorSigner]) -> LedgerInfo {
-    let infos = signers
-        .iter()
-        .map(|v| ValidatorInfo::new_with_test_network_keys(v.author(), v.public_key(), 1));
+    let infos = signers.iter().enumerate().map(|(index, v)| {
+        ValidatorInfo::new_with_test_network_keys(v.author(), v.public_key(), 1, index as u64)
+    });
     let validator_set = ValidatorSet::new(infos.collect());
     LedgerInfo::mock_genesis(Some(validator_set))
 }
@@ -231,7 +237,6 @@ pub fn test_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
         storage,
         signer.author(),
         signer.private_key().clone(),
-        Ed25519PrivateKey::generate_for_testing(),
         waypoint,
         true,
     )
@@ -243,7 +248,7 @@ pub fn test_safety_rules() -> SafetyRules {
     let storage = test_storage(&signer);
     let (epoch_change_proof, _) = make_genesis(&signer);
 
-    let mut safety_rules = SafetyRules::new(storage, true, false);
+    let mut safety_rules = SafetyRules::new(storage);
     safety_rules.initialize(&epoch_change_proof).unwrap();
     safety_rules
 }
@@ -252,7 +257,7 @@ pub fn test_safety_rules() -> SafetyRules {
 pub fn test_safety_rules_uninitialized() -> SafetyRules {
     let signer = ValidatorSigner::from_int(0);
     let storage = test_storage(&signer);
-    SafetyRules::new(storage, true, false)
+    SafetyRules::new(storage)
 }
 
 /// Returns a simple serializer for testing purposes.

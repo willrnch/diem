@@ -1,32 +1,34 @@
 [package]
-name = "netcore"
-version = "0.1.0"
-authors = ["Diem Association <opensource@diem.com>"]
+name = "diem-netcore"
 description = "Diem netcore"
-repository = "https://github.com/diem/diem"
-homepage = "https://diem.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-bytes = "1.0.1"
-futures = "0.3.12"
-pin-project = "1.0.5"
-serde = { version = "1.0.124", default-features = false }
-tokio = { version = "1.8.1", features = ["full"] }
-tokio-util = { version = "0.6.4", features = ["compat"] }
-url = { version = "2.2.1" }
-diem-workspace-hack = { version = "0.1", path = "../../crates/diem-workspace-hack" }
-diem-types = { path = "../../types" }
-memsocket = { path = "../memsocket", optional = true }
-proxy = { path = "../../crates/proxy" }
+diem-memsocket = { workspace = true }
+diem-proxy = { workspace = true }
+diem-types = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+pin-project = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-diem-logger = { path = "../../crates/diem-logger" }
-memsocket = { path = "../memsocket" }
+diem-memsocket = { workspace = true }
+diem-types = { workspace = true, features = ["fuzzing"] }
 
 [features]
 default = []
-fuzzing = ["memsocket/fuzzing", "diem-types/fuzzing"]
-testing = ["memsocket/testing"]
+fuzzing = ["diem-memsocket/fuzzing", "diem-types/fuzzing"]
+testing = ["diem-memsocket/testing"]
