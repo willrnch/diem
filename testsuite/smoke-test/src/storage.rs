@@ -3,26 +3,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    smoke_test_environment::SwarmBuilder,
-    test_utils::{
-        assert_balance, create_and_fund_account, swarm_utils::insert_waypoint,
-        transfer_and_maybe_reconfig, transfer_coins, MAX_CATCH_UP_WAIT_SECS, MAX_HEALTHY_WAIT_SECS,
-    },
     workspace_builder,
     workspace_builder::workspace_root,
 };
 use anyhow::{bail, Result};
 use diem_backup_cli::metadata::view::BackupStorageState;
-use diem_forge::{reconfig, NodeExt, Swarm, SwarmExt};
 use diem_logger::info;
 use diem_temppath::TempPath;
 use diem_types::{transaction::Version, waypoint::Waypoint};
 use std::{
-    fs,
     path::Path,
     process::Command,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use crate::{
+    smoke_test_environment::SwarmBuilder,
+    test_utils::{
+        assert_balance, create_and_fund_account, swarm_utils::insert_waypoint,
+        transfer_and_maybe_reconfig, transfer_coins, MAX_CATCH_UP_WAIT_SECS, MAX_HEALTHY_WAIT_SECS,
+    },
+};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use diem_forge::{reconfig, NodeExt, Swarm, SwarmExt};
+
 
 #[tokio::test]
 async fn test_db_restore() {
@@ -316,7 +323,7 @@ fn get_backup_storage_state(
     std::str::from_utf8(&output)?.parse()
 }
 
-pub(crate) fn db_backup(
+pub fn db_backup(
     backup_service_port: u16,
     target_epoch: u64,
     target_version: Version,
@@ -404,7 +411,7 @@ pub(crate) fn db_backup(
     (backup_path, snapshot_ver)
 }
 
-pub(crate) fn db_restore(
+pub fn db_restore(
     backup_path: &Path,
     db_path: &Path,
     trusted_waypoints: &[Waypoint],

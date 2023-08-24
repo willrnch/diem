@@ -31,8 +31,6 @@ mod rosetta;
 #[cfg(test)]
 mod state_sync;
 #[cfg(test)]
-mod storage;
-#[cfg(test)]
 mod test_smoke_tests;
 #[cfg(test)]
 mod transaction;
@@ -43,11 +41,12 @@ mod txn_emitter;
 #[cfg(test)]
 mod upgrade;
 
-#[cfg(test)]
-mod smoke_test_environment;
-
-#[cfg(test)]
-mod test_utils;
-
-#[cfg(test)]
+//////// 0L ////////
+// not in test config, and must be public
+// these need to be callable in other test environments of third-party
+// testsuites
+pub mod smoke_test_environment;
+pub mod storage;
+pub mod test_utils;
 mod workspace_builder;
+/////// end 0L ////////

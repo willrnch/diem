@@ -83,7 +83,7 @@ pub async fn assert_balance(client: &RestClient, account: &LocalAccount, balance
 /// require a SmokeTestEnvironment, as it provides a generic interface across
 /// DiemSwarms, regardless of if the swarm is a validator swarm, validator full
 /// node swarm, or a public full node swarm.
-#[cfg(test)]
+// #[cfg(test)]
 pub mod swarm_utils {
     use diem_config::config::{NodeConfig, SecureBackend, WaypointConfig};
     use diem_secure_storage::{KVStorage, Storage};
