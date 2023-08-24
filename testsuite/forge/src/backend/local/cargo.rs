@@ -59,7 +59,21 @@ pub fn get_diem_node_binary_from_worktree() -> Result<(String, PathBuf)> {
         revision.push_str("-dirty");
     }
 
-    let bin_path = cargo_build_diem_node(&metadata.workspace_root, &metadata.target_directory)?;
+    // let bin_path = cargo_build_diem_node(&metadata.workspace_root, &metadata.target_directory)?;
+
+    /////// 0L /////////
+    // try to provide an executable instead of rebuilding from source
+    // when importing forge and smoke tests to external libraries, the rebuilding of the aptos-node is error-prone, so external testsuites
+    // should provide an already compiled node binary and export the envar path.
+    // e.g. DIEM_FORGE_NODE_BIN_PATH=/diem/target/release/diem-node
+    let path = std::env::var("DIEM_FORGE_NODE_BIN_PATH");
+    let bin_path = if let Some(p) = path.ok() {
+      PathBuf::from(p) // must be the path of the executable
+    } else {
+      // failover to building as before for monorepo tests
+      cargo_build_diem_node(&metadata.workspace_root, &metadata.target_directory)?
+    };
+    /////// end 0L /////////
 
     Ok((revision, bin_path))
 }
