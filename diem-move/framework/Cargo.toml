@@ -13,6 +13,9 @@ repository = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
+# ///////// OL ////////
+vdf = { git = "https://github.com/0LNetworkCommunity/verifiable_delay.git" }
+
 anyhow = { workspace = true }
 diem-aggregator = { workspace = true }
 diem-crypto = { workspace = true, features = ["fuzzing"] }
