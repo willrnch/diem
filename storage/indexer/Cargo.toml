@@ -1,0 +1,50 @@
+[package]
+name = "diem-db-indexer"
+description = "DiemDB Internal Indexer"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-proptest-helpers = { workspace = true, optional = true }
+diem-rocksdb-options = { workspace = true }
+diem-schemadb = { workspace = true }
+diem-scratchpad = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-temppath = { workspace = true, optional = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true }
+bcs = { workspace = true }
+byteorder = { workspace = true }
+move-core-types = { workspace = true }
+move-resource-viewer = { workspace = true }
+num-derive = { workspace = true }
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+diem-proptest-helpers = { workspace = true }
+diem-schemadb = { workspace = true, features = ["fuzzing"] }
+diem-types = { workspace = true, features = ["fuzzing"] }
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+rand = { workspace = true }
+
+[features]
+default = []
+fuzzing = ["proptest", "proptest-derive", "diem-proptest-helpers", "diem-temppath", "diem-crypto/fuzzing", "diem-types/fuzzing", "diem-schemadb/fuzzing", "diem-scratchpad/fuzzing"]

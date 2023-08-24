@@ -1,0 +1,21 @@
+{
+  "enabled_clusters": [
+    "banana"
+  ],
+  "all_clusters": [
+    "banana",
+    "apple"
+  ],
+  "default_helm_values": {
+    "diem-genesis": {
+      "image": {
+        "repo": "apple"
+      }
+    },
+    "diem-node": {
+      "image": {
+        "repo": "banana2"
+      }
+    }
+  }
+}

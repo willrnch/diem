@@ -1,0 +1,41 @@
+[package]
+name = "diem-genesis"
+description = "A tool to manage genesis"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-db = { workspace = true }
+diem-executor = { workspace = true }
+diem-framework = { workspace = true }
+diem-keygen = { workspace = true }
+diem-logger = { workspace = true }
+diem-state-view =  { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-temppath = { workspace = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true }
+diem-vm-genesis = { workspace = true }
+bcs = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+diem-config = { workspace = true }
+
+[features]
+testing = []
+fuzzing = ["diem-config/fuzzing"]

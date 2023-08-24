@@ -1,0 +1,102 @@
+[package]
+name = "diem"
+description = "Diem tool for management of nodes and interacting with the blockchain"
+version = "2.0.2"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-api-types = { workspace = true }
+diem-backup-cli = { workspace = true }
+diem-bitvec = { workspace = true }
+diem-build-info = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-cli-common = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-db-tool = { workspace = true }
+diem-debugger = { workspace = true }
+diem-faucet-core = { workspace = true }
+diem-framework = { workspace = true }
+diem-gas = { workspace = true }
+diem-gas-profiling = { workspace = true }
+diem-genesis = { workspace = true }
+diem-github-client = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-keygen = { workspace = true }
+diem-logger = { workspace = true }
+diem-network-checker = { workspace = true }
+diem-node = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-sdk = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-telemetry = { workspace = true }
+diem-temppath = { workspace = true }
+diem-transactional-test-harness = { workspace = true }
+diem-types = { workspace = true }
+diem-vm = { workspace = true, features = ["testing"] }
+diem-vm-genesis = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bcs = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["unstable-styles"] }
+clap_complete = { workspace = true }
+codespan-reporting = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+move-binary-format = { workspace = true }
+move-bytecode-source-map = { workspace = true }
+move-cli = { workspace = true }
+move-command-line-common = { workspace = true }
+move-compiler = { workspace = true }
+move-core-types = { workspace = true }
+move-coverage = { workspace = true }
+move-disassembler = { workspace = true }
+move-ir-compiler = { workspace = true }
+move-ir-types = { workspace = true }
+move-package = { workspace = true }
+move-prover = { workspace = true }
+move-prover-boogie-backend = { workspace = true }
+move-symbol-pool = { workspace = true }
+move-unit-test = { workspace = true, features = [ "debugging" ] }
+move-vm-runtime = { workspace = true, features = [ "testing" ] }
+once_cell = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+self_update = { version = "0.34.0", features = ["archive-zip", "compression-zip-deflate"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+shadow-rs = { workspace = true }
+tempfile = { workspace = true }
+termcolor = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+walkdir = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+jemallocator = { workspace = true }
+
+[features]
+default = []
+fuzzing = []
+no-upload-proposal = []
+indexer = ["diem-node/indexer"]
+cli-framework-test-move = []
+
+[build-dependencies]
+shadow-rs = { workspace = true }

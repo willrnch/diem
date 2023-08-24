@@ -1,0 +1,11 @@
+[package]
+name = "Marketplace"
+version = "0.0.0"
+
+[addresses]
+marketplace = "_"
+
+[dependencies]
+DiemFramework = { local = "../../framework/diem-framework" }
+DiemToken = { local = "../../framework/diem-token" }
+DiemTokenObjects = { local = "../../framework/diem-token-objects" }

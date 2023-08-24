@@ -1,0 +1,8 @@
+apiVersion: v2
+name: testnet-addons
+version: 0.1
+appVersion: 0.1.0
+description: Additional components for diem-nodes testnet
+home: https://diemlabs.com/
+sources:
+- https://github.com/aptos-labs/diem-core

@@ -1,0 +1,9 @@
+[package]
+name = "DebugDemo"
+version = "0.0.0"
+
+[addresses]
+DebugDemo = "0x1"
+
+[dependencies]
+DiemFramework = { local = "../../../diem-move/framework/diem-framework" }

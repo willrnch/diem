@@ -1,0 +1,12 @@
+[package]
+name = "DiemToken"
+version = "1.0.0"
+
+[addresses]
+std = "0x1"
+diem_framework = "0x1"
+diem_token = "0x3"
+
+[dependencies]
+MoveStdlib = { local = "../move-stdlib" }
+DiemFramework = { local = "../diem-framework"}

@@ -1,0 +1,36 @@
+[package]
+name = "diem-db-tool"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-backup-cli = { workspace = true }
+diem-backup-service = { workspace = true }
+diem-config = { workspace = true }
+diem-db = { workspace = true, features = ["db-debugger"] }
+diem-executor-types = { workspace = true }
+diem-logger = { workspace = true }
+diem-push-metrics = { workspace = true }
+diem-state-view = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-temppath = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+itertools = { workspace = true }
+owo-colors = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+diem-backup-cli = { workspace = true, features = ["testing"] }
+diem-backup-service = { workspace = true }
+diem-executor-test-helpers = { workspace = true }

@@ -1,0 +1,42 @@
+[package]
+name = "diem-rosetta"
+description = "Diem Rosetta"
+version = "0.0.1"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-cached-packages = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-global-constants = { workspace = true }
+diem-logger = { workspace = true }
+diem-node = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-runtimes = { workspace = true }
+diem-sdk = { workspace = true }
+diem-types = { workspace = true }
+diem-warp-webserver = { workspace = true }
+bcs = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+move-core-types = { workspace = true }
+once_cell = { workspace = true }
+percent-encoding = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+warp = { workspace = true }

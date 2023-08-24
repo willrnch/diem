@@ -1,0 +1,8 @@
+[package]
+name = "too_large_test"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../../../../framework/diem-framework" }
+DiemStdlib = { local = "../../../../../framework/diem-stdlib" }
+MoveStdlib = { local = "../../../../../framework/move-stdlib" }

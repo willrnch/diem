@@ -1,0 +1,10 @@
+[package]
+name = "Examples"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../../framework/diem-framework" }
+DiemToken = { local = "../../../framework/diem-token" }
+
+[addresses]
+diem_framework = "0x1"

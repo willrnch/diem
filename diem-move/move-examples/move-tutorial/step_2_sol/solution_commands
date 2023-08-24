@@ -1,0 +1,11 @@
+# Exercise 1
+diem move test --dump
+
+# Exercise 2
+diem move test --coverage
+
+Followed by:
+
+diem move coverage summary
+diem move coverage summary --summarize-functions
+diem move coverage source --module basic_coin

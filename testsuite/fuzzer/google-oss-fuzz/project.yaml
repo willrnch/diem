@@ -1,0 +1,12 @@
+homepage: "https://diem.dev"
+language: rust
+primary_contact: "gerardo@diemlabs.com"
+main_repo: "https://github.com/aptos-labs/diem-core"
+auto_ccs:
+  - "davidiw@diemlabs.com"
+  - "security@diemlabs.com"
+  - "wg@diemlabs.com"
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer

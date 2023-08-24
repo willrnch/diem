@@ -1,0 +1,9 @@
+[package]
+name = "CommonAccount"
+version = "1.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../framework/diem-framework" }
+
+[addresses]
+common_account = "_"

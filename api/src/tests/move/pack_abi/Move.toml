@@ -1,0 +1,9 @@
+[package]
+name = "pack_abi"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../../../../diem-move/framework/diem-framework" }
+
+[addresses]
+abi = "_"

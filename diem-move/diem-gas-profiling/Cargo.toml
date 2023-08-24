@@ -1,0 +1,27 @@
+[package]
+name = "diem-gas-profiling"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+inferno = { workspace = true }
+regex = { workspace = true }
+smallvec = { workspace = true }
+
+diem-framework = { workspace = true }
+diem-gas = { workspace = true }
+diem-package-builder = { workspace = true }
+diem-types = { workspace = true }
+
+move-binary-format = { workspace = true }
+move-core-types = { workspace = true }
+move-vm-types = { workspace = true }

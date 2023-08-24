@@ -1,0 +1,44 @@
+[package]
+name = "diem-node-checker"
+description = "Diem Node Health Checker"
+version = "0.1.1"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-api = { workspace = true }
+diem-config = { workspace = true }
+diem-crypto = { workspace = true }
+diem-logger = { workspace = true }
+diem-network-checker = { workspace = true }
+diem-rest-client = { workspace = true }
+diem-sdk = { workspace = true }
+diem-transaction-emitter-lib = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+const_format = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+poem = { workspace = true }
+poem-openapi = { workspace = true }
+prometheus-parse = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+
+[lib]
+name = "diem_node_checker_lib"
+path = "src/lib.rs"

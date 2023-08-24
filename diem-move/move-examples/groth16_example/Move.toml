@@ -1,0 +1,6 @@
+[package]
+name = "GenericGroth16"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../framework/diem-framework" }

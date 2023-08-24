@@ -1,0 +1,10 @@
+[package]
+name = "hello_prover"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { git = "https://github.com/aptos-labs/diem-core.git", subdir = "diem-move/framework/diem-framework/", rev = "main" }
+
+[addresses]
+
+

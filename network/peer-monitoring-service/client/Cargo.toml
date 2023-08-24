@@ -1,0 +1,47 @@
+[package]
+name = "diem-peer-monitoring-service-client"
+description = "The Diem peer monitoring service (client-side)"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-id-generator = { workspace = true }
+diem-infallible = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-network = { workspace = true }
+diem-peer-monitoring-service-types = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+async-trait = { workspace = true }
+enum_dispatch = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+diem-build-info = { workspace = true }
+diem-config = { workspace = true }
+diem-netcore = { workspace = true }
+diem-network = { workspace = true, features = ["fuzzing"] }
+diem-peer-monitoring-service-server = { workspace = true }
+bcs = { workspace = true }
+maplit = { workspace = true }
+tokio-stream = { workspace = true }
+
+[features]
+network-perf-test = ["diem-peer-monitoring-service-server/network-perf-test", "diem-peer-monitoring-service-types/network-perf-test"]

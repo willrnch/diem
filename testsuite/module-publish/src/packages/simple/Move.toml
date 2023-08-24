@@ -1,0 +1,6 @@
+[package]
+name = "GenericModule"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../../../../diem-move/framework/diem-framework" }

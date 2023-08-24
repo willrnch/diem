@@ -1,0 +1,109 @@
+# **Please** keep this file ordered alphabetically by directory paths.
+
+# Owners for the `.github` directory and all its subdirectories.
+/.github/ @aptos-labs/prod-eng
+
+# Owners for the `/api` directory and all its subdirectories.
+/api/ @banool @gregnazario @0xmaayan
+
+# Owners for the `/diem-move` directory and its subdirectories:`diem-gas`, `diem-vm`, `framework` and `framework/diem-stdlib/sources/cryptography`.
+/diem-move/diem-aggregator/ @georgemitenkov @gelash @zekun000
+/diem-move/diem-gas/ @vgao1996
+/diem-move/diem-vm/ @davidiw @wrwg @zekun000
+/diem-move/e2e-tests/src/account.rs @alinush
+/diem-move/framework/ @davidiw @movekevin @wrwg
+/diem-move/framework/diem-framework/sources/account.move @alinush
+/diem-move/framework/diem-stdlib/sources/cryptography/ @alinush
+/diem-move/framework/**/*.spec.move @junkil-park
+/diem-move/framework/diem-stdlib/sources/hash.move @alinush
+
+# Owner for diem-token, cryptography natives, parallel-executor and vm-genesis.
+/diem-move/framework/diem-token @areshand
+/diem-move/framework/src/natives/cryptography/ @alinush
+/diem-move/framework/src/natives/aggregator_natives/ @georgemitenkov @gelash @zekun000
+/diem-move/block-executor/ @gelash @zekun000 @sasha8 @danielxiangzl
+/diem-move/sharded_block-executor/ @sitalkedia
+/diem-move/mvhashmap/ @gelash @runtian-zhou @sasha8 @danielxiangzl
+/diem-move/vm-genesis/ @davidiw @movekevin
+
+# Owner for diem node (to prevent things from becoming out of hand :D)
+/diem-node/ @joshlind
+
+# Owner for the node configs (to prevent things from becoming out of hand :D)
+/config/ @joshlind @gregnazario
+
+# Owners for the `/consensus` directory and all its subdirectories.
+/consensus/ @zekun000
+
+# Owners for quorum store.
+/consensus/src/quorum_store/ @bchocho @sasha8 @gelash
+
+# Owners for the `/crates/diem` directory and all its subdirectories.
+/crates/diem @gregnazario @0xjinn @banool
+
+# Owners for the `/crates/diem-crypto*` directories.
+/crates/diem-crypto-derive/ @alinush
+/crates/diem-crypto/ @alinush
+
+# Owners for the `/crates/diem-faucet` directory and all its subdirectories. And other faucet, genesis, and OpenAPI-related crates.
+/crates/diem-faucet @banool @gregnazario
+/crates/diem-genesis @gregnazario
+
+# Owners for the diem-logger crate
+/crates/diem-logger @gregnazario @joshlind
+
+/crates/diem-open-api @banool @gregnazario
+/crates/diem-rest-client @banool @gregnazario
+
+# Owners for the `/diem-rosetta` directory and related crates.
+/crates/diem-rosetta @gregnazario
+/crates/diem-rosetta-cli @gregnazario
+
+# Owners for the diem-speculative-state-helper crate
+/crates/diem-speculative-state-helper @gelash
+
+# Owners for the `telemetry` related crates.
+/crates/diem-telemetry @ibalajiarun @geekflyer
+/crates/diem-telemetry-service @ibalajiarun @geekflyer
+
+# Owners for the inspection-service crate
+/crates/inspection-service/ @joshlind @brianolson
+
+# Owners for the `/dashboards` directory and all its subdirectories.
+/dashboards/ @aptos-labs/prod-eng
+
+# Owners for the `/developer-docs-site` directory and all its subdirectories.
+/developer-docs-site/ @davidiw @gregnazario @saharct
+
+# Auto-reviewers for all Markdown changes including READMEs
+*.md @saharct
+
+# Owner for docs tutorials for the token_standard and related tutorials.
+/developer-docs-site/docs/tutorials @areshand @gregnazario
+
+# Owners for the `/docker` directory and all its subdirectories.
+/docker/ @aptos-labs/prod-eng
+
+# Owners for the `SDKs`.
+/ecosystem/python/sdk @davidiw @gregnazario @banool @0xmaayan @0xjinn
+/ecosystem/typescript/sdk @gregnazario @banool @0xmaayan @0xjinn
+
+# Owners for execution and storage.
+/execution/ @msmouse @lightmark
+
+# Owners for mempool.
+/mempool/ @bchocho
+
+# Owners for the network and all its subdirectories.
+/network/ @gregnazario @joshlind @brianolson
+
+# Owners for the `/state-sync` directory and all its subdirectories.
+/state-sync/ @joshlind
+
+# Owners for execution and storage.
+/storage/ @msmouse @lightmark
+
+# Owners for the `/terraform` directory and all its subdirectories.
+/terraform/ @aptos-labs/prod-eng
+
+/types/src/transaction/authenticator.rs @alinush

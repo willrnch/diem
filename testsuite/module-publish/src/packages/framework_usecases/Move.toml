@@ -1,0 +1,8 @@
+[package]
+name = "FrameworkUsecases"
+version = "0.0.0"
+
+[dependencies]
+DiemFramework = { local = "../../../../../diem-move/framework/diem-framework" }
+DiemToken = { local = "../../../../../diem-move/framework/diem-token" }
+DiemTokenObjects = { local = "../../../../../diem-move/framework/diem-token-objects" }

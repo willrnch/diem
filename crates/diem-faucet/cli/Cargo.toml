@@ -1,0 +1,22 @@
+[package]
+name = "diem-faucet-cli"
+description = "Diem Faucet CLI"
+version = "2.0.1"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+diem-faucet-core = { workspace = true }
+diem-logger = { workspace = true }
+diem-sdk = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+

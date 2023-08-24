@@ -1,0 +1,13 @@
+[package]
+name = "DiemTokenObjects"
+version = "1.0.0"
+
+[addresses]
+std = "0x1"
+diem_std = "0x1"
+diem_framework = "0x1"
+diem_token_objects = "0x4"
+
+[dependencies]
+MoveStdlib = { local = "../move-stdlib" }
+DiemFramework = { local = "../diem-framework"}

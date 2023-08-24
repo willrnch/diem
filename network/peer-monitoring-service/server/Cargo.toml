@@ -1,0 +1,48 @@
+[package]
+name = "diem-peer-monitoring-service-server"
+description = "The peer monitoring service (server-side)"
+version = "0.1.0"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+diem-bounded-executor = { workspace = true }
+diem-build-info = { workspace = true }
+diem-channels = { workspace = true }
+diem-config = { workspace = true }
+diem-logger = { workspace = true }
+diem-metrics-core = { workspace = true }
+diem-netcore = { workspace = true }
+diem-network = { workspace = true }
+diem-peer-monitoring-service-types = { workspace = true }
+diem-storage-interface = { workspace = true }
+diem-time-service = { workspace = true }
+diem-types = { workspace = true }
+bcs = { workspace = true }
+bytes = { workspace = true }
+cfg_block = { workspace = true }
+futures = { workspace = true }
+once_cell = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+diem-crypto = { workspace = true }
+diem-network = { workspace = true, features = ["fuzzing"] }
+diem-time-service = { workspace = true, features = ["testing"] }
+claims = { workspace = true }
+maplit = { workspace = true }
+mockall = { workspace = true }
+rand = { workspace = true }
+
+[features]
+network-perf-test = ["diem-peer-monitoring-service-types/network-perf-test"]
