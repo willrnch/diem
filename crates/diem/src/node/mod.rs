@@ -1132,6 +1132,7 @@ impl CliCommand<()> for RunLocalTestnet {
         // Spawn the node in a separate thread
         let config_path = self.config_path.clone();
         let test_dir_copy = test_dir.clone();
+        let head_release = diem_cached_packages::head_release_bundle();
         let node_thread_handle = thread::spawn(move || {
             let result = diem_node::setup_test_environment_and_start_node(
                 config_path,
@@ -1139,7 +1140,7 @@ impl CliCommand<()> for RunLocalTestnet {
                 Some(test_dir_copy),
                 false,
                 false,
-                diem_cached_packages::head_release_bundle(),
+                &head_release,
                 rng,
             );
             eprintln!("Node stopped unexpectedly {:#?}", result);

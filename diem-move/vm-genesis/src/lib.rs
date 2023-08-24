@@ -655,13 +655,11 @@ pub fn generate_genesis_change_set_for_testing_with_count(
     genesis_options: GenesisOptions,
     count: u64,
 ) -> ChangeSet {
+    let head_release = diem_cached_packages::head_release_bundle();
     let framework = match genesis_options {
-        GenesisOptions::Head => diem_cached_packages::head_release_bundle(),
+        GenesisOptions::Head => &head_release,
         GenesisOptions::Testnet => diem_framework::testnet_release_bundle(),
-        GenesisOptions::Mainnet => {
-            // We don't yet have mainnet, so returning testnet here
-            diem_framework::testnet_release_bundle()
-        },
+        GenesisOptions::Mainnet => &head_release,
     };
 
     generate_test_genesis(framework, Some(count as usize)).0
@@ -669,8 +667,9 @@ pub fn generate_genesis_change_set_for_testing_with_count(
 
 /// Generate a genesis `ChangeSet` for mainnet
 pub fn generate_genesis_change_set_for_mainnet(genesis_options: GenesisOptions) -> ChangeSet {
+    let head_release = diem_cached_packages::head_release_bundle();
     let framework = match genesis_options {
-        GenesisOptions::Head => diem_cached_packages::head_release_bundle(),
+        GenesisOptions::Head => &head_release,
         GenesisOptions::Testnet => diem_framework::testnet_release_bundle(),
         // We don't yet have mainnet, so returning testnet here
         GenesisOptions::Mainnet => diem_framework::testnet_release_bundle(),
@@ -687,7 +686,8 @@ pub fn test_genesis_transaction() -> Transaction {
 pub fn test_genesis_change_set_and_validators(
     count: Option<usize>,
 ) -> (ChangeSet, Vec<TestValidator>) {
-    generate_test_genesis(diem_cached_packages::head_release_bundle(), count)
+    let head_release = diem_cached_packages::head_release_bundle();
+    generate_test_genesis(&head_release, count)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
